@@ -1,0 +1,18 @@
+{
+  "name": "fpinertia",
+  "version-string": "1.0.0",
+  "description": "First-person weapon inertia for Fallout 4",
+  "license": "MIT",
+  "dependencies": [
+    "boost-stl-interfaces",
+    "boost-iostreams",
+    "boost-iterator",
+    "boost-predef",
+    "fmt",
+    "frozen",
+    "nlohmann-json",
+    "rsm-mmio",
+    "spdlog",
+    "xbyak"
+  ]
+}

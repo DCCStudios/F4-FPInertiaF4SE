@@ -1,0 +1,32 @@
+# Build outputs
+build/
+out/
+CMakeUserPresets.json
+
+# Staged game install (DLL / PDB)
+Compile/
+
+# Visual Studio / MSVC
+.vs/
+*.user
+*.suo
+*.VC.db*
+*.opendb
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+_deps/
+
+# Binaries / intermediates (if any leak outside build/)
+*.dll
+*.pdb
+*.exp
+*.lib
+*.ilk
+*.obj
+*.iobj
+*.ipdb
