@@ -266,6 +266,11 @@ namespace Inertia
 			const RE::NiPoint3& localMove, float delta, float mult);
 		void UpdateImpulseSpring(ImpulseSpring& spring, float stiffness, float damping, float delta);
 
+		// Springs, impulses, walk/lean carryover, ADS transition motion, and camera
+		// velocity smoothing — used while Pip-Boy is open and as the first stage of
+		// Reset(). Does not clear reload / EarlyADS / weapon cache / bone cache.
+		void ResetSpringPhysicsState();
+
 		void ApplyOffset(RE::NiNode* node, const SpringState& combined,
 			const WeaponInertiaSettings& ws);
 		RE::NiNode* FindTargetNode(RE::NiNode* fpRoot, const WeaponInertiaSettings& ws, bool isADS = false);
@@ -372,6 +377,12 @@ namespace Inertia
 		int earlyAdsPostDiagFrames{ 0 };            // diagnostic: log attack vars for N frames after trigger
 		int earlyAdsForceIdleFrames{ 0 };           // suppress ADS handler for N frames to force idle transition
 		int earlyAdsForceIdleCountdown{ 0 };        // initial value for frame logging
+
+		// After EarlyADS / EarlyFireCancel / EarlyEquip: replay UnCullBone dispatch
+		// for a few frames — NotifyAnimationGraph can be ignored if fired while
+		// the graph is still transitioning; MiddleHighProcessData cull flags may
+		// also need clearing so parts are not left hidden.
+		std::uint8_t uncullBoneReplayFrames{ 0 };
 
 		// Early Fire Cancel tracking — mirrors Early ADS but driven by FIRE input
 		// held during a reload (reload-cancel-into-fire).  Same downstream flow:

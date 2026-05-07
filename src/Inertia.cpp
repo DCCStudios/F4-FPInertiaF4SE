@@ -39,6 +39,15 @@ static float GetGlobalTimeMult()
 	return v;
 }
 
+// Local static: BSFixedString must not be constructed at DLL load (string pool).
+static bool IsPipboyMenuOpen()
+{
+	static const RE::BSFixedString kPipboyMenu{ "PipboyMenu" };
+	static const RE::BSFixedString kPipboyHolotapeMenu{ "PipboyHolotapeMenu" };
+	const auto* ui = RE::UI::GetSingleton();
+	return ui && (ui->GetMenuOpen(kPipboyMenu) || ui->GetMenuOpen(kPipboyHolotapeMenu));
+}
+
 // ============================================================
 // TaskQueueInterface — minimal declaration for QueueWeaponFire
 // ============================================================
@@ -120,28 +129,120 @@ namespace LocalSound
 // animation may remain hidden.  Sending all known UnCullBone.* events
 // ensures every weapon part is visible regardless of how far through
 // the reload animation we were when we interrupted it.
+//
+// The engine also tracks a coarse weapon cull on MiddleHighProcessData
+// (animWeaponCull / weaponCullCounter).  If those stay set after we cut
+// the reload short, parts can remain culled even when UnCullBone events
+// are accepted by the graph — clear them whenever we repair visibility.
+//
+// NotifyAnimationGraphImpl() feeds Havok / the behavior graph directly.
+// It does NOT reliably fan out through BSTEventSource<BSAnimationGraphEvent>,
+// so registered BSTEventSinks (F4SE plugins, OAR, etc.) never see those
+// events.  Clip-driven annotations do hit that path.  After each batch of
+// NotifyAnimationGraphImpl calls we therefore synthesize BSAnimationGraphEvent
+// and call BSTEventSource::Notify on every source returned by
+// BGSAnimationSystemUtils::GetEventSourcePointersFromGraph (same sources
+// FPInertia's AnimEventSink registers on).
 // ============================================================
-static void SendAllUnCullBoneEvents(RE::PlayerCharacter* a_player)
+static void ClearEngineWeaponCullFlags(RE::Actor* a_actor)
 {
+	if (!a_actor || !a_actor->currentProcess || !a_actor->currentProcess->middleHigh) {
+		return;
+	}
+	auto* mh = a_actor->currentProcess->middleHigh;
+	mh->animWeaponCull     = false;
+	mh->weaponCullCounter  = 0;
+}
+
+// Sends all UncullBone events as an ordered batch, then a_triggerEvent (if non-null).
+//
+//   Phase 1 — NotifyAnimationGraphImpl (Havok / behavior graph):
+//             UncullBone × 13  →  a_triggerEvent
+//   Phase 2 — BSTEventSource::Notify (F4SE plugin sinks, AnimationEventLog…):
+//             UncullBone × 13  →  a_triggerEvent
+//
+// This mirrors how a native HKX clip annotation batch works: the graph sees
+// every event before any BSTEventSink observer does.  UncullBone events are
+// placed before a_triggerEvent in both phases so the reload sub-graph can
+// accept them while still active — prior to the state-transition event.
+//
+// CRASH NOTE: BSFixedString{} default-constructs with _data = nullptr.
+// AnimationEventLog.dll and ActorMediator::ProcessEvent both call
+// argument.c_str() which then crashes on the null ptr.  Always pass
+// BSFixedString{""} for the argument field (interns the empty string,
+// guarantees a valid non-null _data pointer).
+//
+// Returns the NotifyAnimationGraphImpl result for a_triggerEvent
+// (false when a_triggerEvent is nullptr).
+static bool SendUncullBatch(RE::PlayerCharacter* a_player,
+	const RE::BSFixedString* a_triggerEvent = nullptr)
+{
+	if (!a_player) return false;
+
+	// Local static: BSFixedString constructors call BSStringPool which must be
+	// initialized by the engine first.  A local static is constructed on the
+	// first call to this function (well into gameplay, engine fully up),
+	// not at DLL-load time — avoiding the startup crash that file-scope
+	// RE::BSFixedString statics cause.
 	static const RE::BSFixedString kUnCullEvents[] = {
-		"UnCullBone.WeaponBolt",
-		"UnCullBone.WeaponExtra1",
-		"UnCullBone.WeaponExtra2",
-		"UnCullBone.WeaponExtra3",
-		"UnCullBone.WeaponTrigger",
-		"UnCullBone.WeaponMagazine",
-		"UnCullBone.WeaponMagazineChild1",
-		"UnCullBone.WeaponMagazineChild2",
-		"UnCullBone.WeaponMagazineChild3",
-		"UnCullBone.WeaponMagazineChild4",
-		"UnCullBone.WeaponMagazineChild5",
-		"UnCullBone.WeaponOptics1",
-		"UnCullBone.WeaponOptics2",
+		"UncullBone.WeaponBolt",
+		"UncullBone.WeaponExtra1",
+		"UncullBone.WeaponExtra2",
+		"UncullBone.WeaponExtra3",
+		"UncullBone.WeaponTrigger",
+		"UncullBone.WeaponMagazine",
+		"UncullBone.WeaponMagazineChild1",
+		"UncullBone.WeaponMagazineChild2",
+		"UncullBone.WeaponMagazineChild3",
+		"UncullBone.WeaponMagazineChild4",
+		"UncullBone.WeaponMagazineChild5",
+		"UncullBone.WeaponOptics1",
+		"UncullBone.WeaponOptics2",
 	};
-	if (!a_player) return;
+
+	// Phase 1: Havok / behavior graph
 	for (const auto& evt : kUnCullEvents) {
 		a_player->NotifyAnimationGraphImpl(evt);
 	}
+	bool triggerResult = false;
+	if (a_triggerEvent) {
+		triggerResult = a_player->NotifyAnimationGraphImpl(*a_triggerEvent);
+	}
+
+	// Phase 2: BSTEventSource sinks (same event order as Phase 1)
+	auto* refr = static_cast<RE::TESObjectREFR*>(a_player);
+	RE::BSScrapArray<RE::BSTEventSource<RE::BSAnimationGraphEvent>*> sources;
+	if (!RE::BGSAnimationSystemUtils::GetEventSourcePointersFromGraph(a_player, sources)) {
+		return triggerResult;
+	}
+	const RE::BSFixedString emptyArg{ "" };
+	for (auto* src : sources) {
+		if (!src) continue;
+		for (const auto& evt : kUnCullEvents) {
+			RE::BSAnimationGraphEvent ge{};
+			ge.refr      = refr;
+			ge.animEvent = evt;
+			ge.argument  = emptyArg;
+			src->Notify(ge);
+		}
+		if (a_triggerEvent) {
+			RE::BSAnimationGraphEvent ge{};
+			ge.refr      = refr;
+			ge.animEvent = *a_triggerEvent;
+			ge.argument  = emptyArg;
+			src->Notify(ge);
+		}
+	}
+
+	return triggerResult;
+}
+
+// Clear engine-side cull flags and send all UncullBone events (no trigger event).
+// Used for the periodic replay frames and EarlyEquip.
+static void DispatchWeaponUncullRepair(RE::PlayerCharacter* a_player)
+{
+	ClearEngineWeaponCullFlags(a_player);
+	SendUncullBatch(a_player);
 }
 
 // ============================================================
@@ -284,7 +385,9 @@ namespace HavokVar {
 		std::int32_t capacityAndFlags;
 	};
 
-	inline VarArray* GetVariableArray(RE::Actor* a_actor) {
+	// Full pointer walk (expensive). Used once per Update frame via BeginFrame cache.
+	inline VarArray* ResolveVariableArray(RE::Actor* a_actor)
+	{
 		RE::BSTSmartPointer<RE::BSAnimationGraphManager> mgr;
 		if (!a_actor->GetAnimationGraphManagerImpl(mgr) || !mgr) return nullptr;
 		auto mgrAddr = reinterpret_cast<std::uintptr_t>(mgr.get());
@@ -309,6 +412,37 @@ namespace HavokVar {
 		if (!arr->data || arr->size <= 0) return nullptr;
 
 		return arr;
+	}
+
+	// One-frame cache: BeginFrame(player) at start of InertiaManager::Update;
+	// all HavokVar reads/writes for that actor reuse the resolved array pointer.
+	// EndFrame clears state (RAII FrameGuard). Never held across frames.
+	inline thread_local RE::Actor* tls_frameActor = nullptr;
+	inline thread_local VarArray* tls_frameArray = nullptr;
+
+	inline void BeginFrame(RE::Actor* a_actor)
+	{
+		tls_frameActor = a_actor;
+		tls_frameArray = a_actor ? ResolveVariableArray(a_actor) : nullptr;
+	}
+
+	inline void EndFrame()
+	{
+		tls_frameActor = nullptr;
+		tls_frameArray = nullptr;
+	}
+
+	struct FrameGuard
+	{
+		~FrameGuard() { EndFrame(); }
+	};
+
+	inline VarArray* GetVariableArray(RE::Actor* a_actor)
+	{
+		if (tls_frameActor && a_actor == tls_frameActor) {
+			return tls_frameArray;  // may be nullptr (cached miss)
+		}
+		return ResolveVariableArray(a_actor);
 	}
 
 	inline HkbVarValue* GetVar(RE::Actor* a_actor, int a_index) {
@@ -362,16 +496,16 @@ namespace HavokVar {
 	inline void LogAllAttackVars(RE::Actor* a_actor) {
 		auto* arr = GetVariableArray(a_actor);
 		if (!arr) {
-			logger::info("[HavokVar] Could not reach variableValueSet");
+			logger::trace("[HavokVar] Could not reach variableValueSet");
 			return;
 		}
-		logger::info("[HavokVar] variableValueSet has {} variables", arr->size);
+		logger::trace("[HavokVar] variableValueSet has {} variables", arr->size);
 		auto logVar = [&](const char* name, int idx) {
 			if (idx < arr->size)
-				logger::info("[HavokVar]   [{}] {} = int:{} float:{:.4f}",
+				logger::trace("[HavokVar]   [{}] {} = int:{} float:{:.4f}",
 					idx, name, arr->data[idx].i, arr->data[idx].f);
 			else
-				logger::info("[HavokVar]   [{}] {} = OUT OF RANGE", idx, name);
+				logger::trace("[HavokVar]   [{}] {} = OUT OF RANGE", idx, name);
 		};
 		logVar("Speed", kSpeed);
 		logVar("Direction", kDirection);
@@ -749,20 +883,20 @@ RE::BSEventNotifyControl Inertia::AnimEventSink::ProcessEvent(
 	if (a_event.animEvent == "reloadStart" || a_event.animEvent == "ReloadStart" ||
 	    a_event.animEvent == "reloadStateEnter") {
 		reloadStartThisFrame.store(true, std::memory_order_relaxed);
-		logger::info("[AnimEvent] reloadStart (event={})", a_event.animEvent.c_str());
+		logger::trace("[AnimEvent] reloadStart (event={})", a_event.animEvent.c_str());
 	}
 	if (a_event.animEvent == "reloadEnd" || a_event.animEvent == "ReloadEnd" ||
 	    a_event.animEvent == "reloadStateExit") {
 		reloadEndThisFrame.store(true, std::memory_order_relaxed);
-		logger::info("[AnimEvent] reloadEnd (event={})", a_event.animEvent.c_str());
+		logger::trace("[AnimEvent] reloadEnd (event={})", a_event.animEvent.c_str());
 	}
 	if (a_event.animEvent == "reloadComplete" || a_event.animEvent == "ReloadComplete") {
 		reloadCompleteThisFrame.store(true, std::memory_order_relaxed);
-		logger::info("[AnimEvent] reloadComplete");
+		logger::trace("[AnimEvent] reloadComplete");
 	}
 	if (a_event.animEvent == "InitiateStart" || a_event.animEvent == "initiateStart") {
 		initiateStartThisFrame.store(true, std::memory_order_relaxed);
-		logger::info("[AnimEvent] InitiateStart");
+		logger::trace("[AnimEvent] InitiateStart");
 	}
 	if (a_event.animEvent == "SightedStateExit") {
 		sightedExitThisFrame.store(true, std::memory_order_relaxed);
@@ -1303,8 +1437,12 @@ RE::NiNode* Inertia::InertiaManager::GetOrInsertInertiaBone(
 				cachedInsertedBone = existingNode;
 				return existingNode;
 			}
-			// Structure mismatch â€” reinsert
+			// Structure mismatch: detach the stale node so it doesn't remain as an
+			// orphan with no children in the skeleton, then fall through to reinsert.
 			logger::warn("[FPInertia] Inserted bone structure mismatch, reinserting");
+			if (auto* staleParent = existingNode->parent) {
+				staleParent->DetachChild(existingNode);
+			}
 		}
 	}
 
@@ -1315,15 +1453,29 @@ RE::NiNode* Inertia::InertiaManager::GetOrInsertInertiaBone(
 	inserted->name = kInsertedBoneName;
 	inserted->local.translate = RE::NiPoint3{ 0.0f, 0.0f, 0.0f };
 	inserted->local.rotate.MakeIdentity();
+	inserted->local.scale = 1.0f;
 
-	// Insert between pivotBone and its parent:
+	// Crash-safe insertion between pivotBone and its parent:
 	//   Before: parent -> pivotBone
 	//   After:  parent -> inserted -> pivotBone
+	//
+	// Pre-detach pivotBone via the NiPointer overload to keep it alive
+	// (refcount >= 1) while freeing its slot in parent's array. AttachChild
+	// can then reuse the freed slot without growing/reallocating the array,
+	// which eliminates the null-deref that occurred when another mod (e.g. FBA)
+	// had already expanded the same parent array in the same frame.
+	// Clearing pivotBone->parent prevents the implicit DetachFromParent inside
+	// the subsequent AttachChild(pivotBone) from double-detaching.
 	RE::NiNode* parent = pivotBone->parent;
 	if (parent) {
-		parent->AttachChild(inserted, true);
+		RE::NiPointer<RE::NiAVObject> pivotRef;
+		parent->DetachChild(pivotBone, pivotRef);  // detach + keep alive via pivotRef
+		pivotBone->parent = nullptr;               // prevent double-detach in AttachChild
+
+		parent->AttachChild(inserted, true);       // reuses freed slot; no reallocation
 		inserted->parent = parent;
 	}
+	// pivotBone->parent is null; AttachChild skips the implicit DetachFromParent chain
 	inserted->AttachChild(pivotBone, true);
 
 	cachedInsertedBone = inserted;
@@ -1589,13 +1741,23 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	elapsedTime += delta;
 	if (pivotWarmupTimer > 0.0f) pivotWarmupTimer -= delta;
 
+	auto* player = RE::PlayerCharacter::GetSingleton();
+	// Pip-Boy (and holotape-in-Pip-Boy): clear spring / impulse carryover every frame
+	// while open, even if master toggle is off, so re-enabling does not inherit stale state.
+	if (player && IsPipboyMenuOpen()) {
+		ResetSpringPhysicsState();
+	}
+
 	auto* gs = Settings::GetSingleton();
 
 	// MASTER SWITCH — disables ALL features (inertia + extras)
 	if (!gs->enabled) return;
 
-	auto* player = RE::PlayerCharacter::GetSingleton();
 	if (!player) return;
+
+	// One-frame Havok variable-value cache for this actor (cleared at scope exit).
+	HavokVar::BeginFrame(player);
+	const HavokVar::FrameGuard _havokVarFrameGuard{};
 
 	// During save load or cell transitions the player's 3D model isn't loaded yet.
 	// Without 3D there's no skeleton to manipulate and no valid actor states to read.
@@ -1721,10 +1883,10 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	bool reloadComplete = animEventSink.reloadCompleteThisFrame.exchange(false, std::memory_order_relaxed);
 	bool initiateStart  = animEventSink.initiateStartThisFrame.exchange(false, std::memory_order_relaxed);
 
-	if (reloadStarted)  logger::info("[Update] consumed reloadStarted");
-	if (reloadEnd)       logger::info("[Update] consumed reloadEnd");
-	if (reloadComplete)  logger::info("[Update] consumed reloadComplete");
-	if (initiateStart)   logger::info("[Update] consumed initiateStart");
+	if (reloadStarted)  logger::trace("[Update] consumed reloadStarted");
+	if (reloadEnd)       logger::trace("[Update] consumed reloadEnd");
+	if (reloadComplete)  logger::trace("[Update] consumed reloadComplete");
+	if (initiateStart)   logger::trace("[Update] consumed initiateStart");
 
 	// ---- Detect empty vs tactical reload (only lock when reload actually starts) ----
 	if (reloadStarted) {
@@ -1898,6 +2060,11 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	// were ADS before it started or pressed ADS mid-reload). Ends the reload
 	// early on the configured trigger event + delay, letting the game's own
 	// input system re-enter ADS naturally.
+
+	if (uncullBoneReplayFrames > 0) {
+		DispatchWeaponUncullRepair(player);
+		--uncullBoneReplayFrames;
+	}
 
 	// Consume the sightedExit flag (fires same frame as reloadStateEnter)
 	animEventSink.sightedExitThisFrame.exchange(false, std::memory_order_relaxed);
@@ -2239,7 +2406,8 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			}
 
 			// Un-hide weapon bones that the equip animation may have culled.
-			SendAllUnCullBoneEvents(player);
+			DispatchWeaponUncullRepair(player);
+			uncullBoneReplayFrames = 3;
 
 			logger::info("[EarlyEquip] Triggered — gunState={} (handler blocked, ads={}, fire={})",
 				preGS, isAdsEquip, !isAdsEquip);
@@ -2325,18 +2493,23 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 						atkHandler->inputEventHandlingEnabled = false;
 					}
 
-					RE::BSFixedString evtEnd("ReloadEnd");
-					bool r1 = player->NotifyAnimationGraphImpl(evtEnd);
-					auto postGS = static_cast<std::uint32_t>(player->gunState);
+				// Send all UncullBone events + ReloadEnd as one ordered batch:
+				//   Phase 1 (graph): UncullBone × 13 → ReloadEnd
+				//   Phase 2 (sinks): UncullBone × 13 → ReloadEnd
+				// UncullBone first so the reload sub-graph accepts them before
+				// the state-transition event fires.
+				ClearEngineWeaponCullFlags(player);
+				RE::BSFixedString evtEnd("ReloadEnd");
+				bool r1 = SendUncullBatch(player, &evtEnd);
+				auto postGS = static_cast<std::uint32_t>(player->gunState);
 
-					HavokVar::SetBool(player, HavokVar::kIsReloading, false);
-					HavokVar::SetBool(player, HavokVar::kIsAttacking, false);
+				HavokVar::SetBool(player, HavokVar::kIsReloading, false);
+				HavokVar::SetBool(player, HavokVar::kIsAttacking, false);
 
-					// Un-hide any weapon bones that the reload animation would
-					// have un-culled later (e.g. magazine, bolt, trigger).
-					SendAllUnCullBoneEvents(player);
+				DispatchWeaponUncullRepair(player);
+				uncullBoneReplayFrames = 3;
 
-					logger::info("[EarlyADS] Timer fired — ReloadEnd={}, gunState {} -> {} (handler blocked, forced isReloading=false)",
+				logger::info("[EarlyADS] Timer fired — ReloadEnd={}, gunState {} -> {} (handler blocked, forced isReloading=false)",
 						r1, preGS, postGS);
 
 					HavokVar::LogAllAttackVars(player);
@@ -2434,17 +2607,21 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 					atkHandler->inputEventHandlingEnabled = false;
 				}
 
+			// Send all UncullBone events + ReloadEnd as one ordered batch:
+			//   Phase 1 (graph): UncullBone × 13 → ReloadEnd
+			//   Phase 2 (sinks): UncullBone × 13 → ReloadEnd
+			ClearEngineWeaponCullFlags(player);
 			RE::BSFixedString evtEnd("ReloadEnd");
-			bool r1 = player->NotifyAnimationGraphImpl(evtEnd);
+			bool r1 = SendUncullBatch(player, &evtEnd);
 			auto postGS = static_cast<std::uint32_t>(player->gunState);
 
-				HavokVar::SetBool(player, HavokVar::kIsReloading, false);
-				HavokVar::SetBool(player, HavokVar::kIsAttacking, false);
+			HavokVar::SetBool(player, HavokVar::kIsReloading, false);
+			HavokVar::SetBool(player, HavokVar::kIsAttacking, false);
 
-				// Un-hide weapon bones culled mid-reload.
-				SendAllUnCullBoneEvents(player);
+			DispatchWeaponUncullRepair(player);
+			uncullBoneReplayFrames = 3;
 
-				logger::info("[EarlyFireCancel] Triggered — ReloadEnd={}, gunState {} -> {} (handler blocked, isReloading=false)",
+			logger::info("[EarlyFireCancel] Triggered — ReloadEnd={}, gunState {} -> {} (handler blocked, isReloading=false)",
 					r1, preGS, postGS);
 
 				HavokVar::LogAllAttackVars(player);
@@ -2475,7 +2652,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		HavokVar::GetBool(player, HavokVar::kIsAttacking, diagAttacking);
 		HavokVar::GetBool(player, HavokVar::kIsAttackReady, diagAtkReady);
 		HavokVar::GetBool(player, HavokVar::kIsAttackNotReady, diagAtkNotReady);
-		logger::info("[EarlyADS-Diag] frame={} gs={} iAtkState={} firing={} reloading={} attacking={} atkReady={} atkNotReady={}",
+		logger::trace("[EarlyADS-Diag] frame={} gs={} iAtkState={} firing={} reloading={} attacking={} atkReady={} atkNotReady={}",
 			10 - earlyAdsPostDiagFrames, diagGS, atkState, diagFiring, diagReloading, diagAttacking, diagAtkReady, diagAtkNotReady);
 	}
 
@@ -2880,6 +3057,14 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	UpdateImpulseSpring(reloadImpulse,          ws.reloadStiffness,           ws.reloadDamping, delta);
 	UpdateImpulseSpring(emptyReloadImpulse,     ws.emptyReloadStiffness,      ws.emptyReloadDamping, delta);
 
+	// Pip-Boy uses the same first-person rig / weapon chain as viewmodel offsets.
+	// Springs are integrated above every frame; a start-of-Update reset was not
+	// enough — COMBINE would still pick up impulses + camera/movement. Clear here
+	// so we never push deferred or immediate offsets while the menu is up.
+	if (IsPipboyMenuOpen()) {
+		ResetSpringPhysicsState();
+	}
+
 	// ---- PROCEDURAL ADS TRANSITION ----
 	SpringState adsTransitionOffset{};  // starts zeroed
 	if (adsTransitionActive) {
@@ -2994,7 +3179,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	bool doBaselineLog = (debugFrameCounter >= 30);
 	if (doBaselineLog) {
 		debugFrameCounter = 0;
-		logger::info("[FPInertia] dt={:.4f} "
+		logger::trace("[FPInertia] dt={:.4f} "
 			"camVel p={:.3f} y={:.3f} | "
 			"PITCH spr: off={:.4f} vel={:.4f} | "
 			"YAW pos: off={:.4f} vel={:.4f} | "
@@ -3037,6 +3222,10 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 // ============================================================
 void Inertia::InertiaManager::OnFirstPersonUpdate(RE::NiAVObject* firstPersonObject)
 {
+	if (IsPipboyMenuOpen()) {
+		deferredOffsets.hasOffsets = false;
+		return;
+	}
 	if (!deferredOffsets.hasOffsets) return;
 	if (!firstPersonObject) return;
 	auto* node = static_cast<RE::NiNode*>(firstPersonObject);
@@ -3051,7 +3240,7 @@ void Inertia::InertiaManager::OnFirstPersonUpdate(RE::NiAVObject* firstPersonObj
 // ============================================================
 // Reset / lifecycle
 // ============================================================
-void Inertia::InertiaManager::Reset()
+void Inertia::InertiaManager::ResetSpringPhysicsState()
 {
 	cameraSpring.Reset();
 	movementSpring.Reset();
@@ -3071,10 +3260,24 @@ void Inertia::InertiaManager::Reset()
 	prevLeanDir       = 0.0f;
 	leanAdditiveOffset = { 0.0f, 0.0f, 0.0f };
 	wasSneaking = false;
+	smoothedLocalMovement = { 0.0f, 0.0f, 0.0f };
 	deferredOffsets.hasOffsets = false;
 	settlingFactor = 0.0f;
 	timeSinceMovement = 0.0f;
 	actionBlendFactor = 1.0f;
+	adsTransitionActive    = false;
+	adsTransitionTimer     = 0.0f;
+	adsTransitionProgress  = 0.0f;
+	adsTransitionDuration  = 0.0f;
+	initialized            = false;
+	lastCameraYaw          = 0.0f;
+	lastCameraPitch        = 0.0f;
+	smoothedCameraVelocity = { 0.0f, 0.0f, 0.0f };
+}
+
+void Inertia::InertiaManager::Reset()
+{
+	ResetSpringPhysicsState();
 	reloadElapsedTime = 0.0f;
 	lastMeasuredReloadDuration = 0.0f;
 	meleeElapsedTime = 0.0f;
@@ -3118,11 +3321,6 @@ void Inertia::InertiaManager::Reset()
 	earlyFireCancelPending = false;
 	earlyFireCancelTimer   = 0.0f;
 
-	adsTransitionActive   = false;
-	adsTransitionTimer    = 0.0f;
-	adsTransitionProgress = 0.0f;
-	adsTransitionDuration = 0.0f;
-
 	pendingFallImpulse = false;
 	pendingFallTimer   = 0.0f;
 	confirmedInAir     = false;
@@ -3132,11 +3330,6 @@ void Inertia::InertiaManager::Reset()
 	hasRefPosePivot = false;
 	refPosePivotTranslate = { 0.0f, 0.0f, 0.0f };
 	cachedWeaponSettingsValid = false;
-
-	initialized = false;
-	lastCameraYaw = 0.0f;
-	lastCameraPitch = 0.0f;
-	smoothedCameraVelocity = { 0.0f, 0.0f, 0.0f };
 }
 
 void Inertia::InertiaManager::OnGameLoaded()

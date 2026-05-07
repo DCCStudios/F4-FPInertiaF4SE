@@ -5,6 +5,7 @@
 
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 namespace WeaponFOV
 {
@@ -517,32 +518,41 @@ namespace WeaponFOV
 		}
 
 		if (needApply) {
-			// Build a reason string for the log
+			auto*       infoLogger = spdlog::default_logger().get();
+			const bool log_info    = infoLogger && infoLogger->should_log(spdlog::level::info);
+
 			std::string reason;
-			if (resumingFromBlock) reason += "resumeFromBlock ";
-			if (weaponChanged)    reason += "weaponChanged ";
-			if (drawChanged)      reason += "drawChanged ";
-			if (entryGained)      reason += "entryGained ";
-			if (entryLost)        reason += "entryLost ";
-			if (haveWeaponEntry) {
-				if (std::fabs(targetFOV - lastAppliedFOV) > 0.001f) reason += "fovDrifted ";
-				if (sinceLast > 1.5)    reason += "timedReapply ";
-				if (lastAppliedFOV < 0) reason += "firstApply ";
+			if (log_info) {
+				reason.reserve(96);
+				if (resumingFromBlock) reason += "resumeFromBlock ";
+				if (weaponChanged) reason += "weaponChanged ";
+				if (drawChanged) reason += "drawChanged ";
+				if (entryGained) reason += "entryGained ";
+				if (entryLost) reason += "entryLost ";
+				if (haveWeaponEntry) {
+					if (std::fabs(targetFOV - lastAppliedFOV) > 0.001f) reason += "fovDrifted ";
+					if (sinceLast > 1.5) reason += "timedReapply ";
+					if (lastAppliedFOV < 0) reason += "firstApply ";
+				}
 			}
 
 			if (resumingFromBlock && haveWeaponEntry) {
 				const float fromFOV = defaultViewmodelFOV.load();
-				logger::info("[WeaponFOV] LERP vm {:.1f}->{:.1f} (weapon='{}' cam={:.1f} 3p={:.1f}) reason: {}",
-					fromFOV, targetFOV,
-					curEditorID.empty() ? "<none>" : curEditorID.c_str(),
-					cameraFOV.load(), thirdPersonFOV.load(), reason);
+				if (log_info) {
+					logger::info("[WeaponFOV] LERP vm {:.1f}->{:.1f} (weapon='{}' cam={:.1f} 3p={:.1f}) reason: {}",
+						fromFOV, targetFOV,
+						curEditorID.empty() ? "<none>" : curEditorID.c_str(),
+						cameraFOV.load(), thirdPersonFOV.load(), reason);
+				}
 				InterpolateViewmodelFOV(fromFOV, targetFOV, 12);
 			} else {
-				logger::info("[WeaponFOV] APPLY vm={:.1f} (weapon='{}' cam={:.1f} 3p={:.1f} prev={:.1f}) reason: {}",
-					targetFOV,
-					curEditorID.empty() ? "<none>" : curEditorID.c_str(),
-					cameraFOV.load(), thirdPersonFOV.load(),
-					lastAppliedFOV, reason);
+				if (log_info) {
+					logger::info("[WeaponFOV] APPLY vm={:.1f} (weapon='{}' cam={:.1f} 3p={:.1f} prev={:.1f}) reason: {}",
+						targetFOV,
+						curEditorID.empty() ? "<none>" : curEditorID.c_str(),
+						cameraFOV.load(), thirdPersonFOV.load(),
+						lastAppliedFOV, reason);
+				}
 				ApplyViewmodelFOV(targetFOV);
 			}
 			lastAppliedFOV = targetFOV;
@@ -551,12 +561,15 @@ namespace WeaponFOV
 
 		// Log weapon/entry transitions even when no apply was needed
 		if ((weaponChanged || drawChanged || entryGained || entryLost) && !needApply) {
-			logger::info("[WeaponFOV] Transition (no apply): weapon='{}' drawn={} present={} entry={} lastVM={:.1f}",
-				curEditorID.empty() ? "<none>" : curEditorID.c_str(),
-				weaponDrawn ? "yes" : "no",
-				weaponPresent ? "yes" : "no",
-				haveWeaponEntry ? "yes" : "no",
-				lastAppliedFOV);
+			auto* infoLogger = spdlog::default_logger().get();
+			if (infoLogger && infoLogger->should_log(spdlog::level::info)) {
+				logger::info("[WeaponFOV] Transition (no apply): weapon='{}' drawn={} present={} entry={} lastVM={:.1f}",
+					curEditorID.empty() ? "<none>" : curEditorID.c_str(),
+					weaponDrawn ? "yes" : "no",
+					weaponPresent ? "yes" : "no",
+					haveWeaponEntry ? "yes" : "no",
+					lastAppliedFOV);
+			}
 		}
 
 		hadWeaponEntry   = haveWeaponEntry;
