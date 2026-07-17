@@ -1,7 +1,7 @@
 {
-  "name": "fpinertia",
+  "name": "fpgunplayoverhaul",
   "version-string": "1.0.0",
-  "description": "First-person weapon inertia for Fallout 4",
+  "description": "First-person gunplay overhaul for Fallout 4",
   "license": "MIT",
   "dependencies": [
     "boost-stl-interfaces",

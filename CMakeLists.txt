@@ -20,7 +20,7 @@ endif()
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL" CACHE STRING "")
 
 project(
-	FPInertia
+	FPGunplayOverhaul
 	VERSION 1.0.0
 	LANGUAGES CXX
 )
@@ -60,6 +60,7 @@ set(SOURCES
 	src/Menu.cpp
 	src/ChamberExclusion.cpp
 	src/WeaponFOV.cpp
+	src/FireOnEmpty.cpp
 )
 
 set(HEADERS
@@ -72,6 +73,7 @@ set(HEADERS
 	src/F4SEMenuFramework.h
 	src/ChamberExclusion.h
 	src/WeaponFOV.h
+	src/FireOnEmpty.h
 )
 
 add_library(${PROJECT_NAME} SHARED
@@ -129,8 +131,8 @@ endif()
 
 # Copy config files
 configure_file(
-	${CMAKE_CURRENT_SOURCE_DIR}/FPInertia.ini
-	${CMAKE_SOURCE_DIR}/Compile/F4SE/Plugins/FPInertia.ini
+	${CMAKE_CURRENT_SOURCE_DIR}/FPGunplayOverhaul.ini
+	${CMAKE_SOURCE_DIR}/Compile/F4SE/Plugins/FPGunplayOverhaul.ini
 	COPYONLY
 )
 
@@ -142,6 +144,6 @@ if (COPY_BUILD AND DEFINED Fallout4Path)
 		POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:${PROJECT_NAME}> "${Fallout4Path}/Data/F4SE/Plugins/"
 		COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_PDB_FILE:${PROJECT_NAME}> "${Fallout4Path}/Data/F4SE/Plugins/"
-		COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/FPInertia.ini" "${Fallout4Path}/Data/F4SE/Plugins/"
+		COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/FPGunplayOverhaul.ini" "${Fallout4Path}/Data/F4SE/Plugins/"
 	)
 endif()

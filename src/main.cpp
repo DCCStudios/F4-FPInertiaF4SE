@@ -4,13 +4,14 @@
 #include "Menu.h"
 #include "ChamberExclusion.h"
 #include "WeaponFOV.h"
+#include "FireOnEmpty.h"
 
 // ============================================================
 // Plugin Info
 // ============================================================
 namespace Plugin
 {
-	static constexpr auto NAME    = "FPInertia"sv;
+	static constexpr auto NAME    = "FPGunplayOverhaul"sv;
 	static constexpr auto VERSION = REL::Version{ 1, 0, 0 };
 }
 
@@ -23,7 +24,7 @@ namespace
 
 	void DisableWithError(std::string_view title, std::string_view body)
 	{
-		logger::critical("[FPInertia] {}: {}", title, body);
+		logger::critical("[FPGunplayOverhaul] {}: {}", title, body);
 		g_pluginEnabled.store(false);
 		::MessageBoxA(nullptr, body.data(), title.data(), 0 /* MB_OK */);
 	}
@@ -32,7 +33,7 @@ namespace
 	{
 		const auto lighthouseInfo = F4SE::GetPluginInfo("LighthousePapyrusExtender");
 		if (lighthouseInfo) {
-			logger::info("[FPInertia] LighthousePapyrusExtender v{} detected.",
+			logger::info("[FPGunplayOverhaul] LighthousePapyrusExtender v{} detected.",
 				lighthouseInfo->version);
 		}
 	}
@@ -70,7 +71,7 @@ namespace
 	// FOV Slider F4SE handshake (matched in FOV Slider F4SE/src/FOVManager.cpp):
 	//   FSRF  - settings changed, refresh WBFOV defaults
 	//   FSLK  - external override lock state. 1-byte payload: 0=unlock, 1=lock.
-	//           While locked, FPInertia's WBFOV stops applying the viewmodel
+	//           While locked, FPGunplayOverhaul's WBFOV stops applying the viewmodel
 	//           FOV so FOV Slider F4SE can own the Pip-Boy / Terminal /
 	//           Aiming contexts without a tug-of-war.
 	static constexpr std::uint32_t kFOVSliderRefreshMsg = 0x46535246;
@@ -82,7 +83,7 @@ namespace
 
 		if (msg->type == kFOVSliderRefreshMsg) {
 			if (g_pluginEnabled) {
-				logger::trace("[FPInertia] FOV Slider F4SE refresh received - reloading WBFOV defaults");
+				logger::trace("[FPGunplayOverhaul] FOV Slider F4SE refresh received - reloading WBFOV defaults");
 				WeaponFOV::Manager::GetSingleton()->RefreshDefaults();
 			}
 			return;
@@ -99,12 +100,14 @@ namespace
 		switch (msg->type) {
 		case F4SE::MessagingInterface::kGameDataReady:
 		{
-			logger::info("[FPInertia] kGameDataReady - initializing");
+			logger::info("[FPGunplayOverhaul] kGameDataReady - initializing");
 			LogOptionalDependencies();
 			Settings::GetSingleton()->Load();
 			InertiaPresets::GetSingleton()->Init();
 			ChamberExclusion::Manager::GetSingleton()->Init();
 			WeaponFOV::Manager::GetSingleton()->Init();
+			FireOnEmpty::Manager::GetSingleton()->Init();
+			Inertia::InertiaManager::GetSingleton()->InitSuperSprint();
 			Inertia::Install();
 			Menu::Register();
 			break;
@@ -112,7 +115,7 @@ namespace
 
 		case F4SE::MessagingInterface::kPostLoadGame:
 			if (!g_pluginEnabled) return;
-			logger::info("[FPInertia] kPostLoadGame - reloading config");
+			logger::info("[FPGunplayOverhaul] kPostLoadGame - reloading config");
 			Settings::GetSingleton()->Load();
 			Inertia::InertiaManager::GetSingleton()->OnGameLoaded();
 			ChamberExclusion::Manager::GetSingleton()->ReapplyAllKeywords(
@@ -123,7 +126,7 @@ namespace
 
 		case F4SE::MessagingInterface::kNewGame:
 			if (!g_pluginEnabled) return;
-			logger::info("[FPInertia] kNewGame - reloading config");
+			logger::info("[FPGunplayOverhaul] kNewGame - reloading config");
 			Settings::GetSingleton()->Load();
 			Inertia::InertiaManager::GetSingleton()->OnGameLoaded();
 			ChamberExclusion::Manager::GetSingleton()->ReapplyAllKeywords(
@@ -148,13 +151,13 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface* F
 	info->version     = 1;
 
 	if (F4SE->IsEditor()) {
-		logger::critical("[FPInertia] Loaded in editor, skipping");
+		logger::critical("[FPGunplayOverhaul] Loaded in editor, skipping");
 		return false;
 	}
 
 	const auto ver = F4SE->RuntimeVersion();
 	if (ver < F4SE::RUNTIME_1_10_162) {
-		logger::critical("[FPInertia] Unsupported runtime version {}", ver.string());
+		logger::critical("[FPGunplayOverhaul] Unsupported runtime version {}", ver.string());
 		return false;
 	}
 
@@ -176,7 +179,7 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* F4S
 
 	auto* messaging = F4SE::GetMessagingInterface();
 	if (!messaging || !messaging->RegisterListener(MessageCallback)) {
-		logger::critical("[FPInertia] Failed to register messaging listener");
+		logger::critical("[FPGunplayOverhaul] Failed to register messaging listener");
 		return false;
 	}
 	// Second registration for cross-plugin messages from FOV Slider F4SE.
@@ -186,9 +189,9 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* F4S
 	// from FOV Slider F4SE we register a second listener targeting that
 	// plugin's name as the sender filter.
 	if (!messaging->RegisterListener(MessageCallback, "FOVSliderF4SE")) {
-		logger::warn("[FPInertia] Failed to register FOVSliderF4SE message listener (cross-plugin refresh disabled)");
+		logger::warn("[FPGunplayOverhaul] Failed to register FOVSliderF4SE message listener (cross-plugin refresh disabled)");
 	}
 
-	logger::info("[FPInertia] Plugin loaded, waiting for kGameDataReady");
+	logger::info("[FPGunplayOverhaul] Plugin loaded, waiting for kGameDataReady");
 	return true;
 }

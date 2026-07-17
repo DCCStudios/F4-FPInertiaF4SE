@@ -2,6 +2,7 @@
 #include "Inertia.h"
 #include "ChamberExclusion.h"
 #include "WeaponFOV.h"
+#include "FireOnEmpty.h"
 #include <format>
 
 // Pull ImGuiMCP types into scope so we don't need to prefix every ImVec4, ImGuiCol_*, etc.
@@ -85,18 +86,18 @@ namespace Menu
 	void Register()
 	{
 		if (!F4SEMenuFramework::IsInstalled()) {
-			logger::warn("[FPInertia] F4SE Menu Framework is not installed - menu will not be available");
+			logger::warn("[FPGunplayOverhaul] F4SE Menu Framework is not installed - menu will not be available");
 			return;
 		}
 
-		F4SEMenuFramework::SetSection("FP Inertia");
+		F4SEMenuFramework::SetSection("FP Gunplay Overhaul");
 		F4SEMenuFramework::AddSectionItem("Inertia Configs", Render);
 		F4SEMenuFramework::AddSectionItem("ADS Transitions", RenderADSTransitions);
 		F4SEMenuFramework::AddSectionItem("Debug Info", RenderDebugInfo);
 		F4SEMenuFramework::AddSectionItem("Extras", RenderExtras);
 		State::debugPopoutWindow = F4SEMenuFramework::AddWindow(RenderDebugPopout, false);
 
-		logger::info("[FPInertia] Menu registered with F4SE Menu Framework");
+		logger::info("[FPGunplayOverhaul] Menu registered with F4SE Menu Framework");
 	}
 
 	// ============================================================
@@ -340,7 +341,7 @@ namespace Menu
 		ImGuiMCP::SetNextWindowPos(windowPos, ImGuiMCP::ImGuiCond_Appearing, { 0, 0 });
 		ImGuiMCP::SetNextWindowSize(windowSize, ImGuiMCP::ImGuiCond_Appearing);
 
-		ImGuiMCP::Begin("FP Inertia Debug##FPInertia", nullptr,
+		ImGuiMCP::Begin("FP Gunplay Overhaul Debug##FPGunplayOverhaul", nullptr,
 			ImGuiMCP::ImGuiWindowFlags_NoCollapse);
 
 		using namespace Inertia;
@@ -358,7 +359,7 @@ namespace Menu
 	{
 		auto* settings = Settings::GetSingleton();
 
-		ImGuiMCP::Text("FP Inertia v1.0.0");
+		ImGuiMCP::Text("FP Gunplay Overhaul v1.0.0");
 		ImGuiMCP::SameLine();
 
 		if (ImGuiMCP::Checkbox("Enabled", &settings->enabled)) {
@@ -490,7 +491,7 @@ namespace Menu
 		}
 
 		ImGuiMCP::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
-			"Editing: Data\\F4SE\\Plugins\\FPInertia\\%s.json", presets->GetActivePresetName().c_str());
+			"Editing: Data\\F4SE\\Plugins\\FPGunplayOverhaul\\%s.json", presets->GetActivePresetName().c_str());
 
 		// Create preset popup
 		if (State::showCreatePresetPopup) {
@@ -1112,7 +1113,7 @@ namespace Menu
 					targetSettings = sourceSettings;
 					presets->SaveWeaponTypePresets();
 					presets->SetActivePreset(currentPreset);
-					logger::info("[FPInertia] Copied {} settings from '{}' to '{}'",
+					logger::info("[FPGunplayOverhaul] Copied {} settings from '{}' to '{}'",
 						State::copySourceWeaponType, currentPreset, targetPreset);
 					State::showCopyToPresetPopup = false;
 					ImGuiMCP::CloseCurrentPopup();
@@ -2220,7 +2221,7 @@ namespace Menu
 			State::saveStatusTimer = 4.0f;
 		}
 		if (ImGuiMCP::IsItemHovered()) {
-			ImGuiMCP::SetTooltip("Save global settings to Data\\F4SE\\Plugins\\FPInertia.ini");
+			ImGuiMCP::SetTooltip("Save global settings to Data\\F4SE\\Plugins\\FPGunplayOverhaul.ini");
 		}
 
 		ImGuiMCP::SameLine();
@@ -2264,7 +2265,7 @@ namespace Menu
 			State::saveStatusTimer = 4.0f;
 		}
 		if (ImGuiMCP::IsItemHovered()) {
-			ImGuiMCP::SetTooltip("Save current weapon type settings to:\nData\\F4SE\\Plugins\\FPInertia\\%s.json",
+			ImGuiMCP::SetTooltip("Save current weapon type settings to:\nData\\F4SE\\Plugins\\FPGunplayOverhaul\\%s.json",
 				presets->GetActivePresetName().c_str());
 		}
 
@@ -2279,7 +2280,7 @@ namespace Menu
 			State::saveStatusTimer = 4.0f;
 		}
 		if (ImGuiMCP::IsItemHovered()) {
-			ImGuiMCP::SetTooltip("Reload weapon type settings from:\nData\\F4SE\\Plugins\\FPInertia\\%s.json",
+			ImGuiMCP::SetTooltip("Reload weapon type settings from:\nData\\F4SE\\Plugins\\FPGunplayOverhaul\\%s.json",
 				presets->GetActivePresetName().c_str());
 		}
 
@@ -2292,8 +2293,8 @@ namespace Menu
 		}
 
 		// Path info
-		ImGuiMCP::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "INI: Data\\F4SE\\Plugins\\FPInertia.ini");
-		ImGuiMCP::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Preset: Data\\F4SE\\Plugins\\FPInertia\\%s.json",
+		ImGuiMCP::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "INI: Data\\F4SE\\Plugins\\FPGunplayOverhaul.ini");
+		ImGuiMCP::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Preset: Data\\F4SE\\Plugins\\FPGunplayOverhaul\\%s.json",
 			presets->GetActivePresetName().c_str());
 	}
 
@@ -2306,12 +2307,24 @@ namespace Menu
 		auto* settings = Settings::GetSingleton();
 		auto* mgr = WeaponFOV::Manager::GetSingleton();
 
+		ImGuiMCP::Indent(8.0f);
+		ImGuiMCP::Spacing();
+		ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "What it does:");
 		ImGuiMCP::TextWrapped(
-			"Force the player viewmodel FOV to a specific value when a weapon is equipped, "
-			"so weapons made by different animators can use the FOV their animations were "
-			"designed for. When no weapon is equipped (or the equipped weapon has no entry), "
-			"the default viewmodel FOV from your installed FOV mod (or 80 if none) is used. "
-			"FOV is restored automatically when you holster or unequip the weapon.");
+			"Forces the viewmodel FOV to a per-weapon value so each weapon uses the FOV "
+			"its animations were designed for.");
+		ImGuiMCP::Spacing();
+		ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "Behavior:");
+		ImGuiMCP::BulletText("Set a custom viewmodel FOV for any weapon by EditorID");
+		ImGuiMCP::BulletText("Falls back to your FOV mod's default (or 80) when no entry exists");
+		ImGuiMCP::BulletText("FOV restores automatically on holster / unequip");
+		ImGuiMCP::Spacing();
+		ImGuiMCP::TextColored(ImVec4(0.5f, 0.8f, 0.5f, 1.0f), "Recommended:");
+		ImGuiMCP::TextWrapped(
+			"Install FOV Slider F4SE for the best experience. It provides automatic "
+			"default FOV detection and coordinates with this plugin to avoid FOV conflicts "
+			"during Pip-Boy, terminal, and aiming contexts.");
+		ImGuiMCP::Unindent(8.0f);
 		ImGuiMCP::Spacing();
 
 		// ---- Master toggle ----
@@ -2485,6 +2498,185 @@ namespace Menu
 	}
 
 	// ============================================================
+	// Helper: Fire on Empty section (rendered inside Extras)
+	// ============================================================
+	static void RenderFireOnEmpty()
+	{
+		using namespace ImGuiMCP;
+		auto* settings = Settings::GetSingleton();
+		auto* mgr = FireOnEmpty::Manager::GetSingleton();
+
+		ImGuiMCP::Indent(8.0f);
+		ImGuiMCP::Spacing();
+		ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "What it does:");
+		ImGuiMCP::TextWrapped(
+			"Forces a weapon to play its fire animation when the trigger is pressed "
+			"with an empty magazine (no rounds loaded, ignoring inventory reserve).");
+		ImGuiMCP::Spacing();
+		ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "Behavior:");
+		ImGuiMCP::BulletText("Opt-in per weapon by EditorID (a JSON file, like the mod's other systems)");
+		ImGuiMCP::BulletText("Disabled by default for every weapon; nothing happens until you add one");
+		ImGuiMCP::BulletText("Choose the single-fire or auto-fire action per weapon");
+		ImGuiMCP::BulletText("First-person only");
+		ImGuiMCP::Spacing();
+		ImGuiMCP::TextColored(ImVec4(0.5f, 0.8f, 0.5f, 1.0f), "Intended use:");
+		ImGuiMCP::TextWrapped(
+			"Pair each opted-in weapon with an Open Animation Replacer set that swaps "
+			"the forced fire animation for a dry-fire (click) animation under your own "
+			"conditions. This plugin only triggers the fire action; OAR supplies the "
+			"dry-fire look.");
+		ImGuiMCP::Unindent(8.0f);
+		ImGuiMCP::Spacing();
+
+		// ---- Master toggle ----
+		if (ImGuiMCP::Checkbox("Enable Fire on Empty##foeEnabled", &settings->fireOnEmptyEnabled)) {
+			State::hasUnsavedChanges = true;
+		}
+		if (ImGuiMCP::IsItemHovered()) {
+			ImGuiMCP::SetTooltip(
+				"Master toggle. When off, no weapon forces its fire animation on empty.\n"
+				"Per-weapon entries below still gate the behavior when this is on.");
+		}
+
+		ImGuiMCP::Spacing();
+		ImGuiMCP::Separator();
+		ImGuiMCP::Spacing();
+
+		// ---- Equipped weapon block ----
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		auto* base = player ? GetEquippedWeaponBase(player) : nullptr;
+
+		std::string   equippedEditorID;
+		std::string   equippedDisplayName;
+		std::uint32_t equippedFormID = 0;
+		if (base) {
+			equippedFormID = base->GetFormID();
+			const char* eid = base->GetFormEditorID();
+			equippedEditorID = (eid && eid[0]) ? eid : std::string();
+			auto* fn = base->As<RE::TESFullName>();
+			equippedDisplayName = (fn && fn->GetFullName() && fn->GetFullName()[0])
+				? fn->GetFullName() : equippedEditorID;
+		}
+
+		ImGuiMCP::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "Equipped Weapon");
+
+		if (equippedFormID == 0) {
+			ImGuiMCP::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "No weapon equipped.");
+		} else if (equippedEditorID.empty()) {
+			ImGuiMCP::TextColored(ImVec4(0.8f, 0.6f, 0.6f, 1.0f),
+				"Equipped weapon has no EditorID — cannot create a Fire on Empty entry.");
+			ImGuiMCP::Text("FormID: 0x%08X (%s)", equippedFormID, equippedDisplayName.c_str());
+		} else {
+			ImGuiMCP::Text("%s", equippedDisplayName.c_str());
+			ImGuiMCP::Text("EditorID: %s", equippedEditorID.c_str());
+
+			FireOnEmpty::FOEEntry entry;
+			const bool hasEntry = mgr->GetEntry(equippedEditorID, entry);
+
+			if (!hasEntry) {
+				if (ImGuiMCP::Button("Add Entry##foeAdd")) {
+					// Create the JSON on demand — enabled and single-fire by default.
+					mgr->SetEntry(equippedEditorID, equippedDisplayName, true, false);
+					State::saveStatusMsg = std::format("Fire on Empty: added {}", equippedEditorID);
+					State::saveStatusTimer = 4.0f;
+				}
+				if (ImGuiMCP::IsItemHovered()) {
+					auto path = mgr->GetEntryPath(equippedEditorID);
+					ImGuiMCP::SetTooltip("Will create: %s", path.string().c_str());
+				}
+			} else {
+				bool enabled  = entry.enabled;
+				bool autoFire = entry.autoFire;
+
+				if (ImGuiMCP::Checkbox("Enabled##foeEquipEnabled", &enabled)) {
+					mgr->SetEntry(equippedEditorID, equippedDisplayName, enabled, autoFire);
+				}
+				if (ImGuiMCP::IsItemHovered()) {
+					ImGuiMCP::SetTooltip("Force the fire animation for this weapon when its magazine is empty.");
+				}
+
+				if (ImGuiMCP::Checkbox("Auto-fire animation##foeEquipAuto", &autoFire)) {
+					mgr->SetEntry(equippedEditorID, equippedDisplayName, enabled, autoFire);
+				}
+				if (ImGuiMCP::IsItemHovered()) {
+					ImGuiMCP::SetTooltip(
+						"Checked: send the automatic fire action (for automatic weapons).\n"
+						"Unchecked: send the single fire action (for semi-auto / bolt / etc.).");
+				}
+
+				if (ImGuiMCP::Button("Remove Entry##foeRemove")) {
+					mgr->RemoveEntry(equippedEditorID);
+					State::saveStatusMsg = std::format("Fire on Empty: removed {}", equippedEditorID);
+					State::saveStatusTimer = 4.0f;
+				}
+				if (ImGuiMCP::IsItemHovered()) {
+					auto path = mgr->GetEntryPath(equippedEditorID);
+					ImGuiMCP::SetTooltip("Deletes: %s", path.string().c_str());
+				}
+				ImGuiMCP::SameLine();
+				if (entry.enabled) {
+					ImGuiMCP::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "(active: %s)",
+						entry.autoFire ? "auto" : "single");
+				} else {
+					ImGuiMCP::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(entry disabled)");
+				}
+			}
+		}
+
+		ImGuiMCP::Spacing();
+		ImGuiMCP::Separator();
+		ImGuiMCP::Spacing();
+
+		// ---- All entries list ----
+		auto allEntries = mgr->GetEntries();
+		ImGuiMCP::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+			"All Fire on Empty Entries (%d)", static_cast<int>(allEntries.size()));
+
+		if (allEntries.empty()) {
+			ImGuiMCP::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "No weapons configured.");
+		} else {
+			static int s_foeRemoveIdx = -1;
+			for (int i = 0; i < static_cast<int>(allEntries.size()); ++i) {
+				auto& e = allEntries[i];
+
+				ImGuiMCP::PushID(i);
+
+				if (!e.displayName.empty() && e.displayName != e.editorID) {
+					ImGuiMCP::Text("%s  ", e.displayName.c_str());
+					ImGuiMCP::SameLine();
+					ImGuiMCP::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(%s)", e.editorID.c_str());
+				} else {
+					ImGuiMCP::Text("%s", e.editorID.c_str());
+				}
+
+				bool enabled  = e.enabled;
+				bool autoFire = e.autoFire;
+				if (ImGuiMCP::Checkbox("On##foeListEnabled", &enabled)) {
+					mgr->SetEntry(e.editorID, e.displayName, enabled, autoFire);
+				}
+				ImGuiMCP::SameLine();
+				if (ImGuiMCP::Checkbox("Auto##foeListAuto", &autoFire)) {
+					mgr->SetEntry(e.editorID, e.displayName, enabled, autoFire);
+				}
+				ImGuiMCP::SameLine();
+				if (ImGuiMCP::SmallButton("X##foeListDel")) {
+					s_foeRemoveIdx = i;
+				}
+				if (ImGuiMCP::IsItemHovered()) {
+					auto path = mgr->GetEntryPath(e.editorID);
+					ImGuiMCP::SetTooltip("Delete: %s", path.string().c_str());
+				}
+
+				ImGuiMCP::PopID();
+			}
+			if (s_foeRemoveIdx >= 0 && s_foeRemoveIdx < static_cast<int>(allEntries.size())) {
+				mgr->RemoveEntry(allEntries[s_foeRemoveIdx].editorID);
+				s_foeRemoveIdx = -1;
+			}
+		}
+	}
+
+	// ============================================================
 	// Extras Tab
 	// ============================================================
 	void __stdcall RenderExtras()
@@ -2494,8 +2686,10 @@ namespace Menu
 		auto* presets = InertiaPresets::GetSingleton();
 		const auto& types = GetWeaponTypes();
 
-		ImGuiMCP::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "FP Inertia - Extras");
-		ImGuiMCP::TextWrapped("Small quality-of-life features that complement the inertia system.");
+		ImGuiMCP::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "FP Gunplay Overhaul - Extras");
+		ImGuiMCP::Spacing();
+		ImGuiMCP::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+			"Quality-of-life features that complement the inertia system.");
 		ImGuiMCP::Spacing();
 		ImGuiMCP::Separator();
 
@@ -2504,11 +2698,18 @@ namespace Menu
 
 		// ====== EARLY ADS RETURN ======
 		if (ImGuiMCP::CollapsingHeader("Early ADS Return", ImGuiTreeNodeFlags_DefaultOpen)) {
+			ImGuiMCP::Indent(8.0f);
+			ImGuiMCP::Spacing();
+			ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "What it does:");
 			ImGuiMCP::TextWrapped(
-				"When you reload while aiming down sights, the game normally waits for the full reload "
-				"animation to finish before returning to ADS. This feature triggers the ADS return early "
-				"on a configurable animation event, letting you get back on target faster. "
-				"Settings here are per-weapon-type (specific weapon presets override).");
+				"Triggers the ADS return before the reload animation fully finishes, "
+				"so you get back on target faster.");
+			ImGuiMCP::Spacing();
+			ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "How it works:");
+			ImGuiMCP::BulletText("The game normally waits for the full reload to finish before returning to ADS");
+			ImGuiMCP::BulletText("This feature fires an early trigger on a configurable animation event");
+			ImGuiMCP::BulletText("Settings are per-weapon-type (specific weapon presets override)");
+			ImGuiMCP::Unindent(8.0f);
 			ImGuiMCP::Spacing();
 
 			// ---- Weapon type / specific weapon selector ----
@@ -2677,7 +2878,8 @@ namespace Menu
 
 				ImGuiMCP::Spacing();
 				ImGuiMCP::Separator();
-				ImGuiMCP::TextWrapped("Auto-Fire Recovery");
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Auto-Fire Recovery");
 				ImGuiMCP::Spacing();
 
 				if (ImGuiMCP::Checkbox("Enable Auto-Fire Recovery", &ws.earlyAdsAutoFireEnabled)) {
@@ -2744,12 +2946,13 @@ namespace Menu
 							"  300+ = soft tail (may overlap next shot)\n"
 							"\n"
 							"Global setting — applies to every weapon. Stored under\n"
-							"[AutoFire] iSoundFadeMs in FPInertia.ini.");
+							"[AutoFire] iSoundFadeMs in FPGunplayOverhaul.ini.");
 				}
 
 				ImGuiMCP::Spacing();
 				ImGuiMCP::Separator();
-				ImGuiMCP::TextWrapped("Early Fire Cancel");
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Early Fire Cancel");
 				ImGuiMCP::Spacing();
 
 				if (ImGuiMCP::Checkbox("Enable Early Fire Cancel", &ws.earlyFireCancelEnabled)) {
@@ -2773,32 +2976,36 @@ namespace Menu
 
 				ImGuiMCP::Spacing();
 				ImGuiMCP::Separator();
-				ImGuiMCP::TextWrapped("Early Equip");
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Early Equip");
 				ImGuiMCP::Spacing();
 
-				if (ImGuiMCP::Checkbox("Enable Early Equip ADS", &ws.earlyEquipAdsEnabled)) {
-					s_extrasEditorChanged = true;
-				}
-				if (ImGuiMCP::IsItemHovered())
-					ImGuiMCP::SetTooltip(
-						"If the ADS input is held during a weapon equip animation\n"
-						"(WPNEquip / WPNEquipFast), trigger ADS early when the\n"
-						"InitiateStart anim event fires instead of waiting for\n"
-						"the full equip animation to finish.\n"
-						"\n"
-						"Uses the same delay and blend settings as Early ADS Return.");
+				// Disabled for now — these features are planned for a future version
+				ImGuiMCP::BeginDisabled(true);
 
-				if (ImGuiMCP::Checkbox("Enable Early Equip Fire", &ws.earlyEquipFireEnabled)) {
-					s_extrasEditorChanged = true;
-				}
-				if (ImGuiMCP::IsItemHovered())
+				bool earlyEquipAdsDisabled = ws.earlyEquipAdsEnabled;
+				ImGuiMCP::Checkbox("Enable Early Equip ADS", &earlyEquipAdsDisabled);
+
+				ImGuiMCP::EndDisabled();
+				if (ImGuiMCP::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
 					ImGuiMCP::SetTooltip(
-						"If the fire input is held during a weapon equip animation\n"
-						"(WPNEquip / WPNEquipFast), allow hipfire early when the\n"
-						"InitiateStart anim event fires instead of waiting for\n"
-						"the full equip animation to finish.\n"
+						"Coming in a future version.\n"
 						"\n"
-						"Uses the same delay and blend settings as Early ADS Return.");
+						"Will allow triggering ADS early during weapon equip\n"
+						"animations (WPNEquip / WPNEquipFast).");
+
+				ImGuiMCP::BeginDisabled(true);
+
+				bool earlyEquipFireDisabled = ws.earlyEquipFireEnabled;
+				ImGuiMCP::Checkbox("Enable Early Equip Fire", &earlyEquipFireDisabled);
+
+				ImGuiMCP::EndDisabled();
+				if (ImGuiMCP::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+					ImGuiMCP::SetTooltip(
+						"Coming in a future version.\n"
+						"\n"
+						"Will allow hipfire early during weapon equip\n"
+						"animations (WPNEquip / WPNEquipFast).");
 
 			if (s_extrasEditorChanged) {
 				presets->IncrementSettingsVersion();
@@ -2814,19 +3021,150 @@ namespace Menu
 			RenderWeaponBasedFOV();
 		}
 
+		// ====== FIRE ON EMPTY ======
+		ImGuiMCP::Spacing();
+		if (ImGuiMCP::CollapsingHeader("Fire on Empty")) {
+			RenderFireOnEmpty();
+		}
+
+		// ====== SUPER SPRINT ======
+		ImGuiMCP::Spacing();
+		if (ImGuiMCP::CollapsingHeader("Super Sprint")) {
+			auto* settings = Settings::GetSingleton();
+			auto* inertMgr = Inertia::InertiaManager::GetSingleton();
+
+			ImGuiMCP::Indent(8.0f);
+			ImGuiMCP::Spacing();
+			ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "What it does:");
+			ImGuiMCP::TextWrapped(
+				"Double-tap sprint to activate a faster sprint mode with boosted speed, "
+				"higher AP drain, and faster animation playback.");
+			ImGuiMCP::Spacing();
+			ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "Details:");
+			ImGuiMCP::BulletText("Release and re-press sprint within the tap window to activate");
+			ImGuiMCP::BulletText("Movement speed, AP drain, and animation speed are all configurable");
+			ImGuiMCP::BulletText("Adds AnimSuperSprintKeyword to the player for OAR animation replacements");
+			ImGuiMCP::Unindent(8.0f);
+			ImGuiMCP::Spacing();
+
+			// Current status indicator
+			if (inertMgr->IsSuperSprintActive()) {
+				ImGuiMCP::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "Status: ACTIVE");
+			} else {
+				ImGuiMCP::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Status: Inactive");
+			}
+			ImGuiMCP::Spacing();
+
+			if (CheckboxWithTooltip("Enable Super Sprint##superSprint", &settings->superSprintEnabled,
+				"Master toggle for the Super Sprint feature.\n"
+				"When disabled, double-tapping sprint has no special effect.")) {
+				State::hasUnsavedChanges = true;
+			}
+
+			if (settings->superSprintEnabled) {
+				ImGuiMCP::Spacing();
+
+				if (SliderFloatWithTooltip("Double-Tap Window##ssDblTap", &settings->superSprintDoubleTapWindow,
+					0.1f, 1.0f, "%.2f sec",
+					"Time window (seconds) between releasing sprint and re-pressing it\n"
+					"to trigger Super Sprint. Shorter = harder to activate,\n"
+					"longer = easier but may accidentally trigger.\n"
+					"Default: 0.30s")) {
+					settings->superSprintDoubleTapWindow = std::clamp(settings->superSprintDoubleTapWindow, 0.1f, 1.0f);
+					State::hasUnsavedChanges = true;
+				}
+
+				if (SliderFloatWithTooltip("Speed Multiplier##ssSpeed", &settings->superSprintSpeedMult,
+					1.0f, 3.0f, "%.2fx",
+					"Multiplicative boost to the player's SpeedMult actor value\n"
+					"while Super Sprint is active.\n"
+					"1.25 = 25%% faster sprint. Default: 1.25")) {
+					settings->superSprintSpeedMult = std::clamp(settings->superSprintSpeedMult, 1.0f, 3.0f);
+					State::hasUnsavedChanges = true;
+				}
+
+				if (SliderFloatWithTooltip("AP Cost Multiplier##ssAP", &settings->superSprintAPCostMult,
+					1.0f, 5.0f, "%.2fx",
+					"Multiplicative increase to AP drain during Super Sprint.\n"
+					"Applied on top of the engine's base sprint drain.\n"
+					"If a mod sets sprint AP cost to 0, this stays 0 (multiplicative).\n"
+					"1.40 = 40%% more AP drain. Default: 1.40")) {
+					settings->superSprintAPCostMult = std::clamp(settings->superSprintAPCostMult, 1.0f, 5.0f);
+					State::hasUnsavedChanges = true;
+				}
+
+				if (SliderFloatWithTooltip("Animation Speed##ssAnim", &settings->superSprintAnimSpeedMult,
+					1.0f, 3.0f, "%.2fx",
+					"Multiplier for the behavior graph Speed variable while\n"
+					"Super Sprint is active. Makes the sprint animation play faster\n"
+					"to visually match the increased movement speed.\n"
+					"1.25 = 25%% faster playback. Default: 1.25")) {
+					settings->superSprintAnimSpeedMult = std::clamp(settings->superSprintAnimSpeedMult, 1.0f, 3.0f);
+					State::hasUnsavedChanges = true;
+				}
+
+				ImGuiMCP::Spacing();
+				ImGuiMCP::Separator();
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Stamina Threshold");
+				ImGuiMCP::Spacing();
+
+				if (CheckboxWithTooltip("Enable Stamina Threshold##ssStamina", &settings->superSprintStaminaThresholdEnabled,
+					"When enabled, Super Sprint cannot activate and will automatically\n"
+					"disengage if the player's AP drops below the configured percentage.\n"
+					"The OAR keyword is also removed when disengaged.")) {
+					State::hasUnsavedChanges = true;
+				}
+
+				if (settings->superSprintStaminaThresholdEnabled) {
+					if (SliderFloatWithTooltip("Min Stamina %##ssStaminaPct", &settings->superSprintStaminaThreshold,
+						0.0f, 100.0f, "%.0f%%",
+						"AP percentage below which Super Sprint is blocked or cancelled.\n"
+						"If AP falls below this while Super Sprint is active, it will\n"
+						"disengage immediately (speed/anim boosts removed, keyword removed).\n"
+						"Also prevents activation if already below this threshold.\n"
+						"Default: 20%%")) {
+						settings->superSprintStaminaThreshold = std::clamp(settings->superSprintStaminaThreshold, 0.0f, 100.0f);
+						State::hasUnsavedChanges = true;
+					}
+				}
+
+				ImGuiMCP::Spacing();
+				ImGuiMCP::Separator();
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "OAR Integration");
+				ImGuiMCP::Spacing();
+				ImGuiMCP::Indent(8.0f);
+				ImGuiMCP::BulletText("Keyword 'AnimSuperSprintKeyword' is added to the player while active");
+				ImGuiMCP::BulletText("Use OAR's HasKeyword condition to trigger custom sprint animations");
+				ImGuiMCP::Unindent(8.0f);
+			}
+		}
+
 		// ====== AIR WALK PREVENTION ======
 		ImGuiMCP::Spacing();
 		if (ImGuiMCP::CollapsingHeader("Air Walk Prevention")) {
-			auto* settings = Settings::GetSingleton();
+			ImGuiMCP::Indent(8.0f);
+			ImGuiMCP::Spacing();
+			ImGuiMCP::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+				"This section is temporarily disabled while it is being reworked.");
+			ImGuiMCP::Spacing();
+			ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "What it does:");
 			ImGuiMCP::TextWrapped(
-				"Prevents walking and running animations from playing while the player is "
-				"in the air (jumping or falling). Without this, legs may visibly cycle "
-				"mid-air if you were moving when you jumped or walked off a ledge.");
+				"Prevents walking and running animations from playing while airborne.");
+			ImGuiMCP::Spacing();
+			ImGuiMCP::BulletText("Without this, legs visibly cycle mid-air after jumping while moving");
+			ImGuiMCP::BulletText("Blocks walk/run anims when the player is off the ground");
 			ImGuiMCP::Spacing();
 
-			if (ImGuiMCP::Checkbox("Enable Air Walk Prevention##disableAirWalk", &settings->disableAirWalk)) {
-				State::hasUnsavedChanges = true;
-			}
+			ImGuiMCP::BeginDisabled(true);
+			auto* settings = Settings::GetSingleton();
+			bool airWalkDisabled = settings->disableAirWalk;
+			ImGuiMCP::Checkbox("Enable Air Walk Prevention##disableAirWalk", &airWalkDisabled);
+			ImGuiMCP::EndDisabled();
+			if (ImGuiMCP::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+				ImGuiMCP::SetTooltip("This feature is temporarily disabled while it is being reworked.");
+			ImGuiMCP::Unindent(8.0f);
 		}
 
 		// ====== UNEDUCATED RELOAD: CHAMBER EXCLUSION ======
@@ -2839,9 +3177,15 @@ namespace Menu
 				ImGuiMCP::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
 					"UneducatedReload.esm not detected. Install the mod to use this feature.");
 			} else {
+				ImGuiMCP::Indent(8.0f);
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "What it does:");
 				ImGuiMCP::TextWrapped(
-					"Weapons in this list will NOT receive the +1 chambered round from "
-					"Uneducated Reload (e.g. revolvers, break-action weapons).");
+					"Manages which weapons are excluded from Uneducated Reload's +1 chamber round.");
+				ImGuiMCP::Spacing();
+				ImGuiMCP::BulletText("Add weapons that shouldn't get the extra round (revolvers, break-action, etc.)");
+				ImGuiMCP::BulletText("Equip a weapon below and click to add/remove it from the exclusion list");
+				ImGuiMCP::Unindent(8.0f);
 				ImGuiMCP::Spacing();
 
 				auto* player = RE::PlayerCharacter::GetSingleton();
@@ -3037,11 +3381,18 @@ namespace Menu
 		auto* presets = InertiaPresets::GetSingleton();
 		const auto& types = GetWeaponTypes();
 
-		ImGuiMCP::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "FP Inertia - ADS Transitions");
+		ImGuiMCP::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "FP Gunplay Overhaul - ADS Transitions");
+		ImGuiMCP::Spacing();
+		ImGuiMCP::Indent(8.0f);
+		ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "What it does:");
 		ImGuiMCP::TextWrapped(
-			"Procedural secondary motion added on top of the vanilla linear ADS transition. "
-			"Settings are per-weapon-type (specific weapon presets override). "
-			"Spring dampening applies to all residual spring motion when entering/exiting ADS.");
+			"Adds procedural secondary motion on top of the vanilla ADS transition.");
+		ImGuiMCP::Spacing();
+		ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "Details:");
+		ImGuiMCP::BulletText("Settings are per-weapon-type (specific weapon presets override)");
+		ImGuiMCP::BulletText("Spring dampening controls residual motion when entering/exiting ADS");
+		ImGuiMCP::BulletText("Choose from Sine, EaseInOut, Bounce, or Overshoot curve types");
+		ImGuiMCP::Unindent(8.0f);
 		ImGuiMCP::Spacing();
 		ImGuiMCP::Separator();
 

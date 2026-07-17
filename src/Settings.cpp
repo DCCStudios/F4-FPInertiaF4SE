@@ -721,7 +721,7 @@ void Settings::Load()
 
 	bool loaded = (ini.LoadFile(kSettingsPath) >= 0);
 	if (!loaded) {
-		logger::warn("[FPInertia] No INI found at '{}' - using built-in defaults", kSettingsPath);
+		logger::warn("[FPGunplayOverhaul] No INI found at '{}' - using built-in defaults", kSettingsPath);
 	}
 
 	// General
@@ -736,6 +736,9 @@ void Settings::Load()
 	// Weapon Based FOV
 	wbfovEnabled        = ini.GetBoolValue("WBFOV", "bEnabled", true);
 	wbfovLoadRetries    = static_cast<int>(ini.GetLongValue("WBFOV", "iLoadRetries", 3));
+
+	// Fire on Empty
+	fireOnEmptyEnabled  = ini.GetBoolValue("Extras", "bFireOnEmptyEnabled", true);
 
 	// Air walk prevention
 	disableAirWalk      = ini.GetBoolValue("Extras", "bDisableAirWalk", false);
@@ -788,6 +791,20 @@ void Settings::Load()
 	usePASeparateProfiles = ini.GetBoolValue("PowerArmor", "bSeparateProfiles", true);
 	powerArmorMult        = static_cast<float>(ini.GetDoubleValue("PowerArmor", "fMult", 1.2));
 	powerArmorMult        = std::clamp(powerArmorMult, 0.0f, 5.0f);
+
+	// Super Sprint
+	superSprintEnabled         = ini.GetBoolValue("Extras", "bSuperSprintEnabled", true);
+	superSprintDoubleTapWindow = static_cast<float>(ini.GetDoubleValue("Extras", "fSuperSprintDoubleTapWindow", 0.3));
+	superSprintSpeedMult       = static_cast<float>(ini.GetDoubleValue("Extras", "fSuperSprintSpeedMult", 1.25));
+	superSprintAPCostMult      = static_cast<float>(ini.GetDoubleValue("Extras", "fSuperSprintAPCostMult", 1.4));
+	superSprintAnimSpeedMult   = static_cast<float>(ini.GetDoubleValue("Extras", "fSuperSprintAnimSpeedMult", 1.25));
+	superSprintStaminaThresholdEnabled = ini.GetBoolValue("Extras", "bSuperSprintStaminaThresholdEnabled", false);
+	superSprintStaminaThreshold = static_cast<float>(ini.GetDoubleValue("Extras", "fSuperSprintStaminaThreshold", 20.0));
+	superSprintDoubleTapWindow = std::clamp(superSprintDoubleTapWindow, 0.1f, 1.0f);
+	superSprintSpeedMult       = std::clamp(superSprintSpeedMult, 1.0f, 3.0f);
+	superSprintAPCostMult      = std::clamp(superSprintAPCostMult, 1.0f, 5.0f);
+	superSprintAnimSpeedMult   = std::clamp(superSprintAnimSpeedMult, 1.0f, 3.0f);
+	superSprintStaminaThreshold = std::clamp(superSprintStaminaThreshold, 0.0f, 100.0f);
 
 	// Debug
 	debugLogging       = ini.GetBoolValue("Debug", "bDebugLogging", false);
@@ -847,7 +864,7 @@ void Settings::Load()
 		(debugLogging != prevDebugLogging);
 
 	if (changed) {
-		logger::info("[FPInertia] Settings updated: enabled={}, intensity={:.2f}, debug={}",
+		logger::info("[FPGunplayOverhaul] Settings updated: enabled={}, intensity={:.2f}, debug={}",
 			enabled, globalIntensity, debugLogging);
 	}
 	prevEnabled = enabled;
@@ -879,6 +896,8 @@ void Settings::Save()
 	setBool("WBFOV", "bEnabled", wbfovEnabled);
 	ini.SetLongValue("WBFOV", "iLoadRetries", wbfovLoadRetries);
 
+	setBool("Extras", "bFireOnEmptyEnabled", fireOnEmptyEnabled);
+
 	setBool("Extras", "bDisableAirWalk", disableAirWalk);
 
 	ini.SetDoubleValue("Settling", "fSettleDelay", settleDelay);
@@ -904,6 +923,15 @@ void Settings::Save()
 	setBool("PowerArmor", "bSeparateProfiles", usePASeparateProfiles);
 	ini.SetDoubleValue("PowerArmor", "fMult", powerArmorMult);
 
+	// Super Sprint
+	setBool("Extras", "bSuperSprintEnabled", superSprintEnabled);
+	ini.SetDoubleValue("Extras", "fSuperSprintDoubleTapWindow", superSprintDoubleTapWindow);
+	ini.SetDoubleValue("Extras", "fSuperSprintSpeedMult", superSprintSpeedMult);
+	ini.SetDoubleValue("Extras", "fSuperSprintAPCostMult", superSprintAPCostMult);
+	ini.SetDoubleValue("Extras", "fSuperSprintAnimSpeedMult", superSprintAnimSpeedMult);
+	setBool("Extras", "bSuperSprintStaminaThresholdEnabled", superSprintStaminaThresholdEnabled);
+	ini.SetDoubleValue("Extras", "fSuperSprintStaminaThreshold", superSprintStaminaThreshold);
+
 	setBool("Debug", "bDebugLogging", debugLogging);
 	setBool("Debug", "bDebugOnScreen", debugOnScreen);
 	ini.SetBoolValue("AutoFire", "bSoundFadeEnabled", autoFireSoundFadeEnabled);
@@ -922,9 +950,9 @@ void Settings::Save()
 	std::filesystem::create_directories(std::filesystem::path(kSettingsPath).parent_path());
 
 	if (ini.SaveFile(kSettingsPath) >= 0) {
-		logger::info("[FPInertia] Settings saved to '{}'", kSettingsPath);
+		logger::info("[FPGunplayOverhaul] Settings saved to '{}'", kSettingsPath);
 	} else {
-		logger::error("[FPInertia] Failed to save settings to '{}'", kSettingsPath);
+		logger::error("[FPGunplayOverhaul] Failed to save settings to '{}'", kSettingsPath);
 	}
 }
 

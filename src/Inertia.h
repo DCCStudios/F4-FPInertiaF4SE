@@ -48,6 +48,7 @@ namespace Inertia
 		bool isInMeleeAction{ false };
 		bool isInPowerArmor{ false };
 		bool isSprinting{ false };
+		bool isSuperSprinting{ false };
 		bool isJumping{ false };
 		bool isInAir{ false };
 		bool isFalling{ false };
@@ -222,6 +223,12 @@ namespace Inertia
 		// Fill a debug snapshot with current live state (best-effort, no lock — for display only)
 		void FillDebugSnapshot(DebugSnapshot& snap);
 
+		// Super Sprint — create the runtime keyword + cache actor value pointers
+		void InitSuperSprint();
+
+		// Whether super sprint is currently engaged (read by menu for status display)
+		bool IsSuperSprintActive() const { return superSprintActive; }
+
 	private:
 		InertiaManager() = default;
 		~InertiaManager() = default;
@@ -282,6 +289,10 @@ namespace Inertia
 		// ---- State tracking ----
 		bool isInFirstPerson{ false };
 		bool initialized{ false };
+		// Previous frame's springsActive value (inertia visuals allowed to
+		// run). Used to drain spring energy exactly once on the falling
+		// edge so no stale viewmodel offset persists while inertia is off.
+		bool springsWereActive{ false };
 
 		// Camera velocity
 		float lastCameraYaw{ 0.0f };
@@ -315,6 +326,18 @@ namespace Inertia
 		float sprintBlendDuration{ 0.0f };
 		RE::NiPoint3 sprintPendingPos{};
 		RE::NiPoint3 sprintPendingRot{};
+
+		// Super Sprint — double-tap sprint for speed/AP/anim boost + OAR keyword
+		bool  superSprintActive{ false };          // currently in super sprint mode
+		bool  superSprintWindowActive{ false };    // activation window is open (waiting for second tap)
+		float superSprintWindowStart{ 0.0f };      // elapsedTime when the activation window opened
+		float superSprintSpeedBoost{ 0.0f };       // SpeedMult delta currently applied (to remove cleanly)
+		float superSprintAnimBoost{ 0.0f };        // AnimationMult delta currently applied (to remove cleanly)
+		float superSprintPrevAP{ -1.0f };          // AP value at end of previous frame (for multiplicative extra drain)
+		RE::BGSKeyword*    superSprintKeyword{ nullptr };   // runtime keyword added/removed from player NPC base form
+		RE::ActorValueInfo* avifSpeedMult{ nullptr };        // cached SpeedMult AVIF
+		RE::ActorValueInfo* avifAnimMult{ nullptr };         // cached AnimationMult AVIF (controls animation playback speed)
+		RE::ActorValueInfo* avifActionPoints{ nullptr };     // cached ActionPoints AVIF
 
 		// Walk direction offset blending (4 directional weights, 0..1)
 		float walkWeightFwd{ 0.0f };
@@ -432,6 +455,36 @@ namespace Inertia
 		float sustainedFireTime{ 0.0f };
 		float recentlyFiredTimer{ 0.0f };
 		bool recentlyFiredADS{ false };
+
+		// Fire on Empty — input tracking.
+		// fireOnEmptyAnimActive: a dry-fire idle (the 1st-person fire idle
+		// played as a special idle, MSF burst-mode style) is in flight and
+		// owes the engine a StopCurrentIdle — vanilla fire clips loop
+		// inside the idle indefinitely (verified in-game 2026-07-16).
+		// fireOnEmptyStopTimer: countdown (one weapon fire interval) to
+		// that stop; released earlier on trigger release / ammo return.
+		bool  fireOnEmptyAnimActive{ false };
+		float fireOnEmptyStopTimer{ 0.0f };
+		// fireOnEmptySuppressGrace: keeps the FireAnnotationGuard window
+		// (which swallows the engine's weaponFire annotation so a vanilla
+		// fire clip can't discharge real rounds during a dry-fire) open
+		// through the idle's blend-out after the stop.
+		float fireOnEmptySuppressGrace{ 0.0f };
+		// fireOnEmptyVerifyTimer: safety net armed on each trigger. The
+		// idle path never touches the attack state machine, so if gunState
+		// nonetheless reads as firing on an empty magazine when this
+		// expires, force a graph base-state reset (the wedged-loop failure
+		// mode of the abandoned attackStart injection, verified in-game
+		// 2026-07-16: WeaponFire looped ~15s until a weapon swap).
+		float fireOnEmptyVerifyTimer{ 0.0f };
+		// prevFireInputHeld: rising-edge detection for the diagnostic log.
+		// fireOnEmptyLatched: one-shot latch so the forced fire action runs
+		// exactly once per trigger hold. Covers BOTH cases: a fresh press on
+		// an already-empty magazine AND holding the trigger while an
+		// automatic weapon runs dry (no rising edge there — the latch
+		// releases when the trigger is released or ammo returns).
+		bool prevFireInputHeld{ false };
+		bool fireOnEmptyLatched{ false };
 
 		// Action blending
 		float actionBlendFactor{ 1.0f };

@@ -359,6 +359,12 @@ public:
 	bool  wbfovEnabled{ true };
 	int   wbfovLoadRetries{ 3 };  // max load-retry attempts (1-5)
 
+	// Fire on Empty (extras feature) — master toggle. Even when enabled,
+	// the feature only acts on weapons that have an opt-in JSON entry
+	// (see FireOnEmpty::Manager). Defaults on because per-weapon entries
+	// already gate the behavior.
+	bool  fireOnEmptyEnabled{ true };
+
 	// Prevent walking/running animations while airborne
 	bool  disableAirWalk{ false };
 
@@ -388,6 +394,17 @@ public:
 	bool  enableInPowerArmor{ true };
 	bool  usePASeparateProfiles{ true };  // Use PA_ weapon type variants
 	float powerArmorMult{ 1.2f };         // Fallback multiplier if no PA profile
+
+	// === SUPER SPRINT ===
+	// Double-tap sprint to engage a faster sprint mode with increased AP cost,
+	// boosted animation speed, and a runtime keyword for OAR-driven animations.
+	bool  superSprintEnabled{ true };
+	float superSprintDoubleTapWindow{ 0.3f };  // seconds between sprint-stop and sprint-start to detect double-tap
+	float superSprintSpeedMult{ 1.25f };       // multiplicative movement speed boost (1.25 = 25% faster)
+	float superSprintAPCostMult{ 1.4f };       // multiplicative AP drain increase (1.4 = 40% more drain, 0-based mods stay 0)
+	float superSprintAnimSpeedMult{ 1.25f };   // behavior graph Speed variable multiplier (animation playback rate)
+	bool  superSprintStaminaThresholdEnabled{ false }; // disengage super sprint when AP% drops below threshold
+	float superSprintStaminaThreshold{ 20.0f };        // AP percentage (0-100) below which super sprint is cancelled
 
 	// Debug settings
 	bool debugLogging{ false };
@@ -424,7 +441,7 @@ public:
 	WeaponInertiaSettings& GetWeaponSettingsMutable(WeaponType a_type);
 
 	// INI path — direct plugin path, no MCM
-	static constexpr const char* kSettingsPath = "Data\\F4SE\\Plugins\\FPInertia.ini";
+	static constexpr const char* kSettingsPath = "Data\\F4SE\\Plugins\\FPGunplayOverhaul.ini";
 
 private:
 	Settings() = default;

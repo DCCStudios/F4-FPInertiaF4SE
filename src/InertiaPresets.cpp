@@ -451,7 +451,7 @@ WeaponType InertiaPresets::ParseWeaponTypeName(const std::string& a_name)
 // ============================================================
 std::filesystem::path InertiaPresets::GetPresetFolderPath() const
 {
-	return std::filesystem::path("Data\\F4SE\\Plugins\\FPInertia");
+	return std::filesystem::path("Data\\F4SE\\Plugins\\FPGunplayOverhaul");
 }
 
 std::filesystem::path InertiaPresets::GetWeaponTypePresetsPath() const
@@ -481,7 +481,7 @@ void InertiaPresets::EnsurePresetFolderExists()
 		std::filesystem::create_directories(GetPresetFolderPath() / "Weapons");
 		std::filesystem::create_directories(GetKeywordMappingsFolderPath());
 	} catch (const std::exception& e) {
-		logger::error("[FPInertia] Failed to create preset folders: {}", e.what());
+		logger::error("[FPGunplayOverhaul] Failed to create preset folders: {}", e.what());
 	}
 }
 
@@ -502,7 +502,7 @@ void InertiaPresets::Init()
 
 	EnsureCustomTypesInPreset();
 
-	logger::info("[FPInertia] InertiaPresets: preset='{}', {} types, {} custom, {} specific weapons",
+	logger::info("[FPGunplayOverhaul] InertiaPresets: preset='{}', {} types, {} custom, {} specific weapons",
 		activePresetName, weaponTypeSettings.size(), customWeaponTypeSettings.size(),
 		specificWeaponSettings.size());
 }
@@ -524,7 +524,7 @@ void InertiaPresets::InitializeDefaultSettings()
 	weaponTypeSettings[WeaponType::PA_Rifle]   = s->pa_rifle;
 	weaponTypeSettings[WeaponType::PA_Heavy]   = s->pa_heavy;
 	weaponTypeSettings[WeaponType::PA_Energy]  = s->pa_energy;
-	logger::info("[FPInertia] Initialized default weapon type settings from INI");
+	logger::info("[FPGunplayOverhaul] Initialized default weapon type settings from INI");
 }
 
 // ============================================================
@@ -544,9 +544,9 @@ void InertiaPresets::SaveWeaponTypePresets()
 	try {
 		std::ofstream file(GetWeaponTypePresetsPath());
 		file << j.dump(2);
-		logger::info("[FPInertia] Saved preset '{}'", activePresetName);
+		logger::info("[FPGunplayOverhaul] Saved preset '{}'", activePresetName);
 	} catch (const std::exception& e) {
-		logger::error("[FPInertia] Failed to save preset: {}", e.what());
+		logger::error("[FPGunplayOverhaul] Failed to save preset: {}", e.what());
 	}
 }
 
@@ -577,9 +577,9 @@ void InertiaPresets::LoadWeaponTypePresets()
 					customWeaponTypeNames.push_back(key);
 			}
 		}
-		logger::info("[FPInertia] Loaded preset '{}'", activePresetName);
+		logger::info("[FPGunplayOverhaul] Loaded preset '{}'", activePresetName);
 	} catch (const std::exception& e) {
-		logger::error("[FPInertia] Failed to load preset: {}", e.what());
+		logger::error("[FPGunplayOverhaul] Failed to load preset: {}", e.what());
 	}
 }
 
@@ -592,11 +592,11 @@ void InertiaPresets::SaveSpecificWeaponPreset(const std::string& a_editorID)
 	try {
 		auto path = GetSpecificWeaponPresetPath(a_editorID);
 		auto absPath = std::filesystem::absolute(path);
-		logger::info("[FPInertia] Saving weapon preset '{}' to: {}", a_editorID, absPath.string());
+		logger::info("[FPGunplayOverhaul] Saving weapon preset '{}' to: {}", a_editorID, absPath.string());
 		std::filesystem::create_directories(path.parent_path());
 		std::ofstream file(path);
 		if (!file.is_open()) {
-			logger::error("[FPInertia] Failed to open file for writing: {}", absPath.string());
+			logger::error("[FPGunplayOverhaul] Failed to open file for writing: {}", absPath.string());
 			return;
 		}
 
@@ -608,12 +608,12 @@ void InertiaPresets::SaveSpecificWeaponPreset(const std::string& a_editorID)
 		file << wrapper.dump(2);
 		file.flush();
 		file.close();
-		logger::info("[FPInertia] Successfully saved weapon preset '{}' (type={}, size={} bytes)",
+		logger::info("[FPGunplayOverhaul] Successfully saved weapon preset '{}' (type={}, size={} bytes)",
 			a_editorID,
 			overrideIt != weaponTypeOverrides.end() ? GetWeaponTypeName(overrideIt->second) : "inherited",
 			std::filesystem::file_size(path));
 	} catch (const std::exception& e) {
-		logger::error("[FPInertia] Failed to save weapon preset '{}': {}", a_editorID, e.what());
+		logger::error("[FPGunplayOverhaul] Failed to save weapon preset '{}': {}", a_editorID, e.what());
 	}
 }
 
@@ -639,7 +639,7 @@ void InertiaPresets::LoadSpecificWeaponPreset(const std::string& a_editorID)
 			specificWeaponSettings[a_editorID] = j.get<WeaponInertiaSettings>();
 		}
 	} catch (const std::exception& e) {
-		logger::error("[FPInertia] Failed to load weapon preset '{}': {}", a_editorID, e.what());
+		logger::error("[FPGunplayOverhaul] Failed to load weapon preset '{}': {}", a_editorID, e.what());
 	}
 }
 
@@ -689,7 +689,7 @@ void InertiaPresets::ResetToINIValues()
 	}
 	InitializeDefaultSettings();
 	isDirty = true;
-	logger::info("[FPInertia] Reset all presets to INI values");
+	logger::info("[FPGunplayOverhaul] Reset all presets to INI values");
 }
 
 // ============================================================
@@ -720,7 +720,7 @@ void InertiaPresets::SetActivePreset(const std::string& a_name)
 	EnsureCustomTypesInPreset();
 	SaveActivePresetSetting();
 	IncrementSettingsVersion();
-	logger::info("[FPInertia] Active preset set to '{}'", a_name);
+	logger::info("[FPGunplayOverhaul] Active preset set to '{}'", a_name);
 }
 
 void InertiaPresets::CreateNewPreset(const std::string& a_name)
@@ -737,7 +737,7 @@ void InertiaPresets::DuplicatePreset(const std::string& a_src, const std::string
 		std::filesystem::copy_file(GetPresetPath(a_src), GetPresetPath(a_dst),
 			std::filesystem::copy_options::overwrite_existing);
 	} catch (const std::exception& e) {
-		logger::error("[FPInertia] Failed to duplicate preset: {}", e.what());
+		logger::error("[FPGunplayOverhaul] Failed to duplicate preset: {}", e.what());
 	}
 }
 
@@ -938,7 +938,7 @@ void InertiaPresets::LoadKeywordMappings()
 	keywordMappings = std::move(newMappings);
 	customWeaponTypeNames.assign(typeNames.begin(), typeNames.end());
 
-	logger::info("[FPInertia] Loaded {} keyword mappings, {} custom types",
+	logger::info("[FPGunplayOverhaul] Loaded {} keyword mappings, {} custom types",
 		keywordMappings.size(), customWeaponTypeNames.size());
 }
 
@@ -953,7 +953,7 @@ void InertiaPresets::ResolveKeywordPointers()
 			if (kw) {
 				mapping.resolvedKeywords.push_back(kw);
 			} else {
-				logger::warn("[FPInertia] Keyword not found: '{}'", kwName);
+				logger::warn("[FPGunplayOverhaul] Keyword not found: '{}'", kwName);
 				mapping.resolvedKeywords.push_back(nullptr);
 			}
 		}

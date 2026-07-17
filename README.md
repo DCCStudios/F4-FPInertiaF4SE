@@ -1,8 +1,8 @@
-# FP Inertia (F4SE)
+# FP Gunplay Overhaul (F4SE)
 
-First-person weapon inertia and related tweaks for **Fallout 4**, implemented as an **F4SE** plugin. In-game configuration uses the **F4SE Menu Framework** (ImGui). Optional features include weapon-based viewmodel FOV (WBFOV), chamber-exclusion keyword support, and integration hooks for other FOV plugins.
+First-person gunplay overhaul for **Fallout 4**, implemented as an **F4SE** plugin. Features include weapon inertia, weapon-based viewmodel FOV (WBFOV), early ADS/fire handling, super sprint, chamber-exclusion keyword support, and integration hooks for other FOV plugins. In-game configuration uses the **F4SE Menu Framework** (ImGui).
 
-**Repository:** [github.com/DCCStudios/F4-FPInertiaF4SE](https://github.com/DCCStudios/F4-FPInertiaF4SE)
+**Repository:** [github.com/DCCStudios/F4-FPGunplayOverhaulF4SE](https://github.com/DCCStudios/F4-FPGunplayOverhaulF4SE)
 
 ## Requirements (runtime)
 
@@ -24,12 +24,12 @@ Relative to the game folder:
 
 | Path | Purpose |
 |------|---------|
-| `Data\F4SE\Plugins\FPInertia.dll` | Plugin binary |
-| `Data\F4SE\Plugins\FPInertia.ini` | Global settings |
-| `Data\F4SE\Plugins\FPInertia\` | Per-weapon-type presets and weapon-specific JSON |
-| `Data\F4SE\Plugins\FPInertia\WBFOV\` | Per-weapon viewmodel FOV JSON (`{EditorID}.json`) |
+| `Data\F4SE\Plugins\FPGunplayOverhaul.dll` | Plugin binary |
+| `Data\F4SE\Plugins\FPGunplayOverhaul.ini` | Global settings |
+| `Data\F4SE\Plugins\FPGunplayOverhaul\` | Per-weapon-type presets and weapon-specific JSON |
+| `Data\F4SE\Plugins\FPGunplayOverhaul\WBFOV\` | Per-weapon viewmodel FOV JSON (`{EditorID}.json`) |
 
-Logs: `Documents\My Games\Fallout4\F4SE\FPInertia.log`
+Logs: `Documents\My Games\Fallout4\F4SE\FPGunplayOverhaul.log`
 
 ## Building from source
 
@@ -44,7 +44,7 @@ Logs: `Documents\My Games\Fallout4\F4SE\FPInertia.log`
 
   ```
   <parent>/
-    FPInertia/          ← this repository (clone here)
+    FPGunplayOverhaul/          ← this repository (clone here)
     PluginTemplate/
       CommonLibF4/
         CommonLibF4/    ← add_subdirectory target
@@ -52,17 +52,17 @@ Logs: `Documents\My Games\Fallout4\F4SE\FPInertia.log`
 
   If your tree differs, edit the `add_subdirectory(...CommonLibF4...)` path in `CMakeLists.txt`.
 
-- Optional: set **`Fallout4Path`** to your game install and enable **`COPY_BUILD`** in CMake to copy the DLL, PDB, and `FPInertia.ini` after each build.
+- Optional: set **`Fallout4Path`** to your game install and enable **`COPY_BUILD`** in CMake to copy the DLL, PDB, and `FPGunplayOverhaul.ini` after each build.
 
 ### Configure and compile
 
 ```powershell
-cd FPInertia
+cd FPGunplayOverhaul
 cmake --preset <your-preset>   # or configure manually with -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake
 cmake --build build/release --config Release
 ```
 
-Output is written under `Compile\F4SE\Plugins\` (see `CMAKE_*_OUTPUT_DIRECTORY` in `CMakeLists.txt`). Copy `FPInertia.dll` and `FPInertia.ini` into `Data\F4SE\Plugins\` for testing.
+Output is written under `Compile\F4SE\Plugins\` (see `CMAKE_*_OUTPUT_DIRECTORY` in `CMakeLists.txt`). Copy `FPGunplayOverhaul.dll` and `FPGunplayOverhaul.ini` into `Data\F4SE\Plugins\` for testing.
 
 ### Toolchain notes
 
@@ -75,4 +75,4 @@ The `vcpkg.json` manifest lists **MIT** for this package metadata. Add a root `L
 
 ## Contributing
 
-Issues and pull requests are welcome against [DCCStudios/F4-FPInertiaF4SE](https://github.com/DCCStudios/F4-FPInertiaF4SE). Please match existing code style and keep changes scoped to the problem being solved.
+Issues and pull requests are welcome against [DCCStudios/F4-FPGunplayOverhaulF4SE](https://github.com/DCCStudios/F4-FPGunplayOverhaulF4SE). Please match existing code style and keep changes scoped to the problem being solved.

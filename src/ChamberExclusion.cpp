@@ -238,7 +238,7 @@ namespace ChamberExclusion
 	// ----------------------------------------------------------------
 	std::filesystem::path Manager::GetJSONPath() const
 	{
-		return std::filesystem::current_path() / "Data" / "F4SE" / "Plugins" / "FPInertia" / kJSONFilename;
+		return std::filesystem::current_path() / "Data" / "F4SE" / "Plugins" / "FPGunplayOverhaul" / kJSONFilename;
 	}
 
 	void Manager::LoadJSON()

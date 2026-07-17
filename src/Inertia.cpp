@@ -1,6 +1,7 @@
 #include "Inertia.h"
 #include "ChamberExclusion.h"
 #include "WeaponFOV.h"
+#include "FireOnEmpty.h"
 
 // ============================================================
 // Static members
@@ -67,6 +68,262 @@ public:
 		return func(this, a_weapon, a_refObject, a_equipIndex, a_ammo);
 	}
 };
+
+// ============================================================
+// Action-system declarations (kept for reference / future use)
+//
+// FIRST ATTEMPT for "Fire on Empty" was the vanilla fire ACTION
+// (BGSAction default object) via BGSAnimationSystemUtils::
+// RunActionOnActor — the layer Mod Switch Framework's FireGunTask
+// uses to force a shot. VERIFIED IN-GAME (2026-07-16) that the
+// engine REJECTS both kActionFireAuto and kActionFireEmpty on an
+// empty magazine (`RunActionOnActor(...) -> false` on every dry
+// press) — the action layer validates ammo before running. The
+// behavior graph itself accepts `attackStart` at the same moment
+// (probe returned true), so Fire on Empty now injects the graph
+// event directly (see TriggerEmptyFireAction) and skips the
+// action layer entirely.
+//
+// The declarations below stay because RunActionOnActor is the
+// correct tool for OTHER forced actions (reload, holster, etc.)
+// where ammo validation is not in the way.
+//
+// This CommonLibF4 build does not vendor ActionInput / TESActionData
+// (only their RTTI / VTABLE IDs), so we declare the minimal layouts
+// here. Layout verified against:
+//   - CommonLibF4 (Fell63 fork) RE/A/ActionInput.h  (0x28, member offsets)
+//   - Native Animation Framework RE/TESActionData.h (extra members,
+//     RunActionOnActor at REL::ID(22408))
+// stl::emplace_vtable installs the engine's real vtable so the object
+// behaves as a genuine TESActionData when RunActionOnActor uses it.
+// ============================================================
+namespace RE
+{
+	class ActionQueue;
+
+	class __declspec(novtable) ActionInput
+	{
+	public:
+		static constexpr auto RTTI{ RTTI::ActionInput };
+		static constexpr auto VTABLE{ VTABLE::ActionInput };
+
+		enum class ACTIONPRIORITY
+		{
+			kImperative = 0x0,
+			kQueue      = 0x1,
+			kTry        = 0x2
+		};
+
+		class Data
+		{
+		public:
+			union
+			{
+				float         f;
+				std::int32_t  i;
+				std::uint32_t ui;
+			};  // 00
+		};
+
+		virtual ~ActionInput() {}  // 00 (body irrelevant — emplace_vtable installs the engine vtable)
+
+		// members
+		NiPointer<TESObjectREFR> ref;         // 08
+		NiPointer<TESObjectREFR> targetRef;   // 10
+		BGSAction*               action;      // 18
+		std::uint32_t            priority;    // 20 (ACTIONPRIORITY stored as u32)
+		Data                     actionData;  // 24
+	};
+	static_assert(sizeof(ActionInput) == 0x28);
+
+	class __declspec(novtable) TESActionData :
+		public ActionInput
+	{
+	public:
+		static constexpr auto RTTI{ RTTI::TESActionData };
+		static constexpr auto VTABLE{ VTABLE::TESActionData };
+
+		TESActionData(ACTIONPRIORITY a_priority, TESObjectREFR* a_refr, BGSAction* a_action)
+		{
+			stl::emplace_vtable(this);
+			priority = static_cast<std::uint32_t>(a_priority);
+			ref      = NiPointer<TESObjectREFR>(a_refr);
+			action   = a_action;
+		}
+
+		virtual ~TESActionData() {}
+
+		virtual ActorState*            GetActorState() { return nullptr; }
+		virtual ActionQueue*           GetActionQueue() { return nullptr; }
+		virtual BGSAnimationSequencer* GetAnimationSequencer() { return nullptr; }
+		virtual TESActionData*         CreateCopy() { return nullptr; }
+		virtual bool                   DoIt() { return false; }
+
+		// members (opaque tail — sized to match the engine object so
+		// RunActionOnActor can freely write into it)
+		BSFixedString unkStr01;
+		BSFixedString unkStr02;
+		std::int32_t  unk01 = 0;
+		std::int64_t  unk02 = 0;
+		std::int64_t  unk03 = 0;
+		std::int32_t  unk04 = 0;
+		std::int32_t  unk05 = 0;
+		std::uint8_t  padding[32]{};
+	};
+
+	namespace BGSAnimationSystemUtils
+	{
+		inline bool RunActionOnActor(Actor* a_actor, TESActionData& a_action, bool a_unk = false)
+		{
+			using func_t = decltype(&RunActionOnActor);
+			REL::Relocation<func_t> func{ REL::ID(22408) };
+			return func(a_actor, a_action, a_unk);
+		}
+
+		// The "InitializeToBaseState" BGSAction — running it via
+		// RunActionOnActor resets the actor's behavior graph to its base
+		// state. Native Animation Framework uses exactly this to recover
+		// a graph after custom animations (SmartIdle.h), which is the
+		// proven precedent; here it is the last-resort unstick for a
+		// dry-fire attack state that ignored every stop stimulus.
+		// (REL::ID verified against NAF's BGSAnimationSystemUtils.h.)
+		inline BGSAction* GetDefaultObjectForActionInitializeToBaseState()
+		{
+			using func_t = decltype(&GetDefaultObjectForActionInitializeToBaseState);
+			REL::Relocation<func_t> func{ REL::ID(639576) };
+			return func();
+		}
+
+		// Read-only query: would sending this anim event to the actor's
+		// graph cause a state transition right now? Used to diagnose which
+		// fire stimuli the graph accepts on an empty magazine without
+		// actually disturbing the graph. (REL::ID verified against NAF's
+		// BGSAnimationSystemUtils.h.)
+		inline bool WillEventChangeState(const TESObjectREFR& a_ref, const BSFixedString& a_event)
+		{
+			using func_t = decltype(&WillEventChangeState);
+			REL::Relocation<func_t> func{ REL::ID(35074) };
+			return func(a_ref, a_event);
+		}
+
+		// Instantly re-initialize the actor's behavior graph (no blend).
+		// SeamlessInspect calls this on the IdleStop graph event to make
+		// the engine's mandatory post-special-idle re-equip invisible
+		// (paired with a small UpdateAnimation step to advance past it).
+		// (Signature + REL::ID(672857) verified against NAF's
+		// BGSAnimationSystemUtils.h; same usage in SeamlessInspect.)
+		inline bool InitializeActorInstant(Actor* a_actor, bool a_initializeNodes)
+		{
+			using func_t = decltype(&InitializeActorInstant);
+			REL::Relocation<func_t> func{ REL::ID(672857) };
+			return func(a_actor, a_initializeNodes);
+		}
+	}
+
+	// AIProcess::SetupSpecialIdle — the engine function that plays an
+	// action's associated idle on an actor. This is what the Papyrus
+	// Actor.PlayIdleAction native (Mod Switch Framework's fire/release
+	// mechanism) calls internally, and what SeamlessInspect / idlestopfix
+	// hook in working plugins.
+	//
+	// HISTORY: the first attempt called the Papyrus native itself via a
+	// derived address (REL::ID(760592), inferred from MSF's raw-offset
+	// comment) and CRASHED in-game (2026-07-17 02:36: garbage indirect
+	// call during TESConditionItem::IsTrue with ActionFireAuto on the
+	// stack) — the derived ID was wrong. SetupSpecialIdle's ID needs no
+	// derivation: REL::ID(1446774) is declared verbatim in TWO vendored
+	// CommonLibF4 copies in PluginTemplate (fo4test CommonLibF4PreNG
+	// Actor.h and GunMover IDs.h `SetupSpecialIdle{ 1446774, 2231704 }`),
+	// with this exact signature.
+	inline bool AIProcess_SetupSpecialIdle(
+		AIProcess*     a_process,
+		Actor&         a_actor,
+		DEFAULT_OBJECT a_action,
+		TESIdleForm*   a_idle,
+		bool           a_testConditions,
+		TESObjectREFR* a_targetOverride)
+	{
+		if (!a_process) return false;
+		using func_t = bool (*)(AIProcess*, Actor&, DEFAULT_OBJECT, TESIdleForm*, bool, TESObjectREFR*);
+		REL::Relocation<func_t> func{ REL::ID(1446774) };
+		return func(a_process, a_actor, a_action, a_idle, a_testConditions, a_targetOverride);
+	}
+
+	// AIProcess::StopCurrentIdle — ends the special idle SetupSpecialIdle
+	// started. Signature and pre-NG ID from GunMover's vendored
+	// CommonLibF4 (AIProcess.h + IDs.h `StopCurrentIdle{ 434460, 2231705 }`).
+	inline void AIProcess_StopCurrentIdle(
+		AIProcess* a_process,
+		Actor*     a_actor,
+		bool       a_instant,
+		bool       a_killFlavor)
+	{
+		if (!a_process) return;
+		using func_t = void (*)(AIProcess*, Actor*, bool, bool);
+		REL::Relocation<func_t> func{ REL::ID(434460) };
+		return func(a_process, a_actor, a_instant, a_killFlavor);
+	}
+}
+
+// Force the equipped weapon's fire animation to play even with an empty
+// magazine, by playing the first-person FIRE IDLE through the regular
+// idle system — Mod Switch Framework's mechanism for showing fire
+// animations on its forced burst shots (MSF_BurstMode.cpp FireWeapon:
+// PlayIdle(player, fireIdle1stP), where fireIdle1stP is Fallout4.esm
+// form 0x4AE1, MSF_Data.cpp line 719). AIProcess::PlayIdle ==
+// SetupSpecialIdle(kActionIdle, idle, true, target) per GunMover's
+// vendored CommonLibF4 AIProcess.h.
+//
+// Why NOT the attack state machine (all verified in-game 2026-07-16/17):
+//   * RunActionOnActor(kActionFireAuto/Single/Empty): refused on empty
+//     magazine (action layer validates ammo).
+//   * SetupSpecialIdle(kActionFireAuto): refused the same way.
+//   * Raw graph attackStart: PLAYS, but always the single-fire branch
+//     (OAR log: SCAR played wpnfiresingleready), and it wedges the
+//     engine in a self-sustaining fire loop: the attackState-Enter
+//     annotation sets gunState to firing, the engine then re-syncs
+//     isFiring=1 into the graph every frame, and the auto-fire loop
+//     state never exits — attackStop / release actions / variable
+//     writes all bounce (log 22:49: vars written false, still true
+//     next dump) until a full graph base-state reset (which visually
+//     re-equips the weapon).
+// The idle avoids the feedback trap because StopCurrentIdle actually
+// terminates it (unlike attackStop, which the wedged attack state
+// ignored). It is NOT free of the attack state though — in-game trace
+// (2026-07-16 23:29) shows the idle drives attackState Enter/gunState 7
+// while it plays, the weapon's own fire clip loops inside it (SCAR
+// resolved to its AUTO loop — the right clip at last), and every
+// WeaponFire annotation in the clip genuinely discharges the weapon,
+// ammo or not. Hence the caller MUST stop it after one fire cycle (see
+// the lifecycle block in Update), and the feature's real dry-fire use
+// requires an OAR replacement clip without WeaponFire annotations.
+//
+// NOTE: with this path the entry's autoFire flag no longer selects the
+// animation — the idle tree resolves the weapon's own fire anim. The
+// flag is kept in the JSON/UI and logged for OAR authors' reference.
+static bool TriggerEmptyFireAction(RE::PlayerCharacter* a_player, bool a_autoFire)
+{
+	if (!a_player || !a_player->currentProcess) return false;
+
+	auto* fireIdle = RE::TESForm::GetFormByID<RE::TESIdleForm>(0x0004AE1);
+	if (!fireIdle) {
+		logger::warn("[FireOnEmpty] 1st-person fire idle (Fallout4.esm|0004AE1) not found");
+		return false;
+	}
+
+	const bool ok = RE::AIProcess_SetupSpecialIdle(
+		a_player->currentProcess, *a_player,
+		RE::DEFAULT_OBJECT::kActionIdle, fireIdle, true, nullptr);
+	logger::info("[FireOnEmpty] PlayIdle(fireIdle1stP 0x4AE1, autoFlag={}) -> {}",
+		a_autoFire, ok);
+	return ok;
+}
+
+// Return the graph's attack state to idle after a forced dry-fire, and
+// (if that fails) force-reset the graph. Defined after the HavokVar
+// namespace below — the stop needs to clear behavior variables directly.
+static void StopEmptyFireAnimation(RE::PlayerCharacter* a_player, const char* a_reason);
+static void ForceGraphBaseStateReset(RE::PlayerCharacter* a_player);
 
 // ============================================================
 // BSSoundHandle::FadeOutAndRelease — Pre-NG REL::ID(260328).
@@ -142,7 +399,7 @@ namespace LocalSound
 // NotifyAnimationGraphImpl calls we therefore synthesize BSAnimationGraphEvent
 // and call BSTEventSource::Notify on every source returned by
 // BGSAnimationSystemUtils::GetEventSourcePointersFromGraph (same sources
-// FPInertia's AnimEventSink registers on).
+// FPGunplayOverhaul's AnimEventSink registers on).
 // ============================================================
 static void ClearEngineWeaponCullFlags(RE::Actor* a_actor)
 {
@@ -516,6 +773,101 @@ namespace HavokVar {
 		logVar("isAttackNotReady", kIsAttackNotReady);
 		logVar("isAttacking", kIsAttacking);
 	}
+}
+
+// ============================================================
+// Fire on Empty — stop (declared above, near TriggerEmptyFireAction).
+// ------------------------------------------------------------
+// Ends the dry-fire fire idle. Always called after one fire cycle
+// (vanilla fire clips LOOP inside the idle — verified 2026-07-16 23:29,
+// SCAR auto loop ran the full 1.5s safety window), or earlier on
+// trigger release / ammo return.
+//
+// THE EXIT STIMULUS — a full graph base-state reset, hidden by
+// fallout4-idlestopfix's fast-forward.
+//
+// Why nothing gentler works (all verified in-game 2026-07-17):
+//   * StopCurrentIdle instant (03:32) / non-instant (03:07): the fire
+//     clip keeps looping — weaponFire annotations continue every
+//     ~130ms after the call.
+//   * attackStop graph event: NotifyAnimationGraph returns false —
+//     the fire loop state is not listening for it.
+//   * MSF's ActionRightRelease through RunActionOnActor (03:48):
+//     returns false. The action system's conditions read the ENGINE's
+//     attack state — and FireAnnotationGuard keeps the engine blind
+//     (attackState suppressed) precisely so it can't discharge rounds.
+//     MSF can use the release action because its engine SAW the burst
+//     begin; ours by design never does. Engine blind → every vanilla
+//     exit path is condition-gated off. Deadlock by construction.
+//   * Direct isFiring/isAttacking/iAttackState writes: succeed but the
+//     loop continues — the special idle drives the clip regardless.
+//
+// The ONE stimulus that provably runs while the engine is blind is the
+// InitializeToBaseState action (kTry, no attack-state conditions —
+// every 'forced base-state reset (ran=true)' line in the session
+// logs). Its downside was purely cosmetic: the engine follows the
+// graph re-init with a visible weapon re-draw. fallout4-idlestopfix
+// hides exactly that re-draw with one call — UpdateAnimation(1000.0f),
+// a single graph update with a huge delta that completes the re-draw
+// before it renders a frame (idlestopfix Hooks.cpp ProcessEvent). So:
+// reset to base state, then fast-forward through the draw.
+//
+// For a non-looping OAR dry-fire replacement clip the reset lands
+// after the clip already finished, and the fast-forward makes the
+// return to base pose invisible either way.
+// ============================================================
+static void StopEmptyFireAnimation(RE::PlayerCharacter* a_player, const char* a_reason)
+{
+	if (!a_player || !a_player->currentProcess) return;
+
+	// 1) Clear the special-idle slot so the idle system doesn't hold a
+	// reference to the fire idle across the reset.
+	RE::AIProcess_StopCurrentIdle(a_player->currentProcess, a_player, true, false);
+
+	// 2) Reset the behavior graph to its base state — the only exit
+	// stimulus the blind-engine regime doesn't condition-gate away.
+	bool resetRan = false;
+	if (auto* resetAction = RE::BGSAnimationSystemUtils::GetDefaultObjectForActionInitializeToBaseState()) {
+		RE::TESActionData action(RE::ActionInput::ACTIONPRIORITY::kTry, a_player, resetAction);
+		resetRan = RE::BGSAnimationSystemUtils::RunActionOnActor(a_player, action);
+	} else {
+		logger::warn("[FireOnEmpty] InitializeToBaseState default object missing");
+	}
+
+	// 3) Fast-forward the post-reset re-draw so it never renders
+	// (idlestopfix's mechanism). Runs inside the suppression window, so
+	// any annotations the fast-forwarded frames emit are swallowed.
+	a_player->UpdateAnimation(1000.0f);
+
+	logger::info("[FireOnEmpty] Stopped dry-fire ({}) baseStateReset={} + fast-forward",
+		a_reason, resetRan);
+}
+
+// Last-resort unstick: reset the behavior graph to its base state via the
+// InitializeToBaseState action (NAF's proven recovery for a stuck graph).
+// Only called when, ~0.75s after the stop above, gunState still reads as
+// firing on an empty magazine — i.e. every stop stimulus was ignored.
+// May cause a brief visual reset of the viewmodel; preferable to an
+// attack state stuck until weapon swap (engine-side gunState wedged at 7,
+// WeaponFire annotations looping, Fire on Empty unable to re-arm).
+static void ForceGraphBaseStateReset(RE::PlayerCharacter* a_player)
+{
+	if (!a_player) return;
+
+	auto* resetAction = RE::BGSAnimationSystemUtils::GetDefaultObjectForActionInitializeToBaseState();
+	if (!resetAction) {
+		logger::warn("[FireOnEmpty] InitializeToBaseState default object missing — cannot force reset");
+		return;
+	}
+
+	// kTry priority mirrors NAF's SmartIdle stop path exactly.
+	RE::TESActionData action(RE::ActionInput::ACTIONPRIORITY::kTry, a_player, resetAction);
+	const bool ran = RE::BGSAnimationSystemUtils::RunActionOnActor(a_player, action);
+
+	static const RE::BSFixedString kEvtAttackStop{ "attackStop" };
+	a_player->NotifyAnimationGraphImpl(kEvtAttackStop);
+
+	logger::warn("[FireOnEmpty] Graph stuck in fire loop after stop — forced base-state reset (ran={})", ran);
 }
 
 // Bone names to try in order for the FP skeleton pivot node
@@ -928,7 +1280,7 @@ void Inertia::InertiaManager::RegisterAnimEventSink()
 			if (src) src->RegisterSink(&animEventSink);
 		}
 		animEventSink.registered = true;
-		logger::info("[FPInertia] Registered animation event sink ({} sources)", sources.size());
+		logger::info("[FPGunplayOverhaul] Registered animation event sink ({} sources)", sources.size());
 	}
 }
 
@@ -984,8 +1336,9 @@ void Inertia::InertiaManager::FillDebugSnapshot(DebugSnapshot& snap)
 	auto* player = RE::PlayerCharacter::GetSingleton();
 	auto* camera = RE::PlayerCamera::GetSingleton();
 
-	snap.inFirstPerson = isInFirstPerson;
-	snap.isSprinting   = isSprinting;
+	snap.inFirstPerson    = isInFirstPerson;
+	snap.isSprinting      = isSprinting;
+	snap.isSuperSprinting = superSprintActive;
 
 	if (player) {
 		snap.weaponDrawn     = player->currentProcess ? player->GetWeaponMagicDrawn() : false;
@@ -1319,7 +1672,7 @@ const WeaponInertiaSettings& Inertia::InertiaManager::GetCurrentWeaponSettings(R
 	cachedWeightMult = GetWeightScaleMult(weap, cachedWeaponSettingsCopy);
 
 	if (weaponChanged) {
-		logger::debug("[FPInertia] Settings refreshed: formID=0x{:08X} eid='{}' type={} invert={}",
+		logger::debug("[FPGunplayOverhaul] Settings refreshed: formID=0x{:08X} eid='{}' type={} invert={}",
 			weap.formID, weap.editorID, static_cast<int>(wt), cachedWeaponSettingsCopy.invertCameraPitch);
 	}
 
@@ -1374,10 +1727,10 @@ RE::NiNode* Inertia::InertiaManager::FindTargetNode(
 
 	if (!pivotBone) {
 		if (!hasLoggedSkeleton) {
-			logger::warn("[FPInertia] No suitable pivot bone found, using FP root");
+			logger::warn("[FPGunplayOverhaul] No suitable pivot bone found, using FP root");
 			std::function<void(RE::NiAVObject*, int)> logBones = [&](RE::NiAVObject* obj, int depth) {
 				if (!obj || depth > 5) return;
-				logger::info("[FPInertia] Bone[{}]: {}", depth, obj->name.c_str() ? obj->name.c_str() : "<null>");
+				logger::info("[FPGunplayOverhaul] Bone[{}]: {}", depth, obj->name.c_str() ? obj->name.c_str() : "<null>");
 				auto* asNode = obj->IsNode();
 				if (asNode) {
 					for (auto& child : asNode->children) {
@@ -1392,7 +1745,7 @@ RE::NiNode* Inertia::InertiaManager::FindTargetNode(
 	}
 
 	if (!hasLoggedSkeleton) {
-		logger::info("[FPInertia] Using bone '{}' as pivot node", foundName);
+		logger::info("[FPGunplayOverhaul] Using bone '{}' as pivot node", foundName);
 		hasLoggedSkeleton = true;
 	}
 
@@ -1439,7 +1792,7 @@ RE::NiNode* Inertia::InertiaManager::GetOrInsertInertiaBone(
 			}
 			// Structure mismatch: detach the stale node so it doesn't remain as an
 			// orphan with no children in the skeleton, then fall through to reinsert.
-			logger::warn("[FPInertia] Inserted bone structure mismatch, reinserting");
+			logger::warn("[FPGunplayOverhaul] Inserted bone structure mismatch, reinserting");
 			if (auto* staleParent = existingNode->parent) {
 				staleParent->DetachChild(existingNode);
 			}
@@ -1479,7 +1832,7 @@ RE::NiNode* Inertia::InertiaManager::GetOrInsertInertiaBone(
 	inserted->AttachChild(pivotBone, true);
 
 	cachedInsertedBone = inserted;
-	logger::info("[FPInertia] Inserted bone '{}' above '{}'",
+	logger::info("[FPGunplayOverhaul] Inserted bone '{}' above '{}'",
 		kInsertedBoneName, pivotBone->name.c_str());
 
 	return inserted;
@@ -1559,6 +1912,354 @@ RE::NiPoint3 Inertia::InertiaManager::CalculateLocalMovement(RE::PlayerCharacter
 	if (!controls) return { 0.0f, 0.0f, 0.0f };
 	auto& mv = controls->data.moveInputVec;
 	return { mv.x, mv.y, 0.0f };
+}
+
+// ============================================================
+// Super Sprint keyword helpers (add/remove from BGSKeywordForm)
+// ============================================================
+namespace SuperSprintHelpers
+{
+	static void AddKeyword(RE::BGSKeywordForm* form, RE::BGSKeyword* kw)
+	{
+		if (!form || !kw) return;
+		for (std::uint32_t i = 0; i < form->numKeywords; ++i) {
+			if (form->keywords[i] == kw) return;
+		}
+		auto newCount = form->numKeywords + 1;
+		auto** newArr = new RE::BGSKeyword*[newCount];
+		for (std::uint32_t i = 0; i < form->numKeywords; ++i) {
+			newArr[i] = form->keywords[i];
+		}
+		newArr[form->numKeywords] = kw;
+		form->keywords    = newArr;
+		form->numKeywords = newCount;
+	}
+
+	static void RemoveKeyword(RE::BGSKeywordForm* form, RE::BGSKeyword* kw)
+	{
+		if (!form || !kw) return;
+		std::uint32_t idx = UINT32_MAX;
+		for (std::uint32_t i = 0; i < form->numKeywords; ++i) {
+			if (form->keywords[i] == kw) { idx = i; break; }
+		}
+		if (idx == UINT32_MAX) return;
+		for (std::uint32_t i = idx; i < form->numKeywords - 1; ++i) {
+			form->keywords[i] = form->keywords[i + 1];
+		}
+		form->numKeywords--;
+	}
+}
+
+// ============================================================
+// Super Sprint input hook — prevents the engine from toggling
+// sprint off when the player double-taps the sprint key.
+// We hook SprintHandler::HandleEvent(ButtonEvent*) at vtable
+// slot 8 (byte offset 0x40), the same layout confirmed by
+// UneducatedShooter's offsets for MouseMoveEvent (0x30 / slot 6)
+// and ThumbstickEvent (0x20 / slot 4).
+// ============================================================
+namespace SuperSprintInput
+{
+	// Signature of BSInputEventUser::HandleEvent(ButtonEvent*)
+	using FnHandleButton = void(*)(void*, const RE::ButtonEvent*);
+
+	// Original (unhooked) SprintHandler::HandleEvent(ButtonEvent*)
+	static FnHandleButton s_originalHandleButton = nullptr;
+
+	// Set by Update when the activation window is open.
+	// While true, the hook eats JustPressed events so the engine's
+	// sprint toggle never flips.
+	static bool s_eatEnabled = false;
+
+	// Set by the hook when it eats a sprint press.  Cleared by Update
+	// after it reads it and activates super sprint.
+	static bool s_eatTriggered = false;
+
+	// Whether the hook is installed (prevents double-install)
+	static bool s_installed = false;
+
+	static void HookedSprintHandleButton(void* self, const RE::ButtonEvent* event)
+	{
+		if (s_eatEnabled && event && event->JustPressed()) {
+			// Eat the press — don't let the engine toggle sprint off
+			s_eatTriggered = true;
+			return;
+		}
+		// Pass all other events (releases, held) to the original handler
+		if (s_originalHandleButton) {
+			s_originalHandleButton(self, event);
+		}
+	}
+
+	// Patch SprintHandler's vtable entry for HandleEvent(ButtonEvent*).
+	// Uses the same SafeWrite pattern as UneducatedShooter.
+	static bool Install()
+	{
+		auto* pc = RE::PlayerControls::GetSingleton();
+		if (!pc || !pc->sprintHandler) {
+			logger::error("[SuperSprintInput] PlayerControls or SprintHandler is null");
+			return false;
+		}
+
+		// SprintHandler inherits BSInputEventUser single-inheritance chain.
+		// Vtable pointer is at offset 0 of the object.
+		uintptr_t vtable = *reinterpret_cast<uintptr_t*>(pc->sprintHandler);
+
+		// HandleEvent(ButtonEvent*) is vtable slot 8 → byte offset 0x40
+		constexpr uintptr_t kSlotOffset = 8 * sizeof(void*);
+		uintptr_t addr = vtable + kSlotOffset;
+
+		// Read original function pointer
+		memcpy(&s_originalHandleButton, reinterpret_cast<void*>(addr), sizeof(void*));
+
+		// Write our hook
+		uintptr_t hookAddr = reinterpret_cast<uintptr_t>(&HookedSprintHandleButton);
+		DWORD oldProtect = 0;
+		if (!VirtualProtect(reinterpret_cast<void*>(addr), sizeof(void*),
+				PAGE_EXECUTE_READWRITE, &oldProtect)) {
+			logger::error("[SuperSprintInput] VirtualProtect failed");
+			return false;
+		}
+		memcpy(reinterpret_cast<void*>(addr), &hookAddr, sizeof(void*));
+		VirtualProtect(reinterpret_cast<void*>(addr), sizeof(void*), oldProtect, &oldProtect);
+
+		s_installed = true;
+		logger::info("[SuperSprintInput] Hooked SprintHandler::HandleEvent(ButtonEvent*) — "
+			"vtable=0x{:X}, slot=8, original=0x{:X}",
+			vtable, reinterpret_cast<uintptr_t>(s_originalHandleButton));
+		return true;
+	}
+}
+
+// ============================================================
+// Attack input hook — ground-truth fire/ADS button state.
+// ------------------------------------------------------------
+// The previous approach peeked AttackBlockHandler's raw bytes
+// (leftAttackButtonHeld @ 0x72) to detect the fire button. Verified
+// unreliable in-game: a full session of SCAR bursts and 1911 shots
+// produced zero reads of that byte as non-zero, so features gated on it
+// (Fire on Empty, Early Fire Cancel) silently never armed.
+//
+// Instead, vtable-hook AttackBlockHandler::HandleEvent(ButtonEvent*)
+// (BSInputEventUser slot 8 — the same slot/pattern as the proven
+// SuperSprintInput hook, and the same slot ExtendedWeaponSystem patches
+// for this handler) and track the button state straight from the
+// engine's dispatched events. FO4 user-event names, confirmed in F4SE's
+// CustomControlMap.txt and HaBCR: "PrimaryAttack" = fire,
+// "SecondaryAttack" = ADS. ButtonEvent::value != 0 while held, == 0 on
+// release.
+// ============================================================
+namespace AttackInput
+{
+	using FnHandleButton = void(*)(void*, const RE::ButtonEvent*);
+
+	// Original (unhooked) AttackBlockHandler::HandleEvent(ButtonEvent*)
+	static FnHandleButton s_originalHandleButton = nullptr;
+
+	// Whether the hook is installed (prevents double-install)
+	static bool s_installed = false;
+
+	// Live input state, updated by the hook as the engine dispatches
+	// button events. Read by InertiaManager::Update on the main thread;
+	// input dispatch also happens on the main thread, so plain bools are
+	// sufficient (same reasoning as SuperSprintInput's flags).
+	static bool s_fireHeld = false;  // "PrimaryAttack" currently held
+	static bool s_adsHeld  = false;  // "SecondaryAttack" currently held
+
+	static void HookedAttackHandleButton(void* self, const RE::ButtonEvent* event)
+	{
+		if (event) {
+			const RE::BSFixedString& userEvent = event->QUserEvent();
+			if (userEvent == "PrimaryAttack"sv) {
+				s_fireHeld = (event->value != 0.0f);
+				if (event->JustPressed()) {
+					logger::trace("[AttackInput] PrimaryAttack pressed");
+				}
+			} else if (userEvent == "SecondaryAttack"sv) {
+				s_adsHeld = (event->value != 0.0f);
+			}
+		}
+		// Always pass through to the engine's handler unchanged.
+		if (s_originalHandleButton) {
+			s_originalHandleButton(self, event);
+		}
+	}
+
+	// Patch AttackBlockHandler's vtable entry for HandleEvent(ButtonEvent*).
+	static bool Install()
+	{
+		auto* pc = RE::PlayerControls::GetSingleton();
+		if (!pc || !pc->attackHandler) {
+			logger::error("[AttackInput] PlayerControls or AttackBlockHandler is null");
+			return false;
+		}
+
+		uintptr_t vtable = *reinterpret_cast<uintptr_t*>(pc->attackHandler);
+
+		// HandleEvent(ButtonEvent*) is vtable slot 8 → byte offset 0x40
+		constexpr uintptr_t kSlotOffset = 8 * sizeof(void*);
+		uintptr_t addr = vtable + kSlotOffset;
+
+		memcpy(&s_originalHandleButton, reinterpret_cast<void*>(addr), sizeof(void*));
+
+		uintptr_t hookAddr = reinterpret_cast<uintptr_t>(&HookedAttackHandleButton);
+		DWORD oldProtect = 0;
+		if (!VirtualProtect(reinterpret_cast<void*>(addr), sizeof(void*),
+				PAGE_EXECUTE_READWRITE, &oldProtect)) {
+			logger::error("[AttackInput] VirtualProtect failed");
+			return false;
+		}
+		memcpy(reinterpret_cast<void*>(addr), &hookAddr, sizeof(void*));
+		VirtualProtect(reinterpret_cast<void*>(addr), sizeof(void*), oldProtect, &oldProtect);
+
+		s_installed = true;
+		logger::info("[AttackInput] Hooked AttackBlockHandler::HandleEvent(ButtonEvent*) — "
+			"vtable=0x{:X}, slot=8, original=0x{:X}",
+			vtable, reinterpret_cast<uintptr_t>(s_originalHandleButton));
+		return true;
+	}
+}
+
+// ============================================================
+// Fire annotation guard — swallow `weaponFire` during dry-fire,
+// and skip the engine's post-special-idle re-equip on IdleStop.
+// ------------------------------------------------------------
+// The WeaponFire annotation in a fire clip is what makes the engine
+// actually discharge the weapon, and it does NOT check ammo (verified
+// in-game 2026-07-16 23:29: a Fire on Empty dry-fire on the SCAR fired
+// real projectiles from a 0-round magazine; our phantom-fire feature is
+// built on the same fact). So while a Fire on Empty dry-fire idle is
+// playing a VANILLA fire clip, its annotations must be kept away from
+// the engine.
+//
+// Mechanism (same pattern as HaBCR's AnimationGraphEventWatcher and
+// ExtendedWeaponSystem's PlayerAnimationGraphEventHandler, both proven
+// in-game): the player object is itself the engine's sink for its
+// graph events — TESObjectREFR inherits BSTEventSink<
+// BSAnimationGraphEvent> at offset 0x38 (CommonLibF4 TESObjectREFRs.h),
+// and ProcessEvent is vtable slot 1 (+0x8, BSTEvent.h: slot 0 is the
+// dtor). We patch that slot, and while the suppression window is open
+// (managed per-frame by the Fire on Empty block in Update: idle in
+// flight or blend-out grace, AND magazine still empty) we return
+// kContinue for weaponFire without calling the engine's handler.
+// Everything else — and all normal firing — passes straight through.
+//
+// INFERRED (not yet verified): that the discharge happens inside this
+// handler. Reference plugins intercept weapon anim events here, but
+// none blocks weaponFire specifically. If the inference is wrong the
+// failure mode is benign: bullets keep firing exactly as without this
+// hook, nothing else changes.
+// ============================================================
+namespace FireAnnotationGuard
+{
+	using FnProcessEvent = RE::BSEventNotifyControl (*)(
+		void*, const RE::BSAnimationGraphEvent&,
+		RE::BSTEventSource<RE::BSAnimationGraphEvent>*);
+
+	// Original (unhooked) PlayerCharacter ProcessEvent for graph events
+	static FnProcessEvent s_original = nullptr;
+
+	// Whether the hook is installed (prevents double-install)
+	static bool s_installed = false;
+
+	// Suppression window. Written by InertiaManager::Update (main
+	// thread); graph events for the player also dispatch on the main
+	// thread, but atomic keeps this safe if the engine ever notifies
+	// from the havok worker.
+	static std::atomic<bool> s_suppress{ false };
+
+	static RE::BSEventNotifyControl HookedProcessEvent(void* a_self,
+		const RE::BSAnimationGraphEvent& a_event,
+		RE::BSTEventSource<RE::BSAnimationGraphEvent>* a_source)
+	{
+		if (s_suppress.load(std::memory_order_relaxed)) {
+			if (a_event.animEvent == "weaponFire" || a_event.animEvent == "WeaponFire") {
+				// Swallow: the engine's handler never sees the event, so no
+				// discharge. kContinue (not kStop) so OTHER registered sinks
+				// (OAR's log, our own AnimEventSink) still observe it.
+				logger::info("[FireOnEmpty] Suppressed weaponFire annotation (dry-fire window)");
+				return RE::BSEventNotifyControl::kContinue;
+			}
+			if (a_event.animEvent == "attackState") {
+				// Swallow the attack-state notifications too — this is the
+				// loop-breaker. When the fire idle drives the graph into
+				// its attack state, the engine reacts to `attackState
+				// "Enter"` by moving gunState to firing (7) and then
+				// re-syncs isFiring=1 into the graph EVERY FRAME, which is
+				// exactly the self-sustaining auto-fire loop verified on
+				// 2026-07-16/17 (StopCurrentIdle instant AND non-instant,
+				// attackStop, release actions, variable writes: all
+				// bounced; only a full graph reset exited). With the
+				// engine never told, gunState stays 0, isFiring is never
+				// re-asserted, and the loop's sustaining condition dies.
+				// gunState 0 also makes the engine ignore any weaponFire
+				// that slips past the window (it already ignores the
+				// graph's constant background weaponFire noise at
+				// gunState 0 — see the phantom-fire notes).
+				logger::info("[FireOnEmpty] Suppressed attackState '{}' annotation (dry-fire window)",
+					a_event.argument.c_str());
+				return RE::BSEventNotifyControl::kContinue;
+			}
+			if (a_event.animEvent == "IdleStop") {
+				// The engine follows every ended special idle with a full
+				// weapon re-draw (vanilla behavior; the ugly re-equip seen
+				// in-game). fallout4-idlestopfix exists to hide exactly
+				// this, and its whole fix is ONE call made on this exact
+				// event, in this exact hook, before chaining to the
+				// engine's handler (idlestopfix Hooks.cpp ProcessEvent):
+				//     Player->UpdateAnimation(1000.0f);
+				// One graph update with a huge delta fast-forwards the
+				// re-draw to completion so it never renders a frame.
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				if (player) {
+					player->UpdateAnimation(1000.0f);
+					logger::info("[FireOnEmpty] IdleStop in dry-fire window — fast-forwarded post-idle re-equip");
+				}
+				// Fall through to the engine handler (idlestopfix chains
+				// too): it has bookkeeping tied to IdleStop.
+			}
+		}
+		return s_original ? s_original(a_self, a_event, a_source) :
+		                    RE::BSEventNotifyControl::kContinue;
+	}
+
+	// Patch the ProcessEvent slot of the player's
+	// BSTEventSink<BSAnimationGraphEvent> sub-vtable.
+	static bool Install()
+	{
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (!player) {
+			logger::error("[FireAnnotationGuard] PlayerCharacter singleton is null");
+			return false;
+		}
+
+		// BSTEventSink<BSAnimationGraphEvent> base subobject (offset 0x38
+		// per CommonLibF4 TESObjectREFRs.h — same offset HaBCR uses).
+		auto* sink = reinterpret_cast<void*>(
+			reinterpret_cast<std::uintptr_t>(player) + 0x38);
+		uintptr_t vtable = *reinterpret_cast<uintptr_t*>(sink);
+
+		// ProcessEvent is slot 1 (slot 0 = virtual dtor) → byte offset 0x8.
+		uintptr_t addr = vtable + 0x8;
+
+		memcpy(&s_original, reinterpret_cast<void*>(addr), sizeof(void*));
+
+		uintptr_t hookAddr = reinterpret_cast<uintptr_t>(&HookedProcessEvent);
+		DWORD oldProtect = 0;
+		if (!VirtualProtect(reinterpret_cast<void*>(addr), sizeof(void*),
+				PAGE_EXECUTE_READWRITE, &oldProtect)) {
+			logger::error("[FireAnnotationGuard] VirtualProtect failed");
+			return false;
+		}
+		memcpy(reinterpret_cast<void*>(addr), &hookAddr, sizeof(void*));
+		VirtualProtect(reinterpret_cast<void*>(addr), sizeof(void*), oldProtect, &oldProtect);
+
+		s_installed = true;
+		logger::info("[FireAnnotationGuard] Hooked player BSTEventSink<BSAnimationGraphEvent>::ProcessEvent — "
+			"vtable=0x{:X}, slot=1, original=0x{:X}",
+			vtable, reinterpret_cast<uintptr_t>(s_original));
+		return true;
+	}
 }
 
 // ============================================================
@@ -1797,16 +2498,215 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	}
 
 	// ============================================================
-	// INERTIA — gated by inertiaEnabled toggle (extras above remain active)
+	// Fire on Empty (EXTRAS — must NOT sit behind the inertia gates)
+	// ------------------------------------------------------------
+	// When the equipped weapon's magazine is empty (0 rounds loaded,
+	// ignoring inventory reserve) and the fire input is down, force the
+	// weapon to run its fire ACTION so the fire animation plays anyway.
+	// Mod authors then replace that forced fire animation with a dry-fire
+	// animation via Open Animation Replacer conditions.
+	//
+	// Placement matters: this used to live further down, behind
+	// `inertiaEnabled` / `ws.enabled` / `requireWeaponDrawn` early-outs.
+	// Any weapon whose inertia preset was disabled never reached the
+	// check at all (verified: SCAR dry-fire presses produced zero log
+	// output while 1911 presses logged — the SCAR's type preset was
+	// gated out before the input read). Extras must be self-contained,
+	// so this block reads the fire input and ammo count itself.
+	//
+	// Trigger model: fires while the input is HELD, latched once per
+	// hold. Holding an automatic's trigger until the mag runs dry never
+	// produces a fresh press, so an edge-only check can never catch it.
+	// The latch resets on release or when ammo returns. Reload detection
+	// uses gunState (kReloading) rather than the anim-event-driven
+	// isCurrentlyReloading flag, because that flag is only updated by
+	// the inertia-gated code below and can be stale here.
+	{
+		auto* foeSettings = Settings::GetSingleton();
+
+		// Fire input from the AttackInput vtable hook (ground truth from
+		// the engine's own ButtonEvent dispatch). The old raw-byte peek
+		// (AttackBlockHandler @ 0x72) proved unreliable in-game — see the
+		// AttackInput namespace comment. Fall back to the byte peek only
+		// if the hook failed to install.
+		bool foeFireHeld = false;
+		if (AttackInput::s_installed) {
+			foeFireHeld = AttackInput::s_fireHeld;
+		} else if (auto* pcCtrl = RE::PlayerControls::GetSingleton(); pcCtrl && pcCtrl->attackHandler) {
+			auto* handlerBytes = reinterpret_cast<const std::uint8_t*>(pcCtrl->attackHandler);
+			foeFireHeld = (handlerBytes[0x72] != 0);
+		}
+
+		const std::uint32_t foeMagAmmo = EquippedWeapon::GetMagazineAmmoCount(player);
+		const auto gsNow = static_cast<std::uint32_t>(player->gunState);
+		const bool fireRisingEdge = foeFireHeld && !prevFireInputHeld;
+
+		// Diagnostic: log every fresh fire press with full gate state so a
+		// silent no-trigger is attributable to a specific condition.
+		if (foeSettings->fireOnEmptyEnabled && fireRisingEdge) {
+			bool firstPerson = false;
+			if (auto* cam = RE::PlayerCamera::GetSingleton(); cam && cam->currentState) {
+				const auto camState = cam->currentState->id.get();
+				firstPerson = (camState == RE::CameraStates::kFirstPerson ||
+				               camState == RE::CameraStates::kIronSights);
+			}
+			logger::info("[FireOnEmpty] Fire pressed: mag={} gs={} phantom={} fp={} drawn={}",
+				foeMagAmmo, gsNow, earlyAdsAutoFireWatching, firstPerson, weaponDrawn);
+		}
+
+		// Latch release: trigger released or ammo returned (e.g. reloaded).
+		if (!foeFireHeld || foeMagAmmo > 0) {
+			fireOnEmptyLatched = false;
+		}
+
+		// ---- dry-fire idle lifecycle ----
+		// The fire idle does NOT reliably end on its own: with a vanilla
+		// fire animation the clip loops inside the idle for as long as the
+		// idle runs (verified in-game 2026-07-16 23:29: SCAR auto loop
+		// emitted WeaponFire every ~130ms for the full 1.5s until the
+		// safety net force-reset the graph — the visible "re-equip").
+		// So the idle is ALWAYS stopped explicitly, after one fire cycle
+		// (the weapon's own fire interval) — or earlier on trigger release
+		// or if ammo returns (a reload is about to animate over it).
+		// A custom OAR dry-fire replacement clip that doesn't loop simply
+		// ends before this stop and the stop becomes a harmless no-op.
+		if (fireOnEmptyAnimActive) {
+			fireOnEmptyStopTimer -= delta;
+			const char* stopReason =
+				(fireOnEmptyStopTimer <= 0.0f) ? "fire cycle complete" :
+				!foeFireHeld                   ? "trigger released" :
+				(foeMagAmmo > 0)               ? "ammo returned" :
+				                                 nullptr;
+			if (stopReason) {
+				StopEmptyFireAnimation(player, stopReason);
+				fireOnEmptyAnimActive = false;
+				fireOnEmptyStopTimer  = 0.0f;
+				// Keep the annotation suppression window open through the
+				// loop's exit tail — the graph can land a few more
+				// annotations while it unwinds out of the attack state.
+				fireOnEmptySuppressGrace = 0.6f;
+			}
+		}
+
+		// ---- safety net: wedged-graph recovery ----
+		// Armed each time we trigger the dry-fire idle. The idle path
+		// should never touch gunState (it bypasses the attack state
+		// machine entirely — the loop only ever happened with the old
+		// attackStart injection), so this should never fire; if gunState
+		// nonetheless reads as firing on an empty magazine when the timer
+		// expires, reset the graph to base state (NAF's proven recovery)
+		// rather than leave the player stuck. mag==0 guards the check:
+		// with ammo present a firing gunState is legitimate engine
+		// activity, not our leftover.
+		if (fireOnEmptyVerifyTimer > 0.0f) {
+			fireOnEmptyVerifyTimer -= delta;
+			if (fireOnEmptyVerifyTimer <= 0.0f) {
+				fireOnEmptyVerifyTimer = 0.0f;
+				if (foeMagAmmo == 0 && GunStateLocal::IsFiringGunState(gsNow)) {
+					ForceGraphBaseStateReset(player);
+				}
+			}
+		}
+
+		if (foeSettings->fireOnEmptyEnabled &&
+		    foeFireHeld &&
+		    !fireOnEmptyLatched &&
+		    !fireOnEmptyAnimActive &&
+		    foeMagAmmo == 0 &&
+		    !GunStateLocal::IsFiringGunState(gsNow) &&
+		    gsNow != GunStateLocal::kReloading &&
+		    !earlyAdsAutoFireWatching)
+		{
+			// First-person / iron-sights only (matches the mod's other
+			// viewmodel-focused features).
+			bool firstPerson = false;
+			if (auto* cam = RE::PlayerCamera::GetSingleton(); cam && cam->currentState) {
+				const auto camState = cam->currentState->id.get();
+				firstPerson = (camState == RE::CameraStates::kFirstPerson ||
+				               camState == RE::CameraStates::kIronSights);
+			}
+
+			if (firstPerson && weaponDrawn) {
+				// One attempt per trigger hold, whatever the outcome — also
+				// prevents per-frame log spam while holding on an empty mag.
+				fireOnEmptyLatched = true;
+
+				std::string eid = GetEquippedWeaponEditorID(player);
+				if (eid.empty()) {
+					logger::info("[FireOnEmpty] Skipped: equipped weapon has no EditorID");
+				} else {
+					FireOnEmpty::FOEEntry entry;
+					const bool found = FireOnEmpty::Manager::GetSingleton()->GetEntry(eid, entry);
+					if (found && entry.enabled) {
+						// Open the weaponFire suppression window BEFORE the
+						// idle starts — the first WeaponFire annotation
+						// lands synchronously with PlayIdle (verified in
+						// the 23:29 trace: same-millisecond timestamps).
+						FireAnnotationGuard::s_suppress.store(true, std::memory_order_relaxed);
+						const bool ok = TriggerEmptyFireAction(player, entry.autoFire);
+						logger::info("[FireOnEmpty] Empty-fire on '{}' (autoFire={}, gs={}, edge={}) -> triggered={}",
+							eid, entry.autoFire, gsNow, fireRisingEdge, ok);
+						if (ok) {
+							// Arm the lifecycle above: re-trigger throttle
+							// paced by the weapon's own fire interval
+							// (clamped so a missing/zero interval can't
+							// jam the throttle open or shut).
+							fireOnEmptyAnimActive = true;
+							fireOnEmptyStopTimer  =
+								std::clamp(EquippedWeapon::GetWeaponFireInterval(player), 0.05f, 1.0f);
+							// Arm the wedged-graph safety net (see above);
+							// expected to be a no-op on the idle path.
+							fireOnEmptyVerifyTimer = 1.5f;
+							PushEvent("Fire on Empty triggered");
+						}
+					} else {
+						logger::info("[FireOnEmpty] Skipped: '{}' entryFound={} enabled={}",
+							eid, found, found && entry.enabled);
+					}
+				}
+			}
+		}
+
+		// ---- weaponFire suppression window (see FireAnnotationGuard) ----
+		// Recomputed every frame: open while the dry-fire idle is in
+		// flight or blending out, and ONLY while the magazine is still
+		// empty — the instant ammo returns (reload) real firing must
+		// reach the engine again, grace or no grace.
+		if (fireOnEmptySuppressGrace > 0.0f) {
+			fireOnEmptySuppressGrace -= delta;
+			if (fireOnEmptySuppressGrace < 0.0f) fireOnEmptySuppressGrace = 0.0f;
+		}
+		const bool suppressFire =
+			foeSettings->fireOnEmptyEnabled &&
+			foeMagAmmo == 0 &&
+			(fireOnEmptyAnimActive || fireOnEmptySuppressGrace > 0.0f);
+		FireAnnotationGuard::s_suppress.store(suppressFire, std::memory_order_relaxed);
+
+		prevFireInputHeld = foeFireHeld;
+	}
+
 	// ============================================================
-	if (!gs->inertiaEnabled) return;
+	// INERTIA + GAMEPLAY EXTRAS
+	// ------------------------------------------------------------
+	// `inertiaEnabled`, `requireWeaponDrawn`, and the per-weapon-type
+	// `ws.enabled` flag used to be hard early-returns here, which silently
+	// disabled every gameplay extra below them (Early ADS Return, Early
+	// Equip, Early Fire Cancel, phantom-fire override, Super Sprint, Air
+	// Walk Prevention) whenever inertia was off for ANY reason — e.g. a
+	// weapon type with its inertia preset disabled also lost Early ADS.
+	// They are now folded into a single `springsActive` flag that gates
+	// ONLY the visual spring / impulse / viewmodel-offset work; the
+	// gameplay extras run regardless.
+	// ============================================================
 
 	if (!hasLoggedGraphVars) {
 		hasLoggedGraphVars = true;
 		HavokVar::LogAllAttackVars(player);
 	}
 
-	// Only run in first person
+	// First-person only from here down. This is a real gate (not part of
+	// springsActive): both the inertia springs and the gameplay extras are
+	// designed around the first-person rig and FP input flow.
 	auto* camera = RE::PlayerCamera::GetSingleton();
 	if (!camera) return;
 	bool inFP = false;
@@ -1821,16 +2721,30 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	}
 	isInFirstPerson = true;
 
-	// Require weapon drawn (option) - use ActorState::weaponState
-	if (gs->requireWeaponDrawn && !weaponDrawn) {
-		if (wasWeaponDrawn) Reset();
-		wasWeaponDrawn = false;
-		return;
-	}
-
-	// Get current weapon settings
+	// Get current weapon settings (per-type or per-weapon preset). Fetched
+	// unconditionally — extras read their per-type settings (earlyAds*,
+	// earlyEquip*, earlyFireCancel*) from here even when ws.enabled is off.
 	const WeaponInertiaSettings& ws = GetCurrentWeaponSettings(player);
-	if (!ws.enabled) return;
+
+	// Springs gate: master inertia toggle + optional weapon-drawn
+	// requirement + per-weapon-type inertia enable. Gates ONLY the visual
+	// inertia (impulse fires, spring feeds, viewmodel offset application).
+	const bool springsActive = gs->inertiaEnabled &&
+	                           (!gs->requireWeaponDrawn || weaponDrawn) &&
+	                           ws.enabled;
+
+	// Falling edge: drain all spring energy once so no stale offset stays
+	// applied to the viewmodel and re-enabling starts clean (no pop).
+	// Physics-only reset — gameplay-extra state must survive this.
+	if (!springsActive && springsWereActive) {
+		ResetSpringPhysicsState();
+	}
+	springsWereActive = springsActive;
+
+	// Computed once per frame: no new impulses should fire while Pip-Boy is open.
+	// Springs are still integrated and drained (reset before COMBINE); we simply
+	// prevent any new velocity from being kicked in while the menu is up.
+	const bool pipboyOpen = IsPipboyMenuOpen();
 
 	// ---- EQUIP IMPULSE ----
 	// Use the formID already cached by GetCurrentWeaponSettings (which
@@ -1869,7 +2783,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		ChamberExclusion::Manager::GetSingleton()->ApplyKeywordToEquippedInstance(player);
 	}
 
-	if (justEquipped && ws.equipImpulseEnabled) {
+	if (justEquipped && springsActive && ws.equipImpulseEnabled && !pipboyOpen) {
 		equipImpulse.Fire(
 			{ ws.equipImpulseZ, ws.equipImpulseY, ws.equipImpulseX },
 			{ ws.equipRotImpulse, 0.0f, 0.0f },
@@ -1940,7 +2854,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		float& delayTimer = useEmpty ? emptyReloadImpulseDelayTimer : reloadImpulseDelayTimer;
 		float  delayVal   = useEmpty ? ws.emptyReloadImpulseDelay   : ws.reloadImpulseDelay;
 
-		if (triggered && enabled) {
+		if (triggered && enabled && springsActive && !pipboyOpen) {
 			if (delayVal <= 0.0f) {
 				fireReload(useEmpty ? "Empty reload impulse" : "Tactical reload impulse");
 			} else {
@@ -1948,11 +2862,13 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			}
 		}
 
-		if (delayTimer > 0.0f) {
+		if (pipboyOpen) {
+			delayTimer = 0.0f;  // cancel any pending delayed reload impulse
+		} else if (delayTimer > 0.0f) {
 			delayTimer -= delta;
 			if (delayTimer <= 0.0f) {
 				delayTimer = 0.0f;
-				if (enabled) {
+				if (enabled && springsActive) {
 					fireReload(useEmpty ? "Empty reload impulse (delayed)" : "Tactical reload impulse (delayed)");
 				}
 			}
@@ -1967,7 +2883,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		// --- Spring dampening on ADS enter ---
 		// Dampens both velocity (future motion) and current offset (existing displacement)
 		// so both residual swinging and current arm position snap toward neutral.
-		if (ws.adsTransitionDampenEnabled) {
+		if (springsActive && ws.adsTransitionDampenEnabled) {
 			float f = ws.adsTransitionDampenFactor;
 			// Velocity -- controls future spring movement
 			cameraSpring.positionVelocity.x *= f; cameraSpring.positionVelocity.y *= f; cameraSpring.positionVelocity.z *= f;
@@ -1985,7 +2901,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			jumpSpring.positionOffset.x *= f; jumpSpring.positionOffset.y *= f; jumpSpring.positionOffset.z *= f;
 		}
 		// --- ADS enter impulse ---
-		if (ws.adsEnterImpulseEnabled) {
+		if (springsActive && ws.adsEnterImpulseEnabled && !pipboyOpen) {
 			float scale = 1.0f;
 			if (earlyAdsTriggered) {
 				scale = ws.earlyAdsReturnImpulseScale;
@@ -1999,7 +2915,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			PushEvent("ADS enter impulse");
 		}
 		// --- Start procedural enter transition ---
-		if (ws.adsEnterTransition.enabled) {
+		if (springsActive && ws.adsEnterTransition.enabled) {
 			auto* idata = GetEquippedWeaponInstanceData(player);
 			float dur = GetSightedTransitionSeconds(idata);
 			if (dur > 0.0f) {
@@ -2013,7 +2929,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	}
 	if (wasADS && !isCurrentlyADS) {
 		// --- Spring dampening on ADS exit ---
-		if (ws.adsTransitionDampenEnabled) {
+		if (springsActive && ws.adsTransitionDampenEnabled) {
 			float f = ws.adsTransitionDampenFactor;
 			cameraSpring.positionVelocity.x *= f; cameraSpring.positionVelocity.y *= f; cameraSpring.positionVelocity.z *= f;
 			cameraSpring.rotationVelocity.x *= f; cameraSpring.rotationVelocity.y *= f; cameraSpring.rotationVelocity.z *= f;
@@ -2029,7 +2945,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			jumpSpring.positionOffset.x *= f; jumpSpring.positionOffset.y *= f; jumpSpring.positionOffset.z *= f;
 		}
 		// --- ADS exit impulse ---
-		if (ws.adsExitImpulseEnabled) {
+		if (springsActive && ws.adsExitImpulseEnabled && !pipboyOpen) {
 			adsExitImpulse.Fire(
 				{ ws.adsExitImpulseZ, ws.adsExitImpulseY, ws.adsExitImpulseX },
 				{ ws.adsExitRotImpulse, 0.0f, 0.0f },
@@ -2037,7 +2953,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			PushEvent("ADS exit impulse");
 		}
 		// --- Start procedural exit transition ---
-		if (ws.adsExitTransition.enabled) {
+		if (springsActive && ws.adsExitTransition.enabled) {
 			auto* idata = GetEquippedWeaponInstanceData(player);
 			float dur = GetSightedTransitionSeconds(idata);
 			if (dur > 0.0f) {
@@ -2083,13 +2999,15 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		reloadElapsedTime += delta;
 	if (recentlyReloadedTimer > 0.0f) recentlyReloadedTimer -= delta;
 
-	// Read ADS / Fire input state from the AttackBlockHandler.
-	// The base HeldStateHandler::heldStateActive flag is set when *either*
-	// left or right attack input is held (it's a generic "any held" flag).
-	// For fire-cancel-reload detection we need to distinguish them, so we
-	// peek the AttackBlockHandler's per-button bytes:
-	//   leftAttackButtonHeld  @ offset 0x72  → FIRE (left mouse / RT)
-	//   rightAttackButtonHeld @ offset 0x73  → ADS  (right mouse / LT)
+	// Read ADS / Fire input state.
+	// Fire comes from the AttackInput vtable hook (engine-dispatched
+	// "PrimaryAttack" ButtonEvents — ground truth). The old raw-byte peek
+	// of AttackBlockHandler @ 0x72 proved unreliable in-game (whole
+	// sessions of live fire never read non-zero); it remains only as a
+	// fallback if the hook failed to install.
+	// ADS keeps the generic HeldStateHandler::heldStateActive flag for
+	// compatibility with the existing EarlyADS arm behavior (it's a
+	// "either attack button held" flag, which EarlyADS was tuned around).
 	bool adsInputHeld  = false;
 	bool fireInputHeld = false;
 	auto* pc = RE::PlayerControls::GetSingleton();
@@ -2098,11 +3016,12 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		atkHandler = reinterpret_cast<RE::HeldStateHandler*>(pc->attackHandler);
 		// Generic flag (kept for compatibility with the existing EarlyADS arm).
 		adsInputHeld = atkHandler->heldStateActive;
-		// Per-button bytes — same struct layout in Pre-NG and Post-NG (offsets
-		// verified in CommonLibF4PostNG/RE/Bethesda/PlayerControls.h:178-179).
-		auto* base = reinterpret_cast<const std::uint8_t*>(pc->attackHandler);
-		fireInputHeld = (base[0x72] != 0);
-		// (rightAttackButtonHeld at base[0x73] — left as a probe for future work)
+		if (AttackInput::s_installed) {
+			fireInputHeld = AttackInput::s_fireHeld;
+		} else {
+			auto* base = reinterpret_cast<const std::uint8_t*>(pc->attackHandler);
+			fireInputHeld = (base[0x72] != 0);
+		}
 	}
 
 	// Force-idle: keep the ADS/attack handler suppressed for a few frames
@@ -2688,7 +3607,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		                                       ws.sustainedFireMax - 1.0f);
 		bool wasADSFire = recentlyFiredADS;  // set when last fire event was detected while ADS
 
-		if (wasADSFire && ws.adsFireRecoveryImpulseEnabled && adsFireRecoveryCooldownTimer <= 0.0f) {
+		if (wasADSFire && springsActive && ws.adsFireRecoveryImpulseEnabled && adsFireRecoveryCooldownTimer <= 0.0f && !pipboyOpen) {
 			adsFireRecoveryImpulse.Fire(
 				{ ws.adsFireRecoveryImpulseZ * sustainedMult, ws.adsFireRecoveryImpulseY * sustainedMult, ws.adsFireRecoveryImpulseX * sustainedMult },
 				{ ws.adsFireRecoveryRotImpulse * sustainedMult, 0.0f, 0.0f },
@@ -2698,7 +3617,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 				PushEvent("ADS fire recovery (sustained)");
 			else
 				PushEvent("ADS fire recovery");
-		} else if (!wasADSFire && ws.fireRecoveryImpulseEnabled && fireRecoveryCooldownTimer <= 0.0f) {
+		} else if (!wasADSFire && springsActive && ws.fireRecoveryImpulseEnabled && fireRecoveryCooldownTimer <= 0.0f && !pipboyOpen) {
 			fireRecoveryImpulse.Fire(
 				{ ws.fireRecoveryImpulseZ * sustainedMult, ws.fireRecoveryImpulseY * sustainedMult, ws.fireRecoveryImpulseX * sustainedMult },
 				{ ws.fireRecoveryRotImpulse * sustainedMult, 0.0f, 0.0f },
@@ -2769,6 +3688,12 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			intensityMult *= ws.adsInertiaMult;
 	}
 
+	// ---- SETTLING / CAMERA SPRING / MOVEMENT SPRING / WALK OFFSETS ----
+	// Pure inertia visuals — skipped entirely when springs are gated off.
+	// Camera-velocity state (lastCameraYaw etc.) is reset on the falling
+	// edge above and re-initializes on the first active frame, so skipping
+	// here cannot produce a velocity spike on re-enable.
+	if (springsActive) {
 	// ---- SETTLING ----
 	// Camera velocity must use wall-clock realDelta, NOT game-time delta.
 	// Mouse input is not affected by sgtm, so the angular change between
@@ -2826,19 +3751,221 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		moveToward(walkWeightLeft,  tgtLeft);
 		moveToward(walkWeightRight, tgtRight);
 	}
+	}  // end if (springsActive) — settling/camera/movement/walk-offset visuals
 
 	// ---- SPRINT IMPULSE ----
 	// moveMode bit 0x100 = sprinting (UneducatedShooter pattern)
 	bool currentlySpriniting = (player->moveMode & 0x100) != 0;
+
+	// ---- SUPER SPRINT (input-hook approach) ----
+	// The SprintHandler::HandleEvent(ButtonEvent*) vtable hook (installed in
+	// InitSuperSprint) eats sprint JustPressed events while s_eatEnabled is
+	// true. Because the engine never receives the second tap, its internal
+	// sprint toggle stays ON, moveMode keeps 0x100, and the animation never
+	// cancels.  We just manage the window + activation here.
+	{
+		auto* sgs = Settings::GetSingleton();
+		const bool ssEnabled = sgs->superSprintEnabled && superSprintKeyword
+			&& avifSpeedMult && SuperSprintInput::s_installed;
+
+		if (ssEnabled) {
+			// -----------------------------------------------------------
+			// 1. ACTIVATION WINDOW — open on first sprint tap, enable eating
+			// -----------------------------------------------------------
+			if (!superSprintActive) {
+				// Sprint just started (first tap) — open the activation window
+				// and enable the input hook to eat the next sprint press
+				if (currentlySpriniting && !wasSprinting) {
+					superSprintWindowActive = true;
+					superSprintWindowStart  = elapsedTime;
+					SuperSprintInput::s_eatEnabled = true;
+				}
+
+				// Expire the window if too much time has passed
+				if (superSprintWindowActive &&
+					(elapsedTime - superSprintWindowStart) > sgs->superSprintDoubleTapWindow) {
+					superSprintWindowActive = false;
+					SuperSprintInput::s_eatEnabled = false;
+				}
+
+				// The input hook ate a sprint press during the window → ACTIVATE
+				if (superSprintWindowActive && SuperSprintInput::s_eatTriggered) {
+					SuperSprintInput::s_eatTriggered = false;
+					SuperSprintInput::s_eatEnabled   = false;
+					superSprintWindowActive = false;
+
+					// Block activation if AP is below the stamina threshold
+					bool allowActivation = true;
+					if (sgs->superSprintStaminaThresholdEnabled && avifActionPoints) {
+						float curAP  = player->GetActorValue(*avifActionPoints);
+						float baseAP = player->GetBaseActorValue(*avifActionPoints);
+						if (baseAP > 0.0f) {
+							float pct = (curAP / baseAP) * 100.0f;
+							if (pct < sgs->superSprintStaminaThreshold) {
+								allowActivation = false;
+								logger::trace("[SuperSprint] Activation blocked — AP {:.1f}%% < threshold {:.0f}%%",
+									pct, sgs->superSprintStaminaThreshold);
+							}
+						}
+					}
+
+					if (allowActivation) {
+						superSprintActive = true;
+
+						// Boost SpeedMult actor value (movement speed)
+						float baseSpeed = player->GetActorValue(*avifSpeedMult);
+						superSprintSpeedBoost = baseSpeed * (sgs->superSprintSpeedMult - 1.0f);
+						player->ModActorValue(static_cast<RE::ACTOR_VALUE_MODIFIER>(1),
+							*avifSpeedMult, superSprintSpeedBoost);
+
+						// Boost AnimationMult actor value (animation playback speed).
+						// AnimationMult base is 100 (= 1.0x); adding 25 → 125 → 1.25x.
+						if (avifAnimMult && sgs->superSprintAnimSpeedMult > 1.001f) {
+							float baseAnim = player->GetActorValue(*avifAnimMult);
+							superSprintAnimBoost = baseAnim * (sgs->superSprintAnimSpeedMult - 1.0f);
+							player->ModActorValue(static_cast<RE::ACTOR_VALUE_MODIFIER>(1),
+								*avifAnimMult, superSprintAnimBoost);
+						}
+
+						// Seed AP tracking for multiplicative extra drain
+						if (avifActionPoints) {
+							superSprintPrevAP = player->GetActorValue(*avifActionPoints);
+						}
+
+						// Apply OAR keyword to player's NPC base form
+						auto* npc = player->GetNPC();
+						if (npc) {
+							SuperSprintHelpers::AddKeyword(
+								static_cast<RE::BGSKeywordForm*>(npc), superSprintKeyword);
+						}
+
+						PushEvent("Super Sprint activated");
+						logger::info("[SuperSprint] Activated — speedBoost={:.1f}, animBoost={:.1f}, window={:.3f}s",
+							superSprintSpeedBoost, superSprintAnimBoost,
+							elapsedTime - superSprintWindowStart);
+					}
+				}
+			}
+
+			// -----------------------------------------------------------
+			// 2. DEACTIVATION — sprint stopped naturally (3rd tap, AP out,
+			//    player stopped moving, etc.)
+			// -----------------------------------------------------------
+			if (superSprintActive && !currentlySpriniting && wasSprinting) {
+				superSprintActive = false;
+
+				if (std::abs(superSprintSpeedBoost) > 0.001f) {
+					player->ModActorValue(static_cast<RE::ACTOR_VALUE_MODIFIER>(1),
+						*avifSpeedMult, -superSprintSpeedBoost);
+					superSprintSpeedBoost = 0.0f;
+				}
+
+				// Remove animation speed boost
+				if (avifAnimMult && std::abs(superSprintAnimBoost) > 0.001f) {
+					player->ModActorValue(static_cast<RE::ACTOR_VALUE_MODIFIER>(1),
+						*avifAnimMult, -superSprintAnimBoost);
+					superSprintAnimBoost = 0.0f;
+				}
+
+				auto* npc = player->GetNPC();
+				if (npc) {
+					SuperSprintHelpers::RemoveKeyword(
+						static_cast<RE::BGSKeywordForm*>(npc), superSprintKeyword);
+				}
+
+				superSprintPrevAP = -1.0f;
+				SuperSprintInput::s_eatEnabled = false;
+				PushEvent("Super Sprint deactivated");
+				logger::info("[SuperSprint] Deactivated");
+			}
+
+			// -----------------------------------------------------------
+			// 3. PER-FRAME EFFECTS (AP drain, animation speed)
+			// -----------------------------------------------------------
+			if (superSprintActive && currentlySpriniting) {
+				// Extra AP drain (multiplicative with engine's sprint drain)
+				if (avifActionPoints && sgs->superSprintAPCostMult > 1.001f) {
+					float currentAP = player->GetActorValue(*avifActionPoints);
+					if (superSprintPrevAP >= 0.0f) {
+						float engineDrain = superSprintPrevAP - currentAP;
+						if (engineDrain > 0.0f) {
+							float extraDrain = engineDrain * (sgs->superSprintAPCostMult - 1.0f);
+							player->ModActorValue(static_cast<RE::ACTOR_VALUE_MODIFIER>(2),
+								*avifActionPoints, -extraDrain);
+							currentAP -= extraDrain;
+						}
+					}
+					superSprintPrevAP = currentAP;
+				}
+
+				// Disengage super sprint if AP% drops below the stamina threshold
+				if (sgs->superSprintStaminaThresholdEnabled && avifActionPoints) {
+					float curAP  = player->GetActorValue(*avifActionPoints);
+					float baseAP = player->GetBaseActorValue(*avifActionPoints);
+					if (baseAP > 0.0f && (curAP / baseAP) * 100.0f < sgs->superSprintStaminaThreshold) {
+						// Force deactivation — remove boosts and keyword
+						superSprintActive = false;
+
+						if (std::abs(superSprintSpeedBoost) > 0.001f) {
+							player->ModActorValue(static_cast<RE::ACTOR_VALUE_MODIFIER>(1),
+								*avifSpeedMult, -superSprintSpeedBoost);
+							superSprintSpeedBoost = 0.0f;
+						}
+						if (avifAnimMult && std::abs(superSprintAnimBoost) > 0.001f) {
+							player->ModActorValue(static_cast<RE::ACTOR_VALUE_MODIFIER>(1),
+								*avifAnimMult, -superSprintAnimBoost);
+							superSprintAnimBoost = 0.0f;
+						}
+						auto* npc = player->GetNPC();
+						if (npc) {
+							SuperSprintHelpers::RemoveKeyword(
+								static_cast<RE::BGSKeywordForm*>(npc), superSprintKeyword);
+						}
+						superSprintPrevAP = -1.0f;
+						SuperSprintInput::s_eatEnabled = false;
+						PushEvent("Super Sprint cancelled (low stamina)");
+						logger::info("[SuperSprint] Disengaged — AP {:.1f}%% below threshold {:.0f}%%",
+							(curAP / baseAP) * 100.0f, sgs->superSprintStaminaThreshold);
+					}
+				}
+			}
+		} else if (superSprintActive) {
+			// Feature was disabled while super sprint was active — clean up
+			superSprintActive = false;
+			if (std::abs(superSprintSpeedBoost) > 0.001f && avifSpeedMult) {
+				player->ModActorValue(static_cast<RE::ACTOR_VALUE_MODIFIER>(1),
+					*avifSpeedMult, -superSprintSpeedBoost);
+				superSprintSpeedBoost = 0.0f;
+			}
+			if (avifAnimMult && std::abs(superSprintAnimBoost) > 0.001f) {
+				player->ModActorValue(static_cast<RE::ACTOR_VALUE_MODIFIER>(1),
+					*avifAnimMult, -superSprintAnimBoost);
+				superSprintAnimBoost = 0.0f;
+			}
+			auto* npc = player->GetNPC();
+			if (npc && superSprintKeyword) {
+				SuperSprintHelpers::RemoveKeyword(
+					static_cast<RE::BGSKeywordForm*>(npc), superSprintKeyword);
+			}
+			superSprintPrevAP = -1.0f;
+			SuperSprintInput::s_eatEnabled = false;
+			logger::info("[SuperSprint] Force-deactivated (feature disabled)");
+		}
+	}
+
 	isSprinting = currentlySpriniting;
-	if (currentlySpriniting && !wasSprinting && ws.sprintInertiaEnabled && ws.sprintStartEnabled) {
+
+	const bool sprintJustStarted = currentlySpriniting && !wasSprinting;
+	const bool sprintJustStopped = !currentlySpriniting && wasSprinting;
+
+	if (sprintJustStarted && springsActive && ws.sprintInertiaEnabled && ws.sprintStartEnabled && !pipboyOpen) {
 		sprintSpring.positionVelocity.x += ws.sprintImpulseZ * intensityMult;
 		sprintSpring.positionVelocity.y += ws.sprintImpulseY * intensityMult;
 		sprintSpring.positionVelocity.z += ws.sprintImpulseX * intensityMult;
 		sprintSpring.rotationVelocity.x += ws.sprintRotImpulse * intensityMult;
 		PushEvent("Sprint start impulse");
 	}
-	if (!currentlySpriniting && wasSprinting && ws.sprintInertiaEnabled && ws.sprintStopEnabled) {
+	if (sprintJustStopped && springsActive && ws.sprintInertiaEnabled && ws.sprintStopEnabled && !pipboyOpen) {
 		sprintSpring.positionVelocity.x += ws.sprintStopImpulseZ * intensityMult;
 		sprintSpring.positionVelocity.y += ws.sprintStopImpulseY * intensityMult;
 		sprintSpring.positionVelocity.z += ws.sprintStopImpulseX * intensityMult;
@@ -2892,15 +4019,17 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			pendingFallImpulse = false;
 			pendingFallTimer   = 0.0f;
 			didJump = true;
-			jumpSpring.positionVelocity.x += ws.jumpImpulseZ * intensityMult;
-			jumpSpring.positionVelocity.y += ws.jumpImpulseY * intensityMult;
-			jumpSpring.positionVelocity.z += ws.jumpImpulseX * intensityMult;
-			jumpSpring.rotationVelocity.x += ws.jumpRotPitch * intensityMult;
-			jumpSpring.rotationVelocity.y += ws.jumpRotYaw   * intensityMult;
-			jumpSpring.rotationVelocity.z += ws.jumpRotRoll  * intensityMult;
-			currentJumpStiffness = ws.jumpStiffness;
-			currentJumpDamping   = ws.jumpDamping;
-			PushEvent("Jump impulse");
+			if (springsActive && !pipboyOpen) {
+				jumpSpring.positionVelocity.x += ws.jumpImpulseZ * intensityMult;
+				jumpSpring.positionVelocity.y += ws.jumpImpulseY * intensityMult;
+				jumpSpring.positionVelocity.z += ws.jumpImpulseX * intensityMult;
+				jumpSpring.rotationVelocity.x += ws.jumpRotPitch * intensityMult;
+				jumpSpring.rotationVelocity.y += ws.jumpRotYaw   * intensityMult;
+				jumpSpring.rotationVelocity.z += ws.jumpRotRoll  * intensityMult;
+				currentJumpStiffness = ws.jumpStiffness;
+				currentJumpDamping   = ws.jumpDamping;
+				PushEvent("Jump impulse");
+			}
 		} else {
 			didJump = false;
 			pendingFallImpulse = true;
@@ -2920,21 +4049,23 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			if (pendingFallTimer >= kFallImpulseDelay) {
 				pendingFallImpulse = false;
 				pendingFallTimer   = 0.0f;
-				jumpSpring.positionVelocity.x += ws.fallImpulseZ * intensityMult;
-				jumpSpring.positionVelocity.y += ws.fallImpulseY * intensityMult;
-				jumpSpring.positionVelocity.z += ws.fallImpulseX * intensityMult;
-				jumpSpring.rotationVelocity.x += ws.fallRotPitch * intensityMult;
-				jumpSpring.rotationVelocity.y += ws.fallRotYaw   * intensityMult;
-				jumpSpring.rotationVelocity.z += ws.fallRotRoll  * intensityMult;
-				currentJumpStiffness = ws.fallStiffness;
-				currentJumpDamping   = ws.fallDamping;
-				PushEvent("Fall-from-ledge impulse");
+				if (springsActive && !pipboyOpen) {
+					jumpSpring.positionVelocity.x += ws.fallImpulseZ * intensityMult;
+					jumpSpring.positionVelocity.y += ws.fallImpulseY * intensityMult;
+					jumpSpring.positionVelocity.z += ws.fallImpulseX * intensityMult;
+					jumpSpring.rotationVelocity.x += ws.fallRotPitch * intensityMult;
+					jumpSpring.rotationVelocity.y += ws.fallRotYaw   * intensityMult;
+					jumpSpring.rotationVelocity.z += ws.fallRotRoll  * intensityMult;
+					currentJumpStiffness = ws.fallStiffness;
+					currentJumpDamping   = ws.fallDamping;
+					PushEvent("Fall-from-ledge impulse");
+				}
 			}
 		}
 	}
 
 	// Landing impulse uses confirmedLanding to ignore brief collision flickers
-	if (confirmedLanding && airTime > 0.05f) {
+	if (confirmedLanding && springsActive && airTime > 0.05f && !pipboyOpen) {
 		float landScale = std::min(airTime * ws.airTimeImpulseScale, 2.0f);
 		jumpSpring.positionVelocity.x += ws.landImpulseZ * intensityMult * landScale;
 		jumpSpring.positionVelocity.y += ws.landImpulseY * intensityMult * landScale;
@@ -2965,7 +4096,9 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	//   entry[1] = [ 0,      1, 0      ]
 	//   entry[2] = [-sin(θ), 0, cos(θ) ]
 	// So entry[0].v.z == sin(θ) encodes the lean angle.
-	{
+	// Pure inertia visual — gated. Lean smoothing state is reset with the
+	// other spring state on the falling edge.
+	if (springsActive) {
 		float rawLeanWeight = 0.0f;
 		auto* fpRoot = player->Get3D(true);
 		if (fpRoot) {
@@ -3001,7 +4134,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		if (leanImpulseActive) {
 			const float curDir  = (currentLeanWeight > 0.1f) ? 1.0f : (currentLeanWeight < -0.1f) ? -1.0f : 0.0f;
 			const float prevDir = prevLeanDir;
-			if (curDir != prevDir && (curDir != 0.0f || prevDir != 0.0f)) {
+			if (curDir != prevDir && (curDir != 0.0f || prevDir != 0.0f) && !pipboyOpen) {
 				// Direction changed (or started/stopped leaning) — fire impulse
 				const float dir = (curDir != 0.0f) ? curDir : -prevDir; // direction of the change
 				RE::NiPoint3 posImp{
@@ -3032,7 +4165,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		if (sneakStartEvt)      wasSneaking = true;
 		else if (sneakStopEvt)  wasSneaking = false;
 
-		if (ws.sneakImpulseEnabled && wasSneaking != sneakingBefore) {
+		if (springsActive && ws.sneakImpulseEnabled && wasSneaking != sneakingBefore && !pipboyOpen) {
 			if (wasSneaking) {
 				RE::NiPoint3 posImp{ ws.sneakEnterImpulseX * intensityMult, ws.sneakEnterImpulseY * intensityMult, ws.sneakEnterImpulseZ * intensityMult };
 				RE::NiPoint3 rotImp{ ws.sneakEnterRotImpulse * intensityMult, 0.0f, 0.0f };
@@ -3065,7 +4198,11 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		ResetSpringPhysicsState();
 	}
 
-	// ---- PROCEDURAL ADS TRANSITION ----
+	// ---- PROCEDURAL ADS TRANSITION + COMBINE + APPLY ----
+	// The whole tail (transition envelope, spring summation, viewmodel
+	// offset application, deferred-offset handoff, debug telemetry) is
+	// pure inertia output — skipped entirely when springs are gated off.
+	if (springsActive) {
 	SpringState adsTransitionOffset{};  // starts zeroed
 	if (adsTransitionActive) {
 		adsTransitionTimer += delta;
@@ -3179,7 +4316,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	bool doBaselineLog = (debugFrameCounter >= 30);
 	if (doBaselineLog) {
 		debugFrameCounter = 0;
-		logger::trace("[FPInertia] dt={:.4f} "
+		logger::trace("[FPGunplayOverhaul] dt={:.4f} "
 			"camVel p={:.3f} y={:.3f} | "
 			"PITCH spr: off={:.4f} vel={:.4f} | "
 			"YAW pos: off={:.4f} vel={:.4f} | "
@@ -3204,10 +4341,11 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	if (!pivot && fpNode) {
 		static int nullPivotLogThrottle = 0;
 		if (++nullPivotLogThrottle % 60 == 1) {
-			logger::warn("[FPInertia] FindTargetNode returned nullptr (isADS={}, pivotWarmup={:.2f})",
+			logger::warn("[FPGunplayOverhaul] FindTargetNode returned nullptr (isADS={}, pivotWarmup={:.2f})",
 				isCurrentlyADS, pivotWarmupTimer);
 		}
 	}
+	}  // end if (springsActive) — transition/combine/apply/telemetry
 
 	// Snapshot magazine ammo count for next-frame comparison.  Read here
 	// (end of Update) so phantom-fire's `ammoDecreased` check at the top
@@ -3321,6 +4459,21 @@ void Inertia::InertiaManager::Reset()
 	earlyFireCancelPending = false;
 	earlyFireCancelTimer   = 0.0f;
 
+	// Fire on Empty: if a dry-fire idle is still playing, stop it so it
+	// can't blend through camera switches / game loads.
+	if (fireOnEmptyAnimActive) {
+		if (auto* p = RE::PlayerCharacter::GetSingleton()) {
+			StopEmptyFireAnimation(p, "reset");
+		}
+	}
+	fireOnEmptyAnimActive  = false;
+	fireOnEmptyStopTimer   = 0.0f;
+	fireOnEmptyVerifyTimer = 0.0f;
+	fireOnEmptyLatched     = false;
+	prevFireInputHeld      = false;
+	fireOnEmptySuppressGrace = 0.0f;
+	FireAnnotationGuard::s_suppress.store(false, std::memory_order_relaxed);
+
 	pendingFallImpulse = false;
 	pendingFallTimer   = 0.0f;
 	confirmedInAir     = false;
@@ -3330,6 +4483,31 @@ void Inertia::InertiaManager::Reset()
 	hasRefPosePivot = false;
 	refPosePivotTranslate = { 0.0f, 0.0f, 0.0f };
 	cachedWeaponSettingsValid = false;
+
+	// Clean up super sprint state (remove speed/anim boosts and keyword if active)
+	if (superSprintActive) {
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (player && avifSpeedMult && std::abs(superSprintSpeedBoost) > 0.001f) {
+			player->ModActorValue(static_cast<RE::ACTOR_VALUE_MODIFIER>(1), *avifSpeedMult, -superSprintSpeedBoost);
+		}
+		if (player && avifAnimMult && std::abs(superSprintAnimBoost) > 0.001f) {
+			player->ModActorValue(static_cast<RE::ACTOR_VALUE_MODIFIER>(1), *avifAnimMult, -superSprintAnimBoost);
+		}
+		if (player && superSprintKeyword) {
+			auto* npc = player->GetNPC();
+			if (npc) {
+				SuperSprintHelpers::RemoveKeyword(static_cast<RE::BGSKeywordForm*>(npc), superSprintKeyword);
+			}
+		}
+	}
+	superSprintActive      = false;
+	superSprintWindowActive = false;
+	superSprintWindowStart  = 0.0f;
+	superSprintSpeedBoost  = 0.0f;
+	superSprintAnimBoost   = 0.0f;
+	superSprintPrevAP      = -1.0f;
+	SuperSprintInput::s_eatEnabled  = false;
+	SuperSprintInput::s_eatTriggered = false;
 }
 
 void Inertia::InertiaManager::OnGameLoaded()
@@ -3341,6 +4519,77 @@ void Inertia::InertiaManager::OnGameLoaded()
 	RegisterAnimEventSink();
 }
 
+// ============================================================
+// Super Sprint — runtime keyword and cached AVIF init
+// ============================================================
+void Inertia::InertiaManager::InitSuperSprint()
+{
+	// Cache frequently-used ActorValueInfo pointers from the AV singleton
+	auto* avSingleton = RE::ActorValue::GetSingleton();
+	if (avSingleton) {
+		avifSpeedMult    = avSingleton->speedMult;
+		avifAnimMult     = avSingleton->animationMult;
+		avifActionPoints = avSingleton->actionPoints;
+	}
+	if (!avifSpeedMult)    logger::warn("[SuperSprint] Could not resolve SpeedMult AVIF");
+	if (!avifAnimMult)     logger::warn("[SuperSprint] Could not resolve AnimationMult AVIF");
+	if (!avifActionPoints) logger::warn("[SuperSprint] Could not resolve ActionPoints AVIF");
+
+	// Create a runtime BGSKeyword named "AnimSuperSprintKeyword" for OAR condition matching.
+	// If one already exists (e.g., from an ESP), reuse it.
+	superSprintKeyword = RE::TESForm::GetFormByEditorID<RE::BGSKeyword>("AnimSuperSprintKeyword");
+	if (!superSprintKeyword) {
+		auto* factory = RE::ConcreteFormFactory<RE::BGSKeyword, RE::ENUM_FORM_ID::kKYWD>::GetFormFactory();
+		if (factory) {
+			superSprintKeyword = factory->Create();
+			if (superSprintKeyword) {
+				superSprintKeyword->SetFormEditorID("AnimSuperSprintKeyword");
+				logger::info("[SuperSprint] Created runtime keyword 'AnimSuperSprintKeyword' (FormID 0x{:08X})",
+					superSprintKeyword->GetFormID());
+			}
+		}
+		if (!superSprintKeyword) {
+			logger::error("[SuperSprint] Failed to create runtime keyword — OAR keyword condition will not work");
+		}
+	} else {
+		logger::info("[SuperSprint] Found existing keyword 'AnimSuperSprintKeyword' (FormID 0x{:08X})",
+			superSprintKeyword->GetFormID());
+	}
+
+	superSprintActive      = false;
+	superSprintWindowActive = false;
+	superSprintWindowStart  = 0.0f;
+	superSprintSpeedBoost  = 0.0f;
+	superSprintAnimBoost   = 0.0f;
+	superSprintPrevAP      = -1.0f;
+
+	// Install the SprintHandler vtable hook to eat sprint key presses
+	// during the activation window (prevents the engine from toggling
+	// sprint off on the second tap).
+	if (!SuperSprintInput::s_installed) {
+		SuperSprintInput::Install();
+	}
+	SuperSprintInput::s_eatEnabled  = false;
+	SuperSprintInput::s_eatTriggered = false;
+
+	// Install the AttackBlockHandler vtable hook for ground-truth fire/ADS
+	// button state (used by Fire on Empty and Early Fire Cancel).
+	if (!AttackInput::s_installed) {
+		AttackInput::Install();
+	}
+
+	// Install the player graph-event hook that lets Fire on Empty swallow
+	// weaponFire annotations (prevents real discharge during a dry-fire
+	// on a vanilla fire clip).
+	if (!FireAnnotationGuard::s_installed) {
+		FireAnnotationGuard::Install();
+	}
+
+	logger::info("[SuperSprint] Initialized — SpeedMult={}, AnimMult={}, AP={}, Keyword={}, InputHook={}",
+		avifSpeedMult != nullptr, avifAnimMult != nullptr,
+		avifActionPoints != nullptr, superSprintKeyword != nullptr,
+		SuperSprintInput::s_installed);
+}
 
 // ============================================================
 // Hooks
@@ -3380,10 +4629,10 @@ void Inertia::Install()
 	RunActorUpdatesOrig = reinterpret_cast<RunActorUpdatesFn>(
 		trampoline.write_call<5>(ptr_RunActorUpdates.address(), &HookedActorUpdate));
 
-	logger::info("[FPInertia] Hooks installed: RunActorUpdates @ REL::ID(556439)+0x17");
+	logger::info("[FPGunplayOverhaul] Hooks installed: RunActorUpdates @ REL::ID(556439)+0x17");
 
 	// Validate global time multiplier access (sgtm). At startup it should
 	// be 1.0; if we read something wildly different, the REL::ID is wrong.
 	float initSgtm = GetGlobalTimeMult();
-	logger::info("[FPInertia] Global time multiplier (sgtm) at init: {:.4f}", initSgtm);
+	logger::info("[FPGunplayOverhaul] Global time multiplier (sgtm) at init: {:.4f}", initSgtm);
 }

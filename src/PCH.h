@@ -38,6 +38,7 @@ using namespace std::literals;
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // SimpleIni for INI file parsing

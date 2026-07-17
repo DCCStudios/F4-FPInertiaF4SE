@@ -829,7 +829,7 @@ namespace WeaponFOV
 	// ============================================================
 	std::filesystem::path Manager::GetWBFOVFolder() const
 	{
-		return std::filesystem::current_path() / "Data" / "F4SE" / "Plugins" / "FPInertia" / "WBFOV";
+		return std::filesystem::current_path() / "Data" / "F4SE" / "Plugins" / "FPGunplayOverhaul" / "WBFOV";
 	}
 
 	std::filesystem::path Manager::GetEntryPath(const std::string& editorID) const
