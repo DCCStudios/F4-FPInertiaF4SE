@@ -3141,6 +3141,108 @@ namespace Menu
 			}
 		}
 
+		// ====== REPEATABLE GUN BASH ======
+		ImGuiMCP::Spacing();
+		if (ImGuiMCP::CollapsingHeader("Repeatable Gun Bash")) {
+			auto* settings = Settings::GetSingleton();
+
+			ImGuiMCP::Indent(8.0f);
+			ImGuiMCP::Spacing();
+			ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "What it does:");
+			ImGuiMCP::TextWrapped(
+				"Lets gun bashes combo: press the bash key during an active bash to queue "
+				"a follow-up, which starts once the current bash's hit lands (plus a "
+				"configurable delay) — before the animation has fully wound down.");
+			ImGuiMCP::Spacing();
+			ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "Details:");
+			ImGuiMCP::BulletText("Presses during a bash are queued (up to the queue limit)");
+			ImGuiMCP::BulletText("The follow-up fires after the bash's HitFrame + the combo delay");
+			ImGuiMCP::BulletText("Guns only — melee weapon swings are not affected");
+			ImGuiMCP::BulletText("Below the AP threshold, combos are disabled (vanilla behavior)");
+			ImGuiMCP::Unindent(8.0f);
+			ImGuiMCP::Spacing();
+
+			if (CheckboxWithTooltip("Enable Repeatable Gun Bash##bashCombo", &settings->bashComboEnabled,
+				"Master toggle for the Repeatable Gun Bash feature.\n"
+				"When disabled, bash presses during an active bash are\n"
+				"ignored (vanilla behavior).")) {
+				State::hasUnsavedChanges = true;
+			}
+
+			if (settings->bashComboEnabled) {
+				ImGuiMCP::Spacing();
+
+				if (SliderFloatWithTooltip("Combo Delay##bashDelay", &settings->bashComboDelay,
+					0.0f, 1.0f, "%.2f sec",
+					"Delay after the bash's HitFrame (impact moment) before a\n"
+					"queued follow-up bash may start. Shorter = faster, more\n"
+					"aggressive combos; longer = more deliberate pacing.\n"
+					"Default: 0.20s")) {
+					settings->bashComboDelay = std::clamp(settings->bashComboDelay, 0.0f, 1.0f);
+					State::hasUnsavedChanges = true;
+				}
+
+				if (SliderIntWithTooltip("Max Queued Bashes##bashQueue", &settings->bashComboMaxQueue,
+					1, 2, "%d",
+					"How many follow-up bashes can be queued by pressing the\n"
+					"bash key during an active bash.\n"
+					"Default: 2")) {
+					settings->bashComboMaxQueue = std::clamp(settings->bashComboMaxQueue, 1, 2);
+					State::hasUnsavedChanges = true;
+				}
+
+				ImGuiMCP::Spacing();
+				ImGuiMCP::Separator();
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Transition Blending");
+				ImGuiMCP::Spacing();
+
+				if (CheckboxWithTooltip("Smooth Bash Transitions##bashBlend", &settings->bashComboBlendEnabled,
+					"Starting a follow-up bash mid-swing requires a hard animation\n"
+					"reset, which visually snaps the viewmodel. When enabled, the\n"
+					"pose difference across that snap is measured and smoothed out\n"
+					"as a decaying viewmodel offset (no animation files touched).")) {
+					State::hasUnsavedChanges = true;
+				}
+
+				if (settings->bashComboBlendEnabled) {
+					if (SliderFloatWithTooltip("Blend Time##bashBlendTime", &settings->bashComboBlendTime,
+						0.05f, 0.5f, "%.2f sec",
+						"How long the transition smoothing takes to settle into the\n"
+						"new bash animation. Shorter = snappier, longer = softer.\n"
+						"Default: 0.18s")) {
+						settings->bashComboBlendTime = std::clamp(settings->bashComboBlendTime, 0.05f, 0.5f);
+						State::hasUnsavedChanges = true;
+					}
+				}
+
+				ImGuiMCP::Spacing();
+				ImGuiMCP::Separator();
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Stamina Threshold");
+				ImGuiMCP::Spacing();
+
+				if (CheckboxWithTooltip("Enable Stamina Threshold##bashStamina", &settings->bashComboStaminaThresholdEnabled,
+					"When enabled, bash combos are disabled while the player's AP\n"
+					"is below the configured percentage — presses during a bash\n"
+					"are ignored and any queued bashes are dropped.")) {
+					State::hasUnsavedChanges = true;
+				}
+
+				if (settings->bashComboStaminaThresholdEnabled) {
+					if (SliderFloatWithTooltip("Min Stamina %##bashStaminaPct", &settings->bashComboStaminaThreshold,
+						0.0f, 100.0f, "%.0f%%",
+						"AP percentage below which bash combos are disabled.\n"
+						"If AP falls below this mid-combo, the queue is dropped\n"
+						"and bashing reverts to vanilla single-bash behavior.\n"
+						"Default: 25%%")) {
+						settings->bashComboStaminaThreshold = std::clamp(settings->bashComboStaminaThreshold, 0.0f, 100.0f);
+						State::hasUnsavedChanges = true;
+					}
+				}
+			}
+		}
+
 		// ====== AIR WALK PREVENTION ======
 		ImGuiMCP::Spacing();
 		if (ImGuiMCP::CollapsingHeader("Air Walk Prevention")) {

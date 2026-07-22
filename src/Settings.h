@@ -406,6 +406,20 @@ public:
 	bool  superSprintStaminaThresholdEnabled{ false }; // disengage super sprint when AP% drops below threshold
 	float superSprintStaminaThreshold{ 20.0f };        // AP percentage (0-100) below which super sprint is cancelled
 
+	// === REPEATABLE GUN BASH ===
+	// Gun bashes can combo: a Melee press during an active bash queues a
+	// follow-up, which fires once the bash's HitFrame anim event + delay
+	// have elapsed (before the previous animation fully ends).
+	bool  bashComboEnabled{ true };
+	float bashComboDelay{ 0.2f };     // seconds after HitFrame before a follow-up may start
+	int   bashComboMaxQueue{ 2 };     // max queued follow-up bashes (1-2)
+	bool  bashComboStaminaThresholdEnabled{ true };  // block combos below the AP threshold
+	float bashComboStaminaThreshold{ 25.0f };        // AP percentage (0-100)
+	// Visual blend across the follow-up's graph reset: a measured, decaying
+	// viewmodel offset masks the pose snap (GunMover-style; no OAR needed).
+	bool  bashComboBlendEnabled{ true };
+	float bashComboBlendTime{ 0.18f };               // seconds (0.05-0.50)
+
 	// Debug settings
 	bool debugLogging{ false };
 	bool debugOnScreen{ false };

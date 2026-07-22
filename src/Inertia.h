@@ -194,6 +194,11 @@ namespace Inertia
 		// weaponSheathe, BeginWeaponSheathe, BeginWeaponDraw.
 		std::atomic<bool> sheatheStartedThisFrame{ false };
 		std::atomic<bool> beginWeaponDrawThisFrame{ false };
+		// Repeatable Gun Bash: HitFrame is the common "impact" annotation
+		// present in melee/bash animations (the engine itself registers a
+		// HitFrameHandler functor for this exact event name). The combo
+		// window opens a configurable delay after this event.
+		std::atomic<bool> hitFrameThisFrame{ false };
 		bool registered{ false };
 	};
 
@@ -527,6 +532,23 @@ namespace Inertia
 		// hit can set the remaining stop time to (duration - elapsed).
 		float fireOnEmptyDurationQueryTimer{ 0.0f };
 		float fireOnEmptyAnimElapsed{ 0.0f };
+
+		// Repeatable Gun Bash — combo/queue state.
+		// A bash is "active" while ActorState::meleeAttackState != 0 with a
+		// gun equipped. During an active bash:
+		//   * every fresh Melee press queues a follow-up (capped by settings),
+		//   * the HitFrame anim event arms bashComboDelayTimer,
+		//   * when that timer expires the combo window opens, and the next
+		//     queued bash fires via RunActionOnActor(kActionMelee) (with a
+		//     synthetic Melee input tap as fallback if the action layer
+		//     refuses).
+		// If the bash ends naturally with the queue non-empty, the next
+		// queued bash fires immediately on the falling edge.
+		bool  wasBashActive{ false };        // meleeAttackState != 0 last frame (gun equipped)
+		int   bashQueuedCount{ 0 };          // follow-up bashes waiting to fire
+		float bashComboDelayTimer{ 0.0f };   // counts down from settings delay after HitFrame
+		bool  bashComboWindowOpen{ false };  // HitFrame + delay elapsed for the CURRENT bash
+		float bashRetriggerCooldown{ 0.0f }; // min spacing between injected bashes (re-entry guard)
 
 		// Action blending
 		float actionBlendFactor{ 1.0f };

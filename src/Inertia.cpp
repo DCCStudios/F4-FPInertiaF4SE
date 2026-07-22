@@ -684,6 +684,25 @@ namespace EquippedWeapon
 		}
 		return kFallback;
 	}
+
+	// True when the equipped weapon is a gun (WEAPON_TYPE::kGun). Used to
+	// gate the Repeatable Gun Bash combo — a melee weapon's swings also
+	// set meleeAttackState, and combo-ing those is out of scope.
+	inline bool IsGunEquipped(RE::PlayerCharacter* a_player)
+	{
+		if (!a_player || !a_player->currentProcess || !a_player->currentProcess->middleHigh) return false;
+		auto* mh = a_player->currentProcess->middleHigh;
+		RE::BSAutoLock lock{ mh->equippedItemsLock };
+		for (auto& eq : mh->equippedItems) {
+			auto* form = eq.item.object;
+			if (!form || form->formType != RE::ENUM_FORM_ID::kWEAP) continue;
+			auto* weap = static_cast<RE::TESObjectWEAP*>(form);
+			auto* idata = static_cast<RE::TESObjectWEAP::InstanceData*>(eq.item.instanceData.get());
+			const auto type = idata ? idata->type : weap->weaponData.type;
+			return type == RE::WEAPON_TYPE::kGun;
+		}
+		return false;
+	}
 }
 
 // ============================================================
@@ -1021,6 +1040,601 @@ static bool StopEmptyFireAnimation(RE::PlayerCharacter* a_player, const char* a_
 // whole first-person graph, so locomotion and sway froze until release.
 // Conclusion: the graph must ALWAYS be hard-reset out of the idle, and
 // ADS is re-entered through the input layer (AttackInput::SimulateTap).
+
+// Forward declaration — defined in the MeleeInput namespace below
+// (near the other input hooks); needed here by TriggerGunBashAction.
+namespace MeleeInput
+{
+	static bool SimulateTap();
+}
+
+// ============================================================
+// Repeatable Gun Bash — visual blend across the hard graph reset
+// ------------------------------------------------------------
+// The follow-up bash needs InitializeToBaseState to yank the graph out
+// of the previous bash (V3 findings above), and that reset snaps the
+// viewmodel: the pose jumps from mid-swing to the new bash's first
+// frame in one rendered frame.
+//
+// This masks the snap GunMover-style: a decaying corrective transform
+// applied on top of the animation via an inserted bone, never touching
+// the animation data itself.  No OAR dependency.
+//
+// V1 FINDING (2026-07-22 in-game): routing the correction through the
+// shared inertia pivot (FPInertia_Node, Spine2 by default) was wrong —
+// a rotation measured AT THE HAND applied AROUND THE SPINE swings the
+// hand/weapon along a completely different arc (offset ~= R*(hand-pivot)
+// -(hand-pivot), tens of units for mid-swing deltas), sending the
+// weapon off camera through poses that exist in neither animation.
+//
+// V2 FINDING (in-game): solving a dedicated bone DIRECTLY above
+// RArm_Hand placed the hand/weapon exactly on the blend path, but the
+// forearm and elbow stayed where the NEW animation put them — the
+// skinned wrist/forearm visibly stretched between the displaced hand
+// and the un-displaced elbow during larger corrections.
+//
+// V3 (this version — GunMover's aesthetic): GunMover never corrects a
+// single joint; it shifts the WHOLE viewmodel rigidly (the a_loc
+// anchor in Set1stPersonCameraLocation + the 1st-person camera node's
+// world rotation), which is why its offsets blend in and out of any
+// animation with zero distortion. The node-space equivalent: the
+// blend bone (FPBashBlendNode) is inserted above the SPINE anchor
+// (Spine2 — the subtree carrying both arms and the weapon, the same
+// one the inertia sway moves), and each frame its local transform is
+// SOLVED so the HAND's world pose lands exactly on the blend path:
+//
+//     target(w) = geodesic-lerp( live animated pose,
+//                                captured pre-reset pose,  w )
+//
+// recomputed EVERY FRAME against the live animation. This is the
+// load-bearing design decision, learned the hard way: the first
+// implementation measured the pose delta ONCE (right after the
+// reset) and then composed that frozen offset onto the animation
+// while it kept swinging. Adding a stale ~90-degree offset to a fast
+// moving pose lands on orientations that belong to NEITHER endpoint
+// — the "blend looks completely random" report (2026-07-22 17:38).
+// With the lerp target recomputed per frame, the visible pose is
+// always BETWEEN the old on-screen pose (w=1) and the current
+// animation frame (w=0): it starts exactly where the screen was and
+// converges onto the moving swing — a real visual lerp into the
+// next bash. The whole upper body moves rigidly (no wrist stretch —
+// the seam is the spine junction, off-screen in first person), and
+// the solve collapses to the identity exactly at w=0. Correct
+// regardless of the inertia pivot setting, of inertia being enabled
+// at all, and of FPInertia_Node sitting anywhere above or below —
+// the chain from our bone down to the hand is composed live.
+//
+// This also masks the trigger frame itself: the skeleton shows the
+// fast-forwarded weapon-DRAW pose there (the InitializeToBaseState
+// re-draw; ~34 units / ~134 deg from the captured pose in testing),
+// and at w~1 the lerp pulls the hand back onto the captured pose,
+// hiding the one-frame draw flash that used to slip through.
+//
+// Flow: 1. CaptureBeforeReset (visible hand pose, FP-root frame —
+// the root is placed from the camera, not animated by the bash, so
+// it is stable across the reset; "visible" includes any residual
+// offset from a still-decaying previous blend, so chained combos
+// hand over without a pop)  2. ArmAfterReset starts the decay clock
+// 3. Apply re-solves the bone local every frame until it expires.
+//
+// All state is main-thread only (poked from Update and from
+// TriggerGunBashAction, which Update calls).
+// ============================================================
+namespace BashBlend
+{
+	// -- capture + active blend --
+	// The captured pose stays live for the whole blend: Apply re-derives
+	// the (capture minus current-animation) delta fresh each frame and
+	// weights it, so there is no frozen offset anywhere. The per-frame
+	// rotation delta is taken as AXIS-ANGLE and the angle scaled by w —
+	// the exact geodesic (shortest-arc) between the two orientations.
+	static bool          s_captureValid = false;  // s_capPos/s_capRot hold a usable pose
+	static RE::NiPoint3  s_capPos{};              // hand position, FP-root frame (before reset)
+	static RE::NiMatrix3 s_capRot;                // hand orientation, FP-root frame (before reset)
+	static float         s_timer    = 0.0f;       // counts down from s_duration
+	static float         s_duration = 0.0f;
+
+	// -- dedicated inserted bone (above the spine anchor) --
+	static constexpr const char* kBashBoneName = "FPBashBlendNode";
+	// Anchor candidates, tried in order. Must carry both arms and the
+	// weapon (whole-viewmodel rigid move, GunMover-style) but NOT the
+	// Camera bone — moving that would rotate the player's view.
+	static constexpr const char* kAnchorNames[] = {
+		"Spine2", "Spine1b", "Chest", "Spine1", nullptr
+	};
+	static RE::NiNode* s_bone      = nullptr;     // cached; revalidated by name each use
+	static bool        s_boneDirty = false;       // bone local holds a non-identity offset
+
+	// 3x3 helpers — this vendored CommonLibF4's NiMatrix3 has no operators.
+	static RE::NiMatrix3 Mul(const RE::NiMatrix3& a, const RE::NiMatrix3& b)
+	{
+		RE::NiMatrix3 r;
+		for (int i = 0; i < 3; ++i)
+			for (int j = 0; j < 3; ++j)
+				r.entry[i].pt[j] =
+					a.entry[i].pt[0] * b.entry[0].pt[j] +
+					a.entry[i].pt[1] * b.entry[1].pt[j] +
+					a.entry[i].pt[2] * b.entry[2].pt[j];
+		return r;
+	}
+
+	static RE::NiMatrix3 Transpose(const RE::NiMatrix3& a)
+	{
+		RE::NiMatrix3 r;
+		for (int i = 0; i < 3; ++i)
+			for (int j = 0; j < 3; ++j)
+				r.entry[i].pt[j] = a.entry[j].pt[i];
+		return r;
+	}
+
+	static RE::NiPoint3 MulP(const RE::NiMatrix3& m, const RE::NiPoint3& p)
+	{
+		return {
+			m.entry[0].pt[0] * p.x + m.entry[0].pt[1] * p.y + m.entry[0].pt[2] * p.z,
+			m.entry[1].pt[0] * p.x + m.entry[1].pt[1] * p.y + m.entry[1].pt[2] * p.z,
+			m.entry[2].pt[0] * p.x + m.entry[2].pt[1] * p.y + m.entry[2].pt[2] * p.z
+		};
+	}
+
+	// Rodrigues' rotation formula: matrix for a rotation of a_angle
+	// radians about the unit axis a_axis. R = I + sin(t)K + (1-cos(t))K^2.
+	static RE::NiMatrix3 FromAxisAngle(const RE::NiPoint3& a_axis, float a_angle)
+	{
+		const float s = std::sin(a_angle);
+		const float c = std::cos(a_angle);
+		const float t = 1.0f - c;
+		const float x = a_axis.x, y = a_axis.y, z = a_axis.z;
+
+		RE::NiMatrix3 r;
+		r.entry[0].pt[0] = t * x * x + c;
+		r.entry[0].pt[1] = t * x * y - s * z;
+		r.entry[0].pt[2] = t * x * z + s * y;
+		r.entry[1].pt[0] = t * x * y + s * z;
+		r.entry[1].pt[1] = t * y * y + c;
+		r.entry[1].pt[2] = t * y * z - s * x;
+		r.entry[2].pt[0] = t * x * z - s * y;
+		r.entry[2].pt[1] = t * y * z + s * x;
+		r.entry[2].pt[2] = t * z * z + c;
+		return r;
+	}
+
+	static RE::NiAVObject* FindHand(RE::NiAVObject* a_fpRoot)
+	{
+		static const RE::BSFixedString kHand{ "RArm_Hand" };
+		return a_fpRoot ? a_fpRoot->GetObjectByName(kHand) : nullptr;
+	}
+
+	// Compose the local transforms from (exclusive) a_top down to
+	// (inclusive) a_node: the pose of a_node in a_top's frame. Returns
+	// false when a_top is not an ancestor of a_node.
+	static bool ComposeChain(RE::NiAVObject* a_node, RE::NiAVObject* a_top,
+		RE::NiMatrix3& a_outRot, RE::NiPoint3& a_outPos)
+	{
+		RE::NiMatrix3 rot;
+		rot.MakeIdentity();
+		RE::NiPoint3 pos{ 0.0f, 0.0f, 0.0f };
+
+		auto* node = a_node;
+		while (node && node != a_top) {
+			// prepend node->local:  chain = local ∘ chain
+			pos = {
+				node->local.translate.x + (node->local.rotate.entry[0].pt[0] * pos.x + node->local.rotate.entry[0].pt[1] * pos.y + node->local.rotate.entry[0].pt[2] * pos.z),
+				node->local.translate.y + (node->local.rotate.entry[1].pt[0] * pos.x + node->local.rotate.entry[1].pt[1] * pos.y + node->local.rotate.entry[1].pt[2] * pos.z),
+				node->local.translate.z + (node->local.rotate.entry[2].pt[0] * pos.x + node->local.rotate.entry[2].pt[1] * pos.y + node->local.rotate.entry[2].pt[2] * pos.z)
+			};
+			rot = Mul(node->local.rotate, rot);
+			node = node->parent;
+		}
+		if (node != a_top) return false;
+
+		a_outRot = rot;
+		a_outPos = pos;
+		return true;
+	}
+
+	// VISIBLE hand pose (everything applied, including our own bone) in
+	// the FP root's frame. Used for the "before" capture so the blend
+	// starts from exactly what is on screen — even when a previous
+	// combo's blend is still mid-decay. Returns false when the FP rig
+	// isn't available (3rd person, power armor rig without RArm_Hand,
+	// mid cell transition) or the values are non-finite.
+	static bool ReadHandPoseInRootFrame(RE::PlayerCharacter* a_player,
+		RE::NiPoint3& a_outPos, RE::NiMatrix3& a_outRot)
+	{
+		auto* fpRoot = a_player ? a_player->Get3D(true) : nullptr;
+		auto* hand = FindHand(fpRoot);
+		if (!hand) return false;
+
+		const RE::NiMatrix3 rootRotT = Transpose(fpRoot->world.rotate);
+		const RE::NiPoint3 rel{
+			hand->world.translate.x - fpRoot->world.translate.x,
+			hand->world.translate.y - fpRoot->world.translate.y,
+			hand->world.translate.z - fpRoot->world.translate.z
+		};
+		a_outPos = MulP(rootRotT, rel);
+		a_outRot = Mul(rootRotT, hand->world.rotate);
+
+		return std::isfinite(a_outPos.x) && std::isfinite(a_outPos.y) && std::isfinite(a_outPos.z);
+	}
+
+	// Abort the blend entirely (bad capture, unloading rig, cell move).
+	static void CancelBlend()
+	{
+		s_captureValid = false;
+		s_timer        = 0.0f;
+		s_duration     = 0.0f;
+	}
+
+	// Step 1 — TriggerGunBashAction, right before the graph interrupt.
+	// Records the VISIBLE pose (including a still-decaying previous
+	// blend's offset) so the new blend starts from exactly what is on
+	// screen.
+	static void CaptureBeforeReset(RE::PlayerCharacter* a_player)
+	{
+		s_captureValid = ReadHandPoseInRootFrame(a_player, s_capPos, s_capRot);
+	}
+
+	// Step 2 — TriggerGunBashAction, after the reset ran and the
+	// follow-up bash was requested: start the blend immediately. No
+	// delta is measured here — Apply re-derives it fresh every frame
+	// against the live animation (see the namespace comment for why a
+	// frozen one-shot delta produced garbage poses).
+	static void ArmAfterReset(float a_blendTime)
+	{
+		if (!s_captureValid) return;
+		s_duration = std::max(a_blendTime, 0.01f);
+		s_timer    = s_duration;
+		logger::info("[GunBash] Blend started — {:.2f}s", s_duration);
+	}
+
+	// Kept for the trigger fallback path: a synthetic tap that failed
+	// means no follow-up bash is coming, so nothing needs masking.
+	static void CancelPending() { CancelBlend(); }
+
+	// Per-frame decay clock (runs from the bash block, before Apply).
+	static void Tick(float a_delta)
+	{
+		if (s_timer > 0.0f) {
+			s_timer -= a_delta;
+			if (s_timer <= 0.0f) {
+				s_timer = 0.0f;
+				s_captureValid = false;  // capture consumed
+			}
+		}
+	}
+
+	static void ResetState()
+	{
+		CancelPending();
+		s_timer    = 0.0f;
+		s_duration = 0.0f;
+		// The cached bone may belong to an unloading skeleton; drop the
+		// pointer (Apply revalidates by name) and let s_boneDirty make
+		// the next Apply restore the identity if the rig survives.
+		s_bone = nullptr;
+	}
+
+	// Find the spine anchor: the highest candidate that is an ancestor
+	// of the hand (so the rigid correction carries the whole arm rig).
+	static RE::NiNode* FindAnchor(RE::NiAVObject* a_fpRoot, RE::NiAVObject* a_hand)
+	{
+		for (int i = 0; kAnchorNames[i]; ++i) {
+			if (auto* cand = a_fpRoot->GetObjectByName(kAnchorNames[i])) {
+				if (auto* candNode = cand->IsNode()) {
+					if (candNode->GetObjectByName(a_hand->name))
+						return candNode;
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	// Get (or crash-safe insert) the blend bone above the spine anchor.
+	// Same insertion pattern as GetOrInsertInertiaBone: pre-detach the
+	// child via the NiPointer overload so AttachChild reuses the freed
+	// slot without growing the parent's child array.
+	static RE::NiNode* EnsureBone(RE::NiAVObject* a_fpRoot, RE::NiAVObject* a_hand)
+	{
+		static const RE::BSFixedString kName{ kBashBoneName };
+
+		// Cached pointer still wired into this skeleton?
+		if (s_bone) {
+			if (a_fpRoot->GetObjectByName(kName) == s_bone && s_bone->GetObjectByName(a_hand->name))
+				return s_bone;
+			s_bone = nullptr;
+		}
+
+		// A node by our name already exists (e.g. re-entry after Reset
+		// dropped the cache): adopt it when the hand hangs under it.
+		if (auto* existing = a_fpRoot->GetObjectByName(kName)) {
+			if (auto* existingNode = existing->IsNode()) {
+				if (existingNode->GetObjectByName(a_hand->name)) {
+					s_bone = existingNode;
+					return s_bone;
+				}
+				// Structure mismatch — detach the orphan and reinsert.
+				if (auto* staleParent = existingNode->parent) {
+					staleParent->DetachChild(existingNode);
+				}
+			}
+		}
+
+		auto* anchor = FindAnchor(a_fpRoot, a_hand);
+		RE::NiNode* parent = anchor ? anchor->parent : nullptr;
+		if (!anchor || !parent) return nullptr;
+
+		auto* inserted = new RE::NiNode(1);
+		if (!inserted) return nullptr;
+		inserted->name = kName;
+		inserted->local.MakeIdentity();
+
+		RE::NiPointer<RE::NiAVObject> anchorRef;
+		parent->DetachChild(anchor, anchorRef);  // detach + keep alive
+		anchor->parent = nullptr;                // prevent double-detach in AttachChild
+
+		parent->AttachChild(inserted, true);     // reuses freed slot
+		inserted->parent = parent;
+		inserted->AttachChild(anchor, true);
+
+		s_bone = inserted;
+		logger::info("[GunBash] Inserted blend bone '{}' above '{}' (parent '{}')",
+			kBashBoneName, anchor->name.c_str(), parent->name.c_str());
+		return s_bone;
+	}
+
+	// Solve and write the blend bone's local transform for this frame.
+	// Runs every frame from Update's tail (after the engine's world
+	// update, alongside the inertia ApplyOffset — the engine consumes
+	// these locals when building the render transforms).
+	//
+	// Let P = the bone's parent world transform, K = the composed
+	// animation-authored chain from the bone down to the hand. The
+	// clean animated hand pose is  H_anim = P ∘ K  (our bone treated as
+	// identity — the compose stops below it). The captured pose is
+	// re-expressed in world via the CURRENT root transform (so it
+	// survives the player turning), the delta  capture ∘ H_animᵀ  is
+	// taken FRESH THIS FRAME, and the target is the geodesic lerp:
+	//     H_tgt.R = R(axis, w·angle) · H_anim.R      (axis, angle from the fresh delta)
+	//     H_tgt.T = H_anim.T + w·(capture.T − H_anim.T)
+	// Then the bone local B satisfying  P ∘ B ∘ K = H_tgt  is
+	//     B.R = P.Rᵀ · H_tgt.R · K.Rᵀ
+	//     B.T = P.Rᵀ · (H_tgt.T − P.T) − B.R·K.T
+	// At w=0 this collapses to the identity exactly; at w=1 the hand
+	// sits exactly on the captured pose, whatever the animation is
+	// doing underneath.
+	static void Apply(RE::PlayerCharacter* a_player)
+	{
+		if (s_timer <= 0.0f || s_duration <= 0.0f || !s_captureValid) {
+			// Blend over — restore the identity once so no stale offset
+			// stays frozen on the hand.
+			if (s_boneDirty && s_bone) {
+				s_bone->local.MakeIdentity();
+				s_boneDirty = false;
+			}
+			return;
+		}
+
+		auto* fpRoot = a_player ? a_player->Get3D(true) : nullptr;
+		auto* hand = FindHand(fpRoot);
+		if (!hand || !hand->parent) return;
+
+		auto* bone = EnsureBone(fpRoot, hand);
+		if (!bone || !bone->parent) return;
+
+		RE::NiMatrix3 chainRot;
+		RE::NiPoint3  chainPos;
+		if (!ComposeChain(hand, bone, chainRot, chainPos)) return;
+
+		auto* p = bone->parent;
+		const RE::NiMatrix3& pRot = p->world.rotate;
+		const RE::NiMatrix3 pRotT = Transpose(pRot);
+
+		// Clean animated hand pose in world.
+		const RE::NiMatrix3 animRot = Mul(pRot, chainRot);
+		const RE::NiPoint3  pk = MulP(pRot, chainPos);
+		const RE::NiPoint3  animPos{
+			p->world.translate.x + pk.x,
+			p->world.translate.y + pk.y,
+			p->world.translate.z + pk.z
+		};
+
+		// Captured pose, FP-root frame -> world (current root transform).
+		const RE::NiMatrix3& rootRot = fpRoot->world.rotate;
+		const RE::NiMatrix3 capRotW = Mul(rootRot, s_capRot);
+		const RE::NiPoint3  capOff = MulP(rootRot, s_capPos);
+		const RE::NiPoint3  capPosW{
+			fpRoot->world.translate.x + capOff.x,
+			fpRoot->world.translate.y + capOff.y,
+			fpRoot->world.translate.z + capOff.z
+		};
+
+		// Fresh delta for THIS frame.
+		const RE::NiPoint3 dP{ capPosW.x - animPos.x, capPosW.y - animPos.y, capPosW.z - animPos.z };
+		const RE::NiMatrix3 dR = Mul(capRotW, Transpose(animRot));
+		const float mag = std::sqrt(dP.x * dP.x + dP.y * dP.y + dP.z * dP.z);
+		const float trace = dR.entry[0].pt[0] + dR.entry[1].pt[1] + dR.entry[2].pt[2];
+		const float cosAng = std::clamp((trace - 1.0f) * 0.5f, -1.0f, 1.0f);
+
+		// Pathological gap (bone re-parented, cell transition mid blend):
+		// dropping the blend beats flinging the viewmodel. A large-but-
+		// real gap (the trigger frame's fast-forwarded draw pose sits
+		// ~34 units / ~134 deg away) stays IN: the lerp path is always
+		// between two genuine poses, so big is fine — only absurd or
+		// axis-degenerate (angle -> 180 deg) gaps bail.
+		if (mag > 60.0f || cosAng < -0.94f) {  // ~160 degrees
+			logger::warn("[GunBash] Blend dropped mid-flight (posDelta={:.1f}, cosAng={:.2f})", mag, cosAng);
+			CancelBlend();
+			if (s_boneDirty) {
+				bone->local.MakeIdentity();
+				s_boneDirty = false;
+			}
+			return;
+		}
+
+		// Quadratic ease-out: full pull toward the captured pose at the
+		// snap, decaying with zero-ish velocity into the live animation.
+		const float t = s_timer / s_duration;
+		const float w = t * t;
+
+		// Axis-angle of the fresh delta (skew-symmetric part of dR:
+		// (R32-R23, R13-R31, R21-R12) = 2*sin(angle)*axis; the 160-degree
+		// bail above keeps sin(angle) well away from zero at large angles).
+		const float angle = std::acos(cosAng);
+		RE::NiPoint3 axis{
+			dR.entry[2].pt[1] - dR.entry[1].pt[2],
+			dR.entry[0].pt[2] - dR.entry[2].pt[0],
+			dR.entry[1].pt[0] - dR.entry[0].pt[1]
+		};
+		const float axisLen = std::sqrt(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
+		RE::NiMatrix3 dRotW;
+		if (axisLen > 1.0e-6f && angle > 1.0e-4f) {
+			axis.x /= axisLen;
+			axis.y /= axisLen;
+			axis.z /= axisLen;
+			dRotW = FromAxisAngle(axis, angle * w);
+		} else {
+			dRotW.MakeIdentity();
+		}
+
+		const RE::NiMatrix3 tgtRot = Mul(dRotW, animRot);
+		const RE::NiPoint3  tgtPos{
+			animPos.x + dP.x * w,
+			animPos.y + dP.y * w,
+			animPos.z + dP.z * w
+		};
+
+		// Solve the bone local.
+		const RE::NiMatrix3 boneRot = Mul(Mul(pRotT, tgtRot), Transpose(chainRot));
+		const RE::NiPoint3 relTgt{
+			tgtPos.x - p->world.translate.x,
+			tgtPos.y - p->world.translate.y,
+			tgtPos.z - p->world.translate.z
+		};
+		const RE::NiPoint3 relLocal = MulP(pRotT, relTgt);
+		const RE::NiPoint3 rk = MulP(boneRot, chainPos);
+		const RE::NiPoint3 boneT{ relLocal.x - rk.x, relLocal.y - rk.y, relLocal.z - rk.z };
+
+		if (!std::isfinite(boneT.x) || !std::isfinite(boneT.y) || !std::isfinite(boneT.z))
+			return;
+
+		bone->local.rotate = boneRot;
+		bone->local.translate = boneT;
+		s_boneDirty = true;
+	}
+}
+
+// Repeatable Gun Bash — fire a follow-up bash while the previous bash's
+// animation is still playing.
+//
+// V1 FINDINGS (2026-07-22 11:14 in-game session): with the previous bash
+// still in flight, RunActionOnActor(kActionMelee) was REFUSED on every
+// single attempt, and the fallback synthetic Melee tap through the real
+// MeleeThrowHandler dispatched fine but produced no bash either — the
+// handler funnels into the same conditioned action, and the action layer
+// will not start a melee attack while the actor still reads as attacking
+// (meleeAttackState was 2 at every HitFrame in the log). Same failure
+// class as kActionFireAuto refusing on an empty magazine: the action's
+// conditions read actor state we consider stale.
+//
+// V2 FINDINGS (2026-07-22 11:59 session): clearing the attack bookkeeping
+// (attackStop event + Havok kIsAttacking/kIAttackState + the
+// meleeAttackState bitfield, all confirmed written: "meleeState 3->0" in
+// every log line) did NOT change the refusal — kActionMelee was still
+// refused on every attempt, and the synthetic tap still produced nothing.
+// Conclusion: the action's conditions read the LIVE behavior graph state
+// (the graph is still inside the bash attack sub-graph), not the actor's
+// bookkeeping fields. No variable write can fix that; the graph itself
+// must leave the attack state before a new melee action can start.
+//
+// V3 (this version): force the graph out first, with the one interrupt
+// PROVEN (across every Fire on Empty stop this week) to kill any
+// in-flight state same-frame: InitializeToBaseState via RunActionOnActor
+// + a big UpdateAnimation step to fast-forward the mandatory re-draw the
+// reset causes. From the resulting clean idle state, kActionMelee is a
+// bog-standard bash request — the same call the engine makes from idle
+// on every vanilla bash.
+//
+// Order of attempts (cheapest first):
+//   1. kActionMelee directly — covers the bash-already-ended chain case
+//      (falling-edge refire) where no interrupt is needed at all.
+//   2. Hard graph interrupt (attackStop + Havok clears +
+//      InitializeToBaseState + fast-forward), then kActionMelee again.
+//   3. Synthetic Melee tap as the last resort.
+// The visual cost of the reset (viewmodel snap) is masked by the new
+// bash animation starting the same frame — same masking that made the
+// FOE hard-stop acceptable for ADS dry-fires.
+static bool TriggerGunBashAction(RE::PlayerCharacter* a_player)
+{
+	if (!a_player || !a_player->currentProcess) return false;
+
+	auto* dom = RE::BGSDefaultObjectManager::GetSingleton();
+	auto* meleeAction = dom ? dom->GetDefaultObject<RE::BGSAction>(RE::DEFAULT_OBJECT::kActionMelee) : nullptr;
+	if (!meleeAction) {
+		logger::warn("[GunBash] ActionMelee default object missing");
+		return false;
+	}
+
+	const auto meleeStateBefore = static_cast<std::uint32_t>(a_player->meleeAttackState);
+
+	// -- attempt 1: direct request (works when the graph is already idle) --
+	{
+		RE::TESActionData action(RE::ActionInput::ACTIONPRIORITY::kTry, a_player, meleeAction);
+		if (RE::BGSAnimationSystemUtils::RunActionOnActor(a_player, action)) {
+			logger::info("[GunBash] Follow-up bash via kActionMelee, no interrupt needed (meleeState={})",
+				meleeStateBefore);
+			return true;
+		}
+	}
+
+	// -- attempt 2: hard graph interrupt, then re-request --
+	// V2 proved the refusal comes from live graph state, so yank the graph
+	// to its base state (the FOE-proven same-frame interrupt) and retry.
+
+	// The interrupt snaps the viewmodel pose; record the current hand pose
+	// so the decaying blend offset can mask the discontinuity (BashBlend).
+	if (Settings::GetSingleton()->bashComboBlendEnabled) {
+		BashBlend::CaptureBeforeReset(a_player);
+	}
+
+	static const RE::BSFixedString kEvtAttackStop{ "attackStop" };
+	a_player->NotifyAnimationGraphImpl(kEvtAttackStop);
+	HavokVar::SetBool(a_player, HavokVar::kIsAttacking, false);
+	HavokVar::SetInt(a_player, HavokVar::kIAttackState, 0);
+
+	bool resetRan = false;
+	if (auto* resetAction = RE::BGSAnimationSystemUtils::GetDefaultObjectForActionInitializeToBaseState()) {
+		RE::TESActionData reset(RE::ActionInput::ACTIONPRIORITY::kTry, a_player, resetAction);
+		resetRan = RE::BGSAnimationSystemUtils::RunActionOnActor(a_player, reset);
+	}
+
+	// Fast-forward the reset's mandatory re-draw so the follow-up bash can
+	// start immediately (and its equip sounds stay silent) — the exact
+	// mechanism the FOE hard-stop uses.
+	g_suppressEquipSounds.store(true, std::memory_order_relaxed);
+	a_player->UpdateAnimation(1000.0f);
+	g_suppressEquipSounds.store(false, std::memory_order_relaxed);
+
+	{
+		RE::TESActionData action(RE::ActionInput::ACTIONPRIORITY::kTry, a_player, meleeAction);
+		if (RE::BGSAnimationSystemUtils::RunActionOnActor(a_player, action)) {
+			logger::info("[GunBash] Follow-up bash via kActionMelee after graph reset (resetRan={}, meleeState {}->{})",
+				resetRan, meleeStateBefore, static_cast<std::uint32_t>(a_player->meleeAttackState));
+			BashBlend::ArmAfterReset(Settings::GetSingleton()->bashComboBlendTime);
+			return true;
+		}
+	}
+
+	// -- attempt 3: action refused even from base state — input-level tap --
+	const bool tapped = MeleeInput::SimulateTap();
+	logger::info("[GunBash] kActionMelee refused even after graph reset (resetRan={}); synthetic tap -> {} (meleeState {}->{})",
+		resetRan, tapped, meleeStateBefore, static_cast<std::uint32_t>(a_player->meleeAttackState));
+	if (tapped) {
+		BashBlend::ArmAfterReset(Settings::GetSingleton()->bashComboBlendTime);
+	} else {
+		BashBlend::CancelPending();
+	}
+	return tapped;
+}
 
 // Last-resort unstick: reset the behavior graph to its base state via the
 // InitializeToBaseState action (NAF's proven recovery for a stuck graph).
@@ -1439,6 +2053,14 @@ RE::BSEventNotifyControl Inertia::AnimEventSink::ProcessEvent(
 	}
 	if (a_event.animEvent == "SightedStateExit") {
 		sightedExitThisFrame.store(true, std::memory_order_relaxed);
+	}
+	// Repeatable Gun Bash: HitFrame is the engine's own melee-impact
+	// annotation (a HitFrameHandler functor is registered for this exact
+	// name engine-side). Consumed by the bash combo block in Update.
+	if (a_event.animEvent == "HitFrame" || a_event.animEvent == "hitFrame") {
+		hitFrameThisFrame.store(true, std::memory_order_relaxed);
+		logger::trace("[AnimEvent] HitFrame (meleeState={})",
+			player ? static_cast<std::uint32_t>(player->meleeAttackState) : 99);
 	}
 	if (a_event.animEvent == "sneakStateEnter" || a_event.animEvent == "sneakStart" ||
 	    a_event.animEvent == "SneakStart" || a_event.animEvent == "tagSneakStart" ||
@@ -2302,36 +2924,37 @@ namespace AttackInput
 	// of the handler; if ADS entry ever session-wedges again, this
 	// theory is wrong (the SecondaryAttack edge trace in the hook
 	// above will show real presses arriving while gunState stays 0).
-	static bool SimulateTap(const char* a_userEvent)
+	// Dispatch ONE synthetic ButtonEvent straight to the engine's real
+	// AttackBlockHandler::HandleEvent. value 1 + heldSecs 0 = a fresh
+	// press (JustPressed() == true); value 0 + heldSecs > 0 = a release.
+	static bool DispatchButton(const char* a_userEvent, float a_value, float a_heldSecs)
 	{
 		auto* pc = RE::PlayerControls::GetSingleton();
 		if (!s_originalHandleButton || !pc || !pc->attackHandler) return false;
 
-		auto makeEvent = [&](RE::ButtonEvent& a_evt, float a_value, float a_heldSecs) {
-			RE::stl::emplace_vtable(&a_evt);
-			a_evt.device       = RE::INPUT_DEVICE::kKeyboard;
-			a_evt.deviceID     = 0;
-			a_evt.eventType    = RE::INPUT_EVENT_TYPE::kButton;
-			a_evt.next         = nullptr;
-			a_evt.timeCode     = 0;
-			a_evt.handled      = RE::InputEvent::HANDLED_RESULT::kUnhandled;
-			a_evt.strUserEvent = RE::BSFixedString(a_userEvent);
-			a_evt.idCode       = -1;
-			a_evt.disabled     = false;
-			a_evt.value        = a_value;
-			a_evt.heldDownSecs = a_heldSecs;
-		};
-
-		// Release first (value 0, heldDownSecs > 0), then a fresh press
-		// (value 1, heldDownSecs 0 → JustPressed() == true).
-		RE::ButtonEvent release{};
-		makeEvent(release, 0.0f, 0.5f);
-		s_originalHandleButton(pc->attackHandler, &release);
-
-		RE::ButtonEvent press{};
-		makeEvent(press, 1.0f, 0.0f);
-		s_originalHandleButton(pc->attackHandler, &press);
+		RE::ButtonEvent evt{};
+		RE::stl::emplace_vtable(&evt);
+		evt.device       = RE::INPUT_DEVICE::kKeyboard;
+		evt.deviceID     = 0;
+		evt.eventType    = RE::INPUT_EVENT_TYPE::kButton;
+		evt.next         = nullptr;
+		evt.timeCode     = 0;
+		evt.handled      = RE::InputEvent::HANDLED_RESULT::kUnhandled;
+		evt.strUserEvent = RE::BSFixedString(a_userEvent);
+		evt.idCode       = -1;
+		evt.disabled     = false;
+		evt.value        = a_value;
+		evt.heldDownSecs = a_heldSecs;
+		s_originalHandleButton(pc->attackHandler, &evt);
 		return true;
+	}
+
+	static bool SimulateTap(const char* a_userEvent)
+	{
+		// Release first (returns the handler to a consistent released
+		// state — see the wedge post-mortem above), then a fresh press.
+		if (!DispatchButton(a_userEvent, 0.0f, 0.5f)) return false;
+		return DispatchButton(a_userEvent, 1.0f, 0.0f);
 	}
 
 	// Patch AttackBlockHandler's vtable entry for HandleEvent(ButtonEvent*).
@@ -2363,6 +2986,123 @@ namespace AttackInput
 
 		s_installed = true;
 		logger::info("[AttackInput] Hooked AttackBlockHandler::HandleEvent(ButtonEvent*) — "
+			"vtable=0x{:X}, slot=8, original=0x{:X}",
+			vtable, reinterpret_cast<uintptr_t>(s_originalHandleButton));
+		return true;
+	}
+}
+
+// ============================================================
+// Melee input hook — ground-truth gun-bash button presses.
+// ------------------------------------------------------------
+// Same BSInputEventUser slot-8 vtable patch as SuperSprintInput /
+// AttackInput, applied to MeleeThrowHandler (PlayerControls +0x240).
+// The FO4 user event for gun bash is "Melee" (confirmed in F4SE's
+// CustomControlMap.txt). The handler also drives grenade throws on
+// long-hold of the same key; we only observe events and always pass
+// them through, so throw behavior is untouched.
+//
+// Used by Repeatable Gun Bash: presses that land while a bash is
+// already playing are queued (the engine ignores them natively), and
+// the combo block in Update fires the follow-up bash once the
+// HitFrame + delay window opens.
+// ============================================================
+namespace MeleeInput
+{
+	using FnHandleButton = void(*)(void*, const RE::ButtonEvent*);
+
+	// Original (unhooked) MeleeThrowHandler::HandleEvent(ButtonEvent*)
+	static FnHandleButton s_originalHandleButton = nullptr;
+
+	// Whether the hook is installed (prevents double-install)
+	static bool s_installed = false;
+
+	// Rising-edge press flag, set by the hook, consumed (cleared) by the
+	// bash combo block in Update. Input dispatch and Update both run on
+	// the main thread (same reasoning as AttackInput's plain bools).
+	static bool s_meleePressedEdge = false;
+
+	static void HookedMeleeHandleButton(void* self, const RE::ButtonEvent* event)
+	{
+		if (event && event->QUserEvent() == "Melee"sv && event->JustPressed()) {
+			s_meleePressedEdge = true;
+			logger::trace("[MeleeInput] Melee pressed");
+		}
+		// Always pass through to the engine's handler unchanged.
+		if (s_originalHandleButton) {
+			s_originalHandleButton(self, event);
+		}
+	}
+
+	// Synthesize a release+press tap on the Melee user event, dispatched
+	// straight to the engine's real MeleeThrowHandler::HandleEvent.
+	// Fallback bash trigger for when RunActionOnActor(kActionMelee)
+	// refuses mid-bash (conditioned actions can read the in-flight
+	// attack state and bail — the same failure class as kActionFireAuto
+	// on an empty magazine). Release-first for the same input-layer
+	// bookkeeping reason as AttackInput::SimulateTap.
+	static bool SimulateTap()
+	{
+		auto* pc = RE::PlayerControls::GetSingleton();
+		if (!s_originalHandleButton || !pc || !pc->meleeThrowHandler) return false;
+
+		auto makeEvent = [&](RE::ButtonEvent& a_evt, float a_value, float a_heldSecs) {
+			RE::stl::emplace_vtable(&a_evt);
+			a_evt.device       = RE::INPUT_DEVICE::kKeyboard;
+			a_evt.deviceID     = 0;
+			a_evt.eventType    = RE::INPUT_EVENT_TYPE::kButton;
+			a_evt.next         = nullptr;
+			a_evt.timeCode     = 0;
+			a_evt.handled      = RE::InputEvent::HANDLED_RESULT::kUnhandled;
+			a_evt.strUserEvent = RE::BSFixedString("Melee");
+			a_evt.idCode       = -1;
+			a_evt.disabled     = false;
+			a_evt.value        = a_value;
+			a_evt.heldDownSecs = a_heldSecs;
+		};
+
+		RE::ButtonEvent release{};
+		makeEvent(release, 0.0f, 0.1f);
+		s_originalHandleButton(pc->meleeThrowHandler, &release);
+
+		RE::ButtonEvent press{};
+		makeEvent(press, 1.0f, 0.0f);
+		s_originalHandleButton(pc->meleeThrowHandler, &press);
+
+		// The synthetic press must not read back as a queue request.
+		s_meleePressedEdge = false;
+		return true;
+	}
+
+	// Patch MeleeThrowHandler's vtable entry for HandleEvent(ButtonEvent*).
+	static bool Install()
+	{
+		auto* pc = RE::PlayerControls::GetSingleton();
+		if (!pc || !pc->meleeThrowHandler) {
+			logger::error("[MeleeInput] PlayerControls or MeleeThrowHandler is null");
+			return false;
+		}
+
+		uintptr_t vtable = *reinterpret_cast<uintptr_t*>(pc->meleeThrowHandler);
+
+		// HandleEvent(ButtonEvent*) is vtable slot 8 → byte offset 0x40
+		constexpr uintptr_t kSlotOffset = 8 * sizeof(void*);
+		uintptr_t addr = vtable + kSlotOffset;
+
+		memcpy(&s_originalHandleButton, reinterpret_cast<void*>(addr), sizeof(void*));
+
+		uintptr_t hookAddr = reinterpret_cast<uintptr_t>(&HookedMeleeHandleButton);
+		DWORD oldProtect = 0;
+		if (!VirtualProtect(reinterpret_cast<void*>(addr), sizeof(void*),
+				PAGE_EXECUTE_READWRITE, &oldProtect)) {
+			logger::error("[MeleeInput] VirtualProtect failed");
+			return false;
+		}
+		memcpy(reinterpret_cast<void*>(addr), &hookAddr, sizeof(void*));
+		VirtualProtect(reinterpret_cast<void*>(addr), sizeof(void*), oldProtect, &oldProtect);
+
+		s_installed = true;
+		logger::info("[MeleeInput] Hooked MeleeThrowHandler::HandleEvent(ButtonEvent*) — "
 			"vtable=0x{:X}, slot=8, original=0x{:X}",
 			vtable, reinterpret_cast<uintptr_t>(s_originalHandleButton));
 		return true;
@@ -2923,10 +3663,20 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 
 			const bool adsReleasedMidFlight =
 				fireOnEmptyWasADS && AttackInput::s_installed && !AttackInput::s_adsHeld;
+			// Mirror case: PRESSING ADS during a hip-fire dry-fire. The
+			// special idle owns the graph, so the engine eats the sighted
+			// transition and then boots the player back to idle when the
+			// idle ends (reported in-game 2026-07-22). Treat it like the
+			// release case: player-initiated state change → interrupt now,
+			// then the tap below re-enters ADS from the clean base state.
+			const bool adsPressedMidFlight =
+				!fireOnEmptyWasADS && !fireOnEmptyAdsHeldAtTrigger &&
+				AttackInput::s_installed && AttackInput::s_adsHeld;
 			const bool reloadInterrupt =
 				animEventSink.reloadStartThisFrame.load(std::memory_order_relaxed);
 			const char* stopReason =
 				adsReleasedMidFlight           ? "ADS released" :
+				adsPressedMidFlight            ? "ADS pressed" :
 				reloadInterrupt                ? "reload started" :
 				(fireOnEmptyStopTimer <= 0.0f) ? "fire cycle complete" :
 				(foeMagAmmo > 0)               ? "ammo returned" :
@@ -2949,13 +3699,47 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 				// tap, not a bare press). Restores the graph to the REAL
 				// sighted state, so locomotion works and the eventual
 				// real button release plays the engine's natural exit.
-				if (fireOnEmptyWasADS && !adsReleasedMidFlight && !reloadInterrupt &&
+				// Covers both directions: an ADS dry-fire ending with ADS
+				// still held, and a hip dry-fire interrupted by an ADS
+				// press (the press the special idle swallowed).
+				if ((fireOnEmptyWasADS || adsPressedMidFlight) &&
+				    !adsReleasedMidFlight && !reloadInterrupt &&
 				    AttackInput::s_installed && AttackInput::s_adsHeld) {
+					if (AttackInput::SimulateTap("SecondaryAttack")) {
+						// Fast-forward only when RE-entering (the player was
+						// already sighted before the dry-fire, so the aim-enter
+						// transition replaying would look like a glitch). On a
+						// fresh hip->ADS press the natural aim-enter blend is
+						// exactly what the player expects — let it play.
+						if (fireOnEmptyWasADS) {
+							g_suppressEquipSounds.store(true, std::memory_order_relaxed);
+							player->UpdateAnimation(1000.0f);
+							g_suppressEquipSounds.store(false, std::memory_order_relaxed);
+						}
+						logger::info("[FireOnEmpty] {} ADS via synthetic tap (gs={})",
+							fireOnEmptyWasADS ? "Re-entered" : "Entered",
+							static_cast<std::uint32_t>(player->gunState));
+					}
+				} else if (adsReleasedMidFlight && AttackInput::s_installed &&
+				           !AttackInput::s_adsHeld && !reloadInterrupt) {
+					// ADS released mid-dry-fire: the hard stop above reset the
+					// graph to the HIP base state and fast-forwarded the
+					// re-draw, so without help the screen snaps from the aimed
+					// dry-fire pose straight to hip idle — the reported "exit
+					// snap" (2026-07-22 18:10). Rebuild the exit the engine
+					// never got to play: synthetically re-enter sighted and
+					// fast-forward the enter blend (invisible — sighted is
+					// what was on screen anyway), then dispatch a synthetic
+					// RELEASE so the engine runs its natural aim-exit blend
+					// from the sighted state. Event pairing stays balanced:
+					// the real release already landed, and this release pairs
+					// with our synthetic press inside the tap.
 					if (AttackInput::SimulateTap("SecondaryAttack")) {
 						g_suppressEquipSounds.store(true, std::memory_order_relaxed);
 						player->UpdateAnimation(1000.0f);
 						g_suppressEquipSounds.store(false, std::memory_order_relaxed);
-						logger::info("[FireOnEmpty] Re-entered ADS via synthetic tap (gs={})",
+						AttackInput::DispatchButton("SecondaryAttack", 0.0f, 0.5f);
+						logger::info("[FireOnEmpty] Reconstructed natural ADS exit (gs={})",
 							static_cast<std::uint32_t>(player->gunState));
 					}
 				}
@@ -3100,6 +3884,153 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		FireAnnotationGuard::s_suppress.store(false, std::memory_order_relaxed);
 
 		prevFireInputHeld = foeFireHeld;
+	}
+
+	// ============================================================
+	// Repeatable Gun Bash (EXTRAS — self-contained like Fire on Empty)
+	// ------------------------------------------------------------
+	// Vanilla ignores Melee presses while a bash animation is playing.
+	// This block makes bashes combo:
+	//   * a Melee press during an active bash is QUEUED (capped),
+	//   * the bash's HitFrame anim event + a configurable delay opens
+	//     the combo window,
+	//   * when the window is open the next queued bash fires through
+	//     the action layer (TriggerGunBashAction), starting the new
+	//     bash before the old animation has fully wound down,
+	//   * anything still queued when the bash ends naturally fires on
+	//     the falling edge instead.
+	// Below the AP ("stamina") threshold the combo is disabled and
+	// presses fall back to vanilla behavior (ignored mid-bash).
+	//
+	// "Bash active" = ActorState::meleeAttackState != 0 (3-bit field,
+	// non-zero during melee/bash per the workspace reference §Melee/
+	// Bash) with a gun equipped — gun-typed weapons only, so melee
+	// weapon swings are not combo-ed by this feature.
+	{
+		auto* rgb = Settings::GetSingleton();
+
+		const bool gunEquipped = weaponDrawn && EquippedWeapon::IsGunEquipped(player);
+		const bool bashActive  = gunEquipped && player->meleeAttackState != 0;
+		const bool hitFrame    = animEventSink.hitFrameThisFrame.exchange(false, std::memory_order_relaxed);
+
+		// Consume the press edge every frame — a stale edge from a menu
+		// or a melee-weapon swing must never count as a queue request.
+		const bool meleePressed = MeleeInput::s_meleePressedEdge;
+		MeleeInput::s_meleePressedEdge = false;
+
+		if (bashRetriggerCooldown > 0.0f) {
+			bashRetriggerCooldown -= delta;
+			if (bashRetriggerCooldown < 0.0f) bashRetriggerCooldown = 0.0f;
+		}
+
+		if (!rgb->bashComboEnabled || !MeleeInput::s_installed || !gunEquipped) {
+			// Feature off / hook missing / no gun: drop all combo state.
+			bashQueuedCount     = 0;
+			bashComboWindowOpen = false;
+			bashComboDelayTimer = 0.0f;
+			wasBashActive       = bashActive;
+		} else {
+			// AP percentage gate ("stamina"). True = combo allowed.
+			auto staminaOk = [&]() {
+				if (!rgb->bashComboStaminaThresholdEnabled || !avifActionPoints) return true;
+				const float cur  = player->GetActorValue(*avifActionPoints);
+				const float base = player->GetBaseActorValue(*avifActionPoints);
+				if (base <= 0.0f) return true;
+				return (cur / base) * 100.0f >= rgb->bashComboStaminaThreshold;
+			};
+
+			if (bashActive && !wasBashActive) {
+				// Fresh bash started (player-initiated or our follow-up):
+				// its own HitFrame must arm the next window.
+				bashComboWindowOpen = false;
+				bashComboDelayTimer = 0.0f;
+			}
+
+			if (bashActive) {
+				// -- queue presses landing during the bash --
+				if (meleePressed) {
+					if (!staminaOk()) {
+						logger::info("[GunBash] Queue blocked — AP below {:.0f}%% threshold",
+							rgb->bashComboStaminaThreshold);
+					} else if (bashQueuedCount < rgb->bashComboMaxQueue) {
+						++bashQueuedCount;
+						logger::info("[GunBash] Queued follow-up bash ({}/{})",
+							bashQueuedCount, rgb->bashComboMaxQueue);
+						PushEvent("Gun bash queued");
+					} else {
+						logger::trace("[GunBash] Queue full ({})", bashQueuedCount);
+					}
+				}
+
+				// -- HitFrame arms the combo delay --
+				if (hitFrame && !bashComboWindowOpen && bashComboDelayTimer <= 0.0f) {
+					bashComboDelayTimer = rgb->bashComboDelay;
+					if (bashComboDelayTimer <= 0.0f) bashComboWindowOpen = true;
+					logger::trace("[GunBash] HitFrame — combo window in {:.2f}s", rgb->bashComboDelay);
+				}
+				if (bashComboDelayTimer > 0.0f) {
+					bashComboDelayTimer -= delta;
+					if (bashComboDelayTimer <= 0.0f) {
+						bashComboDelayTimer = 0.0f;
+						bashComboWindowOpen = true;
+						logger::trace("[GunBash] Combo window open");
+					}
+				}
+
+				// -- consume the queue once the window is open --
+				if (bashComboWindowOpen && bashQueuedCount > 0 && bashRetriggerCooldown <= 0.0f) {
+					if (!staminaOk()) {
+						// AP fell below the threshold mid-combo — drop the queue.
+						logger::info("[GunBash] Combo cancelled — AP below threshold ({} queued dropped)",
+							bashQueuedCount);
+						bashQueuedCount = 0;
+					} else if (TriggerGunBashAction(player)) {
+						--bashQueuedCount;
+						bashComboWindowOpen = false;  // new bash → wait for ITS HitFrame
+						bashComboDelayTimer = 0.0f;
+						bashRetriggerCooldown = 0.15f;
+						PushEvent("Gun bash combo");
+					} else {
+						// Both trigger paths failed — drop the queue rather
+						// than retrying every frame.
+						logger::warn("[GunBash] Follow-up trigger failed — dropping queue ({})",
+							bashQueuedCount);
+						bashQueuedCount = 0;
+					}
+				}
+			} else if (wasBashActive) {
+				// Bash ended (falling edge).
+				if (bashRetriggerCooldown > 0.0f) {
+					// We injected a follow-up moments ago and its
+					// meleeAttackState hasn't registered yet — this edge is
+					// the OLD bash ending, not a combo break. Keep the queue
+					// for the incoming bash.
+				} else if (bashQueuedCount > 0 && staminaOk()) {
+					// Queue leftover (e.g. HitFrame window never opened) —
+					// fire the next bash back-to-back.
+					if (TriggerGunBashAction(player)) {
+						--bashQueuedCount;
+						bashRetriggerCooldown = 0.15f;
+						PushEvent("Gun bash combo (chained)");
+					} else {
+						bashQueuedCount = 0;
+					}
+				} else {
+					bashQueuedCount = 0;
+				}
+				bashComboWindowOpen = false;
+				bashComboDelayTimer = 0.0f;
+			}
+
+			wasBashActive = bashActive;
+		}
+
+		// Visual blend across the follow-up's graph reset (see BashBlend
+		// at the top of the file). Capture and blend start happen inside
+		// TriggerGunBashAction; here we only run the decay clock.
+		// BashBlend::Apply at the end of Update re-derives the pose
+		// delta fresh and writes the blend bone for this frame.
+		BashBlend::Tick(delta);
 	}
 
 	// ============================================================
@@ -4765,6 +5696,13 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	}
 	}  // end if (springsActive) — transition/combine/apply/telemetry
 
+	// Repeatable Gun Bash — solve and write the transition-blend bone
+	// for this frame (see BashBlend at the top of the file). Runs its
+	// own dedicated bone above RArm_Hand, deliberately OUTSIDE the
+	// springsActive gate: masking the follow-up's reset snap should not
+	// require inertia to be enabled.
+	BashBlend::Apply(player);
+
 	// Snapshot magazine ammo count for next-frame comparison.  Read here
 	// (end of Update) so phantom-fire's `ammoDecreased` check at the top
 	// of next Update sees a true frame-to-frame delta — including any
@@ -4898,6 +5836,18 @@ void Inertia::InertiaManager::Reset()
 	fireOnEmptyDurationQueryTimer = 0.0f;
 	fireOnEmptyAnimElapsed = 0.0f;
 	fireOnEmptySuppressGrace = 0.0f;
+
+	// Repeatable Gun Bash — drop the combo queue across camera switches /
+	// game loads (a queued bash firing into a fresh scene would be wrong).
+	wasBashActive        = false;
+	bashQueuedCount      = 0;
+	bashComboDelayTimer  = 0.0f;
+	bashComboWindowOpen  = false;
+	bashRetriggerCooldown = 0.0f;
+	MeleeInput::s_meleePressedEdge = false;
+	// A half-finished pose blend must not carry into a fresh scene.
+	BashBlend::ResetState();
+
 	FireAnnotationGuard::s_suppress.store(false, std::memory_order_relaxed);
 	FireAnnotationGuard::s_suppressWeaponFire.store(false, std::memory_order_relaxed);
 	FireAnnotationGuard::s_suppressAttackState.store(false, std::memory_order_relaxed);
@@ -5011,6 +5961,12 @@ void Inertia::InertiaManager::InitSuperSprint()
 	// button state (used by Fire on Empty and Early Fire Cancel).
 	if (!AttackInput::s_installed) {
 		AttackInput::Install();
+	}
+
+	// Install the MeleeThrowHandler vtable hook for gun-bash presses
+	// (used by Repeatable Gun Bash to queue follow-up bashes).
+	if (!MeleeInput::s_installed) {
+		MeleeInput::Install();
 	}
 
 	// Install the player graph-event hook that lets Fire on Empty swallow

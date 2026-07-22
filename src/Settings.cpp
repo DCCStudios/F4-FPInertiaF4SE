@@ -806,6 +806,19 @@ void Settings::Load()
 	superSprintAnimSpeedMult   = std::clamp(superSprintAnimSpeedMult, 1.0f, 3.0f);
 	superSprintStaminaThreshold = std::clamp(superSprintStaminaThreshold, 0.0f, 100.0f);
 
+	// Repeatable Gun Bash
+	bashComboEnabled = ini.GetBoolValue("Extras", "bBashComboEnabled", true);
+	bashComboDelay   = static_cast<float>(ini.GetDoubleValue("Extras", "fBashComboDelay", 0.2));
+	bashComboMaxQueue = static_cast<int>(ini.GetLongValue("Extras", "iBashComboMaxQueue", 2));
+	bashComboStaminaThresholdEnabled = ini.GetBoolValue("Extras", "bBashComboStaminaThresholdEnabled", true);
+	bashComboStaminaThreshold = static_cast<float>(ini.GetDoubleValue("Extras", "fBashComboStaminaThreshold", 25.0));
+	bashComboBlendEnabled = ini.GetBoolValue("Extras", "bBashComboBlendEnabled", true);
+	bashComboBlendTime = static_cast<float>(ini.GetDoubleValue("Extras", "fBashComboBlendTime", 0.18));
+	bashComboDelay    = std::clamp(bashComboDelay, 0.0f, 1.0f);
+	bashComboMaxQueue = std::clamp(bashComboMaxQueue, 1, 2);
+	bashComboStaminaThreshold = std::clamp(bashComboStaminaThreshold, 0.0f, 100.0f);
+	bashComboBlendTime = std::clamp(bashComboBlendTime, 0.05f, 0.5f);
+
 	// Debug
 	debugLogging       = ini.GetBoolValue("Debug", "bDebugLogging", false);
 	debugOnScreen      = ini.GetBoolValue("Debug", "bDebugOnScreen", false);
@@ -931,6 +944,14 @@ void Settings::Save()
 	ini.SetDoubleValue("Extras", "fSuperSprintAnimSpeedMult", superSprintAnimSpeedMult);
 	setBool("Extras", "bSuperSprintStaminaThresholdEnabled", superSprintStaminaThresholdEnabled);
 	ini.SetDoubleValue("Extras", "fSuperSprintStaminaThreshold", superSprintStaminaThreshold);
+
+	setBool("Extras", "bBashComboEnabled", bashComboEnabled);
+	ini.SetDoubleValue("Extras", "fBashComboDelay", bashComboDelay);
+	ini.SetLongValue("Extras", "iBashComboMaxQueue", bashComboMaxQueue);
+	setBool("Extras", "bBashComboStaminaThresholdEnabled", bashComboStaminaThresholdEnabled);
+	ini.SetDoubleValue("Extras", "fBashComboStaminaThreshold", bashComboStaminaThreshold);
+	setBool("Extras", "bBashComboBlendEnabled", bashComboBlendEnabled);
+	ini.SetDoubleValue("Extras", "fBashComboBlendTime", bashComboBlendTime);
 
 	setBool("Debug", "bDebugLogging", debugLogging);
 	setBool("Debug", "bDebugOnScreen", debugOnScreen);
