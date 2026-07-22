@@ -74,6 +74,7 @@ set(HEADERS
 	src/ChamberExclusion.h
 	src/WeaponFOV.h
 	src/FireOnEmpty.h
+	src/OpenAnimationReplacerAPI-Clips.h
 )
 
 add_library(${PROJECT_NAME} SHARED

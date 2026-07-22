@@ -188,6 +188,12 @@ namespace Inertia
 		std::atomic<bool> sightedExitThisFrame{ false };     // SightedStateExit (tracks ADS exit for early return)
 		std::atomic<bool> sneakStartedThisFrame{ false };    // sneakStateEnter / sneakStart etc.
 		std::atomic<bool> sneakStoppedThisFrame{ false };    // sneakStateExit / sneakStop etc.
+		// Holster / draw window — Fire on Empty must not run over these
+		// clips (same failure mode as mid-equip: sound plays against the
+		// wrong animation). Events from FPWeaponAdjust / in-game log:
+		// weaponSheathe, BeginWeaponSheathe, BeginWeaponDraw.
+		std::atomic<bool> sheatheStartedThisFrame{ false };
+		std::atomic<bool> beginWeaponDrawThisFrame{ false };
 		bool registered{ false };
 	};
 
@@ -384,8 +390,13 @@ namespace Inertia
 
 		// Early ADS return tracking
 		bool isCurrentlyReloading{ false };   // tracked via anim events (reloadStart → reloadEnd)
-		bool isCurrentlyEquipping{ false };   // true from justEquipped until equip finishes or early trigger fires
+		bool isCurrentlyEquipping{ false };   // true from justEquipped / BeginWeaponDraw until equip finishes
 		float equipAnimTimer{ 0.0f };         // safety timeout for equip state (cleared after ~1.5s)
+		// Holster/sheathe window — true from weaponSheathe / BeginWeaponSheathe
+		// until drawn goes false or the safety timer expires. Gates Fire on Empty
+		// the same way isCurrentlyEquipping gates the draw.
+		bool  isCurrentlyHolstering{ false };
+		float holsterAnimTimer{ 0.0f };
 
 		// Early Equip — ADS/fire during equip animations (InitiateStart trigger)
 		bool  earlyEquipAdsArmed{ false };
@@ -485,6 +496,37 @@ namespace Inertia
 		// releases when the trigger is released or ammo returns).
 		bool prevFireInputHeld{ false };
 		bool fireOnEmptyLatched{ false };
+		// ADS preservation across the dry-fire stop. When the dry-fire
+		// starts in iron-sights (gunState 6/8), the stop re-asserts or
+		// releases sighted as needed. All normal stops are soft
+		// (StopCurrentIdle only) — InitializeToBaseState is reserved for
+		// the wedged-graph safety net (hard-stop every tap wedged ADS /
+		// holster so only PlayIdle still worked — verified 2026-07-21).
+		bool fireOnEmptyWasADS{ false };
+		bool fireOnEmptyAdsHeldAtTrigger{ false };
+		// Retired (2026-07-21): a per-frame forced-SightedRelease retry
+		// after ADS soft-stop. Verified never to succeed (every retry
+		// returned false) and unnecessary once the stop always hard-resets
+		// — kept as a dead flag only so old call sites compile unchanged.
+		bool fireOnEmptyGuardAdsRelease{ false };
+		// FOE-only draw/holster lock. Separate from isCurrentlyEquipping so
+		// dry-fire stops never arm Early Equip (which disables the attack
+		// handler). Refreshed on BeginWeaponDraw / sheathe / drawn edges.
+		float fireOnEmptyMotionLock{ 0.0f };
+		// NOTE (2026-07-22): the "ADS soft-stop" (parking the graph in the
+		// special idle while ADS was held) and its rescue watchdog were
+		// removed after three failed in-game rounds — see the soft-stop
+		// post-mortem comment above StopEmptyFireAnimation in Inertia.cpp.
+		// All stops hard-reset; ADS re-entry is a synthetic input tap
+		// (AttackInput::SimulateTap).
+		// Deferred OAR duration query (2026-07-22). The fire clip is only
+		// SOMETIMES visible to OAR's Clips API on the trigger frame
+		// (verified in the 00:39 session log: one same-frame hit, several
+		// misses), so the query retries each frame while this timer runs.
+		// fireOnEmptyAnimElapsed tracks time since the trigger so a late
+		// hit can set the remaining stop time to (duration - elapsed).
+		float fireOnEmptyDurationQueryTimer{ 0.0f };
+		float fireOnEmptyAnimElapsed{ 0.0f };
 
 		// Action blending
 		float actionBlendFactor{ 1.0f };

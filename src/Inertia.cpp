@@ -2,6 +2,7 @@
 #include "ChamberExclusion.h"
 #include "WeaponFOV.h"
 #include "FireOnEmpty.h"
+#include "OpenAnimationReplacerAPI-Clips.h"
 
 // ============================================================
 // Static members
@@ -319,10 +320,104 @@ static bool TriggerEmptyFireAction(RE::PlayerCharacter* a_player, bool a_autoFir
 	return ok;
 }
 
+// ---- OAR Clips API: real fire-idle duration (replaces the tuned floor) ----
+// fireIdle1stP resolves through the graph's idle tree to whichever clip the
+// weapon/behavior actually binds (see TriggerEmptyFireAction comment), so
+// there's no fixed clip we can look up a duration for ahead of time — but
+// once SetupSpecialIdle has activated it, OAR's Clips API can read the real
+// bound hkaAnimation's duration off the live clip generator (verified via
+// OAR's own Conditions.cpp: GetAnimDuration() reads clipGen->GetAnimation()->
+// duration, an offset-checked field — this is the same mechanism, just
+// exposed to us). This also means an OAR-authored dry-fire replacement clip's
+// real (likely shorter, non-looping) duration is picked up automatically,
+// no re-tuning needed on our side.
+//
+// The API has no "get the actor's active special-idle clip" query — only
+// "list every active clip" on the actor's first-person graph, which can
+// include several concurrently-active layers (weapon idle, breathing/idle
+// sway, prop layers, etc).
+//
+// Two prior approaches failed in-game:
+//   1. Handle-diff before/after the trigger (2026-07-22 early): picked
+//      unrelated clips whose generators happened to be recreated the same
+//      frame, and missed reused generators entirely.
+//   2. Same-frame "freshest clip" pick (2026-07-22 later): the fire clip
+//      is only SOMETIMES visible to OAR on the trigger frame — the 00:39
+//      session log shows one trigger where WPNFireSingleSighted appeared
+//      at localTime=0 (picked correctly, 0.767s) and several where the
+//      candidate list contained no fire clip at all yet, so hipfire
+//      grabbed a freshly-restarted 5.8s WPNIdleReady instead.
+//
+// Current approach: the caller RETRIES this query each frame for a short
+// window after the trigger (fireOnEmptyDurationQueryTimer), and we only
+// accept a clip whose name contains "fire" — vanilla weapon fire clips
+// are consistently named this way (wpnfiresingleready, wpnfiresinglesighted,
+// wpnfireauto…; confirmed in the session log) and fire clips don't play
+// outside firing, so a recently-started fire-named clip during a dry-fire
+// window is ours. Ambient false positives (WPNIdleReady etc.) never
+// name-match, so they can no longer be picked at all.
+namespace OARFireIdleQuery
+{
+	static bool NameLooksLikeFire(const OAR::Clips::ClipInfo& a_clip)
+	{
+		auto contains = [](const char* a_hay) {
+			if (!a_hay || !a_hay[0]) return false;
+			std::string lower(a_hay);
+			std::transform(lower.begin(), lower.end(), lower.begin(),
+				[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+			return lower.find("fire") != std::string::npos;
+		};
+		return contains(a_clip.suffix) || contains(a_clip.animationName) || contains(a_clip.resolvedPath);
+	}
+
+	// One retry attempt. a_maxLocalTime bounds how far into playback the
+	// clip may already be (grows with time since trigger, so a clip that
+	// activated a couple frames ago still qualifies). a_logCandidates
+	// dumps the full candidate list — used on the final attempt only, so
+	// a persistent failure is diagnosable without per-frame log spam.
+	// Returns the clip's real duration, or 0.0f if no fire-named,
+	// recently-started first-person clip is visible yet.
+	static float QueryFireClipDuration(float a_maxLocalTime, bool a_logCandidates)
+	{
+		auto* api = OAR::Clips::GetAPI();
+		if (!api) return 0.0f;
+
+		OAR::Clips::ClipInfo clips[32];
+		const std::uint32_t total = api->GetActorClips(0, clips, 32);
+
+		int   bestIdx = -1;
+		float bestLocalTime = 0.0f;
+
+		for (std::uint32_t i = 0; i < total && i < 32; ++i) {
+			const auto& c = clips[i];
+			if (c.perspective != OAR::Clips::kPerspectiveFirstPerson) continue;
+			if (c.duration <= 0.0f) continue;
+			const bool fresh = c.localTime <= a_maxLocalTime;
+			const bool fireName = NameLooksLikeFire(c);
+			if (a_logCandidates) {
+				logger::info("[FireOnEmpty] OAR clip candidate: name='{}' duration={:.3f} "
+					"localTime={:.3f} fresh={} fireName={}",
+					c.animationName, c.duration, c.localTime, fresh, fireName);
+			}
+			if (!fresh || !fireName) continue;
+			if (bestIdx < 0 || c.localTime < bestLocalTime) {
+				bestIdx = static_cast<int>(i);
+				bestLocalTime = c.localTime;
+			}
+		}
+
+		if (bestIdx < 0) return 0.0f;
+		logger::info("[FireOnEmpty] OAR fire clip found: name='{}' duration={:.3f} localTime={:.3f}",
+			clips[bestIdx].animationName, clips[bestIdx].duration, clips[bestIdx].localTime);
+		return clips[bestIdx].duration;
+	}
+}
+
 // Return the graph's attack state to idle after a forced dry-fire, and
 // (if that fails) force-reset the graph. Defined after the HavokVar
 // namespace below — the stop needs to clear behavior variables directly.
-static void StopEmptyFireAnimation(RE::PlayerCharacter* a_player, const char* a_reason);
+// Returns true if the hard-stop (base-state reset) ran.
+static bool StopEmptyFireAnimation(RE::PlayerCharacter* a_player, const char* a_reason);
 static void ForceGraphBaseStateReset(RE::PlayerCharacter* a_player);
 
 // ============================================================
@@ -815,17 +910,76 @@ namespace HavokVar {
 // For a non-looping OAR dry-fire replacement clip the reset lands
 // after the clip already finished, and the fast-forward makes the
 // return to base pose invisible either way.
+//
+// ADS (2026-07-21, two rounds of testing):
+//   Round 1 — hard reset + blind re-assert kActionSighted afterward:
+//     ADS dry-fire played correctly, but releasing ADS afterward no
+//     longer exited — the forced re-assert (bypassing normal input)
+//     left the action layer unable to process the real button-release.
+//   Round 2 — soft-stop only (StopCurrentIdle, no reset), preserving
+//     gunState, with a per-frame TryPlayerAction(kActionSightedRelease)
+//     retry once ADS was released: EVERY retry returned false (dozens
+//     of consecutive attempts in the log), and gunState only recovered
+//     1-3s later on its own — fire-effect anim events kept firing the
+//     whole window, proving the idle was still looping internally.
+//     That multi-second window is what blocked ADS/sprint ("locked").
+//   Conclusion: hard reset is the only reliable stop (confirmed again
+//     across every hipfire cycle this session — zero stuck frames).
+//     Do NOT force any action afterward. If ADS is still held, let the
+//     normal per-frame SecondaryAttack dispatch (AttackInput always
+//     chains to the engine's real handler) re-enter sighted through
+//     the vanilla input path, exactly like hipfire resumes after its
+//     reset. Cost: a brief idle->ADS blend is visible on ADS dry-fire.
+//
+// ADS round 3 (2026-07-22): the synthetic-press re-entry itself became
+//   the prime suspect for a session-long "cannot enter ADS" input wedge
+//   (survived a full weapon re-equip → not graph state; see
+//   StopEmptyFireAnimation's REMOVED note). ADS dry-fires now use
+//   SoftStopEmptyFireADS (no reset, no synthetic input) with a bounded
+//   weaponFire-annotation rescue in Update(); the hard reset here is
+//   for hipfire and reload interrupts only.
 // ============================================================
-static void StopEmptyFireAnimation(RE::PlayerCharacter* a_player, const char* a_reason)
+
+// Set while the hard-stop fast-forwards the post-reset re-draw so
+// FireAnnotationGuard can swallow re-equip SoundPlay annotations
+// without muting the dry-fire clip's own sounds earlier in the idle.
+static std::atomic<bool> g_suppressEquipSounds{ false };
+
+// HARD stop: full base-state reset. Used for hipfire dry-fires and any
+// reload-driven interrupt. Soft-stop (StopCurrentIdle alone) was verified
+// in-game (2026-07-21, gs=6 trace) to NOT reliably kill the special
+// idle: fire-effect anim events (jiggleAfterFireEffectSingleSighted)
+// kept firing for 1-3 more seconds after the "stop", and every single
+// TryPlayerAction(kActionSightedRelease) attempt during that window
+// returned false — the eventual recovery came from the idle's own
+// internal timing, not from us. That multi-second window is what
+// blocked ADS / sprint ("locked weapon state"). InitializeToBaseState
+// is the only stop that has ever reliably killed the idle same-frame
+// (2026-07-16/17 findings) — verified again across every hipfire
+// cycle in-session, zero stuck frames.
+//
+// REMOVED (2026-07-22): the post-reset synthetic SecondaryAttack press
+// (SimulateFreshPress) that re-entered ADS after an ADS dry-fire's hard
+// stop. Prime suspect for the "cannot enter ADS at all anymore" wedge in
+// the 00:39 session: after three resimulated presses ADS entry stopped
+// working for the rest of the session, and a FULL weapon re-equip did
+// not fix it — a graph-level wedge cannot survive a re-equip, so the
+// stuck state must live in the input/controls layer, which is exactly
+// the layer the synthetic ButtonEvent injected into (an extra "just
+// pressed" edge per stop with no matching release). Inferred, not
+// proven — but ADS dry-fires no longer hard-stop at all (see the soft
+// stop below), so nothing needs the resimulation anymore either way.
+static bool StopEmptyFireAnimation(RE::PlayerCharacter* a_player, const char* a_reason)
 {
-	if (!a_player || !a_player->currentProcess) return;
+	if (!a_player || !a_player->currentProcess) return false;
 
-	// 1) Clear the special-idle slot so the idle system doesn't hold a
-	// reference to the fire idle across the reset.
 	RE::AIProcess_StopCurrentIdle(a_player->currentProcess, a_player, true, false);
+	HavokVar::SetBool(a_player, HavokVar::kIsFiring, false);
+	HavokVar::SetBool(a_player, HavokVar::kIsAttacking, false);
+	HavokVar::SetInt(a_player, HavokVar::kIAttackState, 0);
+	static const RE::BSFixedString kEvtAttackStop{ "attackStop" };
+	a_player->NotifyAnimationGraphImpl(kEvtAttackStop);
 
-	// 2) Reset the behavior graph to its base state — the only exit
-	// stimulus the blind-engine regime doesn't condition-gate away.
 	bool resetRan = false;
 	if (auto* resetAction = RE::BGSAnimationSystemUtils::GetDefaultObjectForActionInitializeToBaseState()) {
 		RE::TESActionData action(RE::ActionInput::ACTIONPRIORITY::kTry, a_player, resetAction);
@@ -834,14 +988,39 @@ static void StopEmptyFireAnimation(RE::PlayerCharacter* a_player, const char* a_
 		logger::warn("[FireOnEmpty] InitializeToBaseState default object missing");
 	}
 
-	// 3) Fast-forward the post-reset re-draw so it never renders
-	// (idlestopfix's mechanism). Runs inside the suppression window, so
-	// any annotations the fast-forwarded frames emit are swallowed.
+	g_suppressEquipSounds.store(true, std::memory_order_relaxed);
 	a_player->UpdateAnimation(1000.0f);
+	g_suppressEquipSounds.store(false, std::memory_order_relaxed);
 
-	logger::info("[FireOnEmpty] Stopped dry-fire ({}) baseStateReset={} + fast-forward",
-		a_reason, resetRan);
+	const auto gsAfter = static_cast<std::uint32_t>(a_player->gunState);
+	logger::info("[FireOnEmpty] Stopped dry-fire ({}) hard-stop baseStateReset={} + fast-forward (gs={})",
+		a_reason, resetRan, gsAfter);
+	return resetRan;
 }
+
+// SOFT stop: used for ALL ADS dry-fire stops (2026-07-22) — both the
+// natural end of the fire cycle with ADS still held, and the ADS-released
+// interrupt. Same cleanup as the top of StopEmptyFireAnimation
+// (StopCurrentIdle + attack-state variable/event reset) but deliberately
+// WITHOUT InitializeToBaseState or the fast-forward:
+//   * ADS still held  -> the sighted state simply persists; no exit, no
+//     re-enter, no synthetic input needed at all.
+//   * ADS released    -> the engine's own ADS-exit blend plays in real
+//     time off the real button release, instead of snapping to idle.
+//
+// SOFT-STOP POST-MORTEM (2026-07-22, three in-game rounds — do not retry):
+// "park the graph in the special idle while ADS is held" failed on every
+// axis. (1) 01:02 session: after every soft stop the engine never
+// processed the ADS release — gunState stayed 6 indefinitely. (2) 01:14
+// session: ActionIdleStop (the engine's own idle interrupt, the last
+// untried exit stimulus after StopCurrentIdle / attackStop /
+// ActionRightRelease / direct variable writes) returned false from
+// RunActionOnActor on EVERY attempt — the annotation guard keeps the
+// engine blind to the attack by design, and every conditioned action
+// reads that blind state. (3) 01:28 report: the parked idle owns the
+// whole first-person graph, so locomotion and sway froze until release.
+// Conclusion: the graph must ALWAYS be hard-reset out of the idle, and
+// ADS is re-entered through the input layer (AttackInput::SimulateTap).
 
 // Last-resort unstick: reset the behavior graph to its base state via the
 // InitializeToBaseState action (NAF's proven recovery for a stuck graph).
@@ -1249,6 +1428,14 @@ RE::BSEventNotifyControl Inertia::AnimEventSink::ProcessEvent(
 	if (a_event.animEvent == "InitiateStart" || a_event.animEvent == "initiateStart") {
 		initiateStartThisFrame.store(true, std::memory_order_relaxed);
 		logger::trace("[AnimEvent] InitiateStart");
+	}
+	if (a_event.animEvent == "weaponSheathe" || a_event.animEvent == "BeginWeaponSheathe") {
+		sheatheStartedThisFrame.store(true, std::memory_order_relaxed);
+		logger::trace("[AnimEvent] weaponSheathe (event={})", a_event.animEvent.c_str());
+	}
+	if (a_event.animEvent == "BeginWeaponDraw") {
+		beginWeaponDrawThisFrame.store(true, std::memory_order_relaxed);
+		logger::trace("[AnimEvent] BeginWeaponDraw");
 	}
 	if (a_event.animEvent == "SightedStateExit") {
 		sightedExitThisFrame.store(true, std::memory_order_relaxed);
@@ -2076,13 +2263,75 @@ namespace AttackInput
 					logger::trace("[AttackInput] PrimaryAttack pressed");
 				}
 			} else if (userEvent == "SecondaryAttack"sv) {
-				s_adsHeld = (event->value != 0.0f);
+				const bool nowHeld = (event->value != 0.0f);
+				if (nowHeld != s_adsHeld) {
+					// Edge trace: if ADS entry ever wedges engine-side
+					// again, these lines show real presses arriving while
+					// gunState never leaves 0 — pinpointing the ignore.
+					logger::trace("[AttackInput] SecondaryAttack {}", nowHeld ? "pressed" : "released");
+				}
+				s_adsHeld = nowHeld;
 			}
 		}
 		// Always pass through to the engine's handler unchanged.
 		if (s_originalHandleButton) {
 			s_originalHandleButton(self, event);
 		}
+	}
+
+	// Synthesize a full release+press TAP and dispatch both events
+	// straight to the engine's real AttackBlockHandler::HandleEvent.
+	// Purpose: re-enter ADS after a dry-fire hard stop while the player
+	// is still physically holding the ADS button — the engine's aim-
+	// enter logic is edge-triggered off this input path (verified
+	// 2026-07-21: a continuously-held button never re-enters on its
+	// own, action-layer requests all return false, but a synthetic
+	// press reliably re-entered sighted every cycle).
+	//
+	// Why a TAP and not a bare press: the first synthetic-press build
+	// (00:39 session) wedged ADS entry for the rest of the session
+	// after a few cycles, and the wedge survived a weapon re-equip —
+	// so it lived in this input layer's bookkeeping, not the graph.
+	// A bare press injects a second "pressed" edge while the handler
+	// already holds a pressed state from the REAL button, leaving its
+	// press/release pairing unbalanced when the single real release
+	// arrives. Dispatching a release FIRST returns the handler to a
+	// consistent released state, and the following press re-arms it —
+	// after which the real release pairs with our synthetic press.
+	// INFERRED from the wedge's survival pattern, not from disassembly
+	// of the handler; if ADS entry ever session-wedges again, this
+	// theory is wrong (the SecondaryAttack edge trace in the hook
+	// above will show real presses arriving while gunState stays 0).
+	static bool SimulateTap(const char* a_userEvent)
+	{
+		auto* pc = RE::PlayerControls::GetSingleton();
+		if (!s_originalHandleButton || !pc || !pc->attackHandler) return false;
+
+		auto makeEvent = [&](RE::ButtonEvent& a_evt, float a_value, float a_heldSecs) {
+			RE::stl::emplace_vtable(&a_evt);
+			a_evt.device       = RE::INPUT_DEVICE::kKeyboard;
+			a_evt.deviceID     = 0;
+			a_evt.eventType    = RE::INPUT_EVENT_TYPE::kButton;
+			a_evt.next         = nullptr;
+			a_evt.timeCode     = 0;
+			a_evt.handled      = RE::InputEvent::HANDLED_RESULT::kUnhandled;
+			a_evt.strUserEvent = RE::BSFixedString(a_userEvent);
+			a_evt.idCode       = -1;
+			a_evt.disabled     = false;
+			a_evt.value        = a_value;
+			a_evt.heldDownSecs = a_heldSecs;
+		};
+
+		// Release first (value 0, heldDownSecs > 0), then a fresh press
+		// (value 1, heldDownSecs 0 → JustPressed() == true).
+		RE::ButtonEvent release{};
+		makeEvent(release, 0.0f, 0.5f);
+		s_originalHandleButton(pc->attackHandler, &release);
+
+		RE::ButtonEvent press{};
+		makeEvent(press, 1.0f, 0.0f);
+		s_originalHandleButton(pc->attackHandler, &press);
+		return true;
 	}
 
 	// Patch AttackBlockHandler's vtable entry for HandleEvent(ButtonEvent*).
@@ -2162,61 +2411,61 @@ namespace FireAnnotationGuard
 	// Whether the hook is installed (prevents double-install)
 	static bool s_installed = false;
 
-	// Suppression window. Written by InertiaManager::Update (main
-	// thread); graph events for the player also dispatch on the main
-	// thread, but atomic keeps this safe if the engine ever notifies
-	// from the havok worker.
+	// Suppression windows. Written by InertiaManager::Update (main
+	// thread). weaponFire and attackState are split: after an ADS
+	// soft-stop we must NOT keep swallowing attackState — that was
+	// implicated in SightedRelease no longer working on button-up.
+	static std::atomic<bool> s_suppressWeaponFire{ false };
+	static std::atomic<bool> s_suppressAttackState{ false };
+
+	// Back-compat alias written by Reset() and older call sites.
 	static std::atomic<bool> s_suppress{ false };
+
 
 	static RE::BSEventNotifyControl HookedProcessEvent(void* a_self,
 		const RE::BSAnimationGraphEvent& a_event,
 		RE::BSTEventSource<RE::BSAnimationGraphEvent>* a_source)
 	{
-		if (s_suppress.load(std::memory_order_relaxed)) {
-			if (a_event.animEvent == "weaponFire" || a_event.animEvent == "WeaponFire") {
+		// Re-equip SoundPlay from the stop's UpdateAnimation(1000) —
+		// draw/bolt/foley annotations (WPNSCARDrawFoley, BoltBack, …).
+		if (g_suppressEquipSounds.load(std::memory_order_relaxed)) {
+			if (a_event.animEvent == "SoundPlay" || a_event.animEvent == "SoundPlay3D") {
+				logger::info("[FireOnEmpty] Suppressed re-equip {} '{}' (stop fast-forward)",
+					a_event.animEvent.c_str(), a_event.argument.c_str());
+				return RE::BSEventNotifyControl::kContinue;
+			}
+		}
+
+		const bool suppressWF = s_suppressWeaponFire.load(std::memory_order_relaxed) ||
+		                        s_suppress.load(std::memory_order_relaxed);
+		const bool suppressAS = s_suppressAttackState.load(std::memory_order_relaxed) ||
+		                        s_suppress.load(std::memory_order_relaxed);
+
+		if (suppressWF || suppressAS) {
+			if (suppressWF && (a_event.animEvent == "weaponFire" || a_event.animEvent == "WeaponFire")) {
 				// Swallow: the engine's handler never sees the event, so no
 				// discharge. kContinue (not kStop) so OTHER registered sinks
 				// (OAR's log, our own AnimEventSink) still observe it.
 				logger::info("[FireOnEmpty] Suppressed weaponFire annotation (dry-fire window)");
 				return RE::BSEventNotifyControl::kContinue;
 			}
-			if (a_event.animEvent == "attackState") {
-				// Swallow the attack-state notifications too — this is the
-				// loop-breaker. When the fire idle drives the graph into
-				// its attack state, the engine reacts to `attackState
-				// "Enter"` by moving gunState to firing (7) and then
-				// re-syncs isFiring=1 into the graph EVERY FRAME, which is
-				// exactly the self-sustaining auto-fire loop verified on
-				// 2026-07-16/17 (StopCurrentIdle instant AND non-instant,
-				// attackStop, release actions, variable writes: all
-				// bounced; only a full graph reset exited). With the
-				// engine never told, gunState stays 0, isFiring is never
-				// re-asserted, and the loop's sustaining condition dies.
-				// gunState 0 also makes the engine ignore any weaponFire
-				// that slips past the window (it already ignores the
-				// graph's constant background weaponFire noise at
-				// gunState 0 — see the phantom-fire notes).
+			if (suppressAS && a_event.animEvent == "attackState") {
+				// Swallow only while the dry-fire idle is in flight — this
+				// is the loop-breaker (attackState Enter → gunState 7 →
+				// isFiring re-sync every frame). Cleared on ADS soft-stop
+				// so SightedRelease can proceed.
 				logger::info("[FireOnEmpty] Suppressed attackState '{}' annotation (dry-fire window)",
 					a_event.argument.c_str());
 				return RE::BSEventNotifyControl::kContinue;
 			}
 			if (a_event.animEvent == "IdleStop") {
-				// The engine follows every ended special idle with a full
-				// weapon re-draw (vanilla behavior; the ugly re-equip seen
-				// in-game). fallout4-idlestopfix exists to hide exactly
-				// this, and its whole fix is ONE call made on this exact
-				// event, in this exact hook, before chaining to the
-				// engine's handler (idlestopfix Hooks.cpp ProcessEvent):
-				//     Player->UpdateAnimation(1000.0f);
-				// One graph update with a huge delta fast-forwards the
-				// re-draw to completion so it never renders a frame.
-				auto* player = RE::PlayerCharacter::GetSingleton();
-				if (player) {
-					player->UpdateAnimation(1000.0f);
-					logger::info("[FireOnEmpty] IdleStop in dry-fire window — fast-forwarded post-idle re-equip");
-				}
-				// Fall through to the engine handler (idlestopfix chains
-				// too): it has bookkeeping tied to IdleStop.
+				// Intentionally NOT calling UpdateAnimation(1000) here.
+				// idlestopfix uses that to hide the post-idle re-draw, but
+				// combined with our former InitializeToBaseState hard-stop
+				// it stormed InitiateStart and wedged ADS/holster so only
+				// dry-fire PlayIdle still worked (2026-07-21). Fall through
+				// to the engine; g_suppressEquipSounds (if set by the stop)
+				// still mutes re-equip foley.
 			}
 		}
 		return s_original ? s_original(a_self, a_event, a_source) :
@@ -2524,6 +2773,53 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	{
 		auto* foeSettings = Settings::GetSingleton();
 
+		// ---- Draw / holster windows (must run before the trigger gate) ----
+		// FOE uses fireOnEmptyMotionLock (not isCurrentlyEquipping) so a
+		// dry-fire stop cannot arm Early Equip / disable the attack handler.
+		// Real equip still sets isCurrentlyEquipping later for Early Equip.
+		//
+		// wasWeaponDrawn is still last frame here (member updates later).
+		// 2.5s covers long rifle draws — 1.5s expired while InitiateStart
+		// was still firing and dry-fire clicked over the draw (2026-07-21).
+		constexpr float kFOEMotionLock = 2.5f;
+		if (animEventSink.beginWeaponDrawThisFrame.exchange(false, std::memory_order_relaxed) ||
+		    (weaponDrawn && !wasWeaponDrawn)) {
+			isCurrentlyEquipping = true;
+			equipAnimTimer = std::max(equipAnimTimer, kFOEMotionLock);
+			fireOnEmptyMotionLock = std::max(fireOnEmptyMotionLock, kFOEMotionLock);
+		}
+		if (animEventSink.sheatheStartedThisFrame.exchange(false, std::memory_order_relaxed) ||
+		    (!weaponDrawn && wasWeaponDrawn)) {
+			isCurrentlyHolstering = true;
+			holsterAnimTimer = std::max(holsterAnimTimer, kFOEMotionLock);
+			fireOnEmptyMotionLock = std::max(fireOnEmptyMotionLock, kFOEMotionLock);
+			// Abort an in-flight dry-fire so it can't finish over the sheathe.
+			if (fireOnEmptyAnimActive) {
+				StopEmptyFireAnimation(player, "holster started");
+				fireOnEmptyAnimActive = false;
+				fireOnEmptyStopTimer = 0.0f;
+				fireOnEmptyDurationQueryTimer = 0.0f;
+				fireOnEmptyAnimElapsed = 0.0f;
+				fireOnEmptyWasADS = false;
+				fireOnEmptyAdsHeldAtTrigger = false;
+				fireOnEmptyGuardAdsRelease = false;
+				fireOnEmptySuppressGrace = 0.3f;
+			}
+		}
+		if (fireOnEmptyMotionLock > 0.0f) {
+			fireOnEmptyMotionLock -= delta;
+			if (fireOnEmptyMotionLock < 0.0f) fireOnEmptyMotionLock = 0.0f;
+		}
+		if (isCurrentlyHolstering) {
+			holsterAnimTimer -= delta;
+			// Sheathe finished once the engine reports undrawn, or the
+			// safety timer expires (covers missed undrawn edges).
+			if (!weaponDrawn || holsterAnimTimer <= 0.0f) {
+				isCurrentlyHolstering = false;
+				holsterAnimTimer = 0.0f;
+			}
+		}
+
 		// Fire input from the AttackInput vtable hook (ground truth from
 		// the engine's own ButtonEvent dispatch). The old raw-byte peek
 		// (AttackBlockHandler @ 0x72) proved unreliable in-game — see the
@@ -2550,8 +2846,9 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 				firstPerson = (camState == RE::CameraStates::kFirstPerson ||
 				               camState == RE::CameraStates::kIronSights);
 			}
-			logger::info("[FireOnEmpty] Fire pressed: mag={} gs={} phantom={} fp={} drawn={}",
-				foeMagAmmo, gsNow, earlyAdsAutoFireWatching, firstPerson, weaponDrawn);
+			logger::info("[FireOnEmpty] Fire pressed: mag={} gs={} phantom={} fp={} drawn={} equipping={} holstering={} motionLock={:.2f}",
+				foeMagAmmo, gsNow, earlyAdsAutoFireWatching, firstPerson, weaponDrawn,
+				isCurrentlyEquipping, isCurrentlyHolstering, fireOnEmptyMotionLock);
 		}
 
 		// Latch release: trigger released or ammo returned (e.g. reloaded).
@@ -2565,25 +2862,109 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		// idle runs (verified in-game 2026-07-16 23:29: SCAR auto loop
 		// emitted WeaponFire every ~130ms for the full 1.5s until the
 		// safety net force-reset the graph — the visible "re-equip").
-		// So the idle is ALWAYS stopped explicitly, after one fire cycle
-		// (the weapon's own fire interval) — or earlier on trigger release
-		// or if ammo returns (a reload is about to animate over it).
+		// So the idle is ALWAYS stopped explicitly, once the weapon's own
+		// fire interval elapses — or immediately if ammo returns (a
+		// reload is about to animate over it).
 		// A custom OAR dry-fire replacement clip that doesn't loop simply
 		// ends before this stop and the stop becomes a harmless no-op.
+		//
+		// NOT an early-exit condition: !foeFireHeld ("trigger released").
+		// Automatic weapons deliver PrimaryAttack as a train of discrete
+		// press/release ButtonEvent pulses at the weapon's own cyclic
+		// rate even while the physical button stays held (verified
+		// in-game 2026-07-21: foeFireHeld toggled false ~180ms into
+		// every ADS dry-fire, well under the >=0.35s fireOnEmptyStopTimer
+		// floor, cutting the idle short on literally every cycle of a
+		// held trigger). Reacting to that pulse as "released" tore the
+		// idle down before the clip's floor duration — the exact
+		// "getting cut short" symptom. The floor timer alone is the
+		// gate; a genuine quick tap-release just means the idle keeps
+		// playing to the floor anyway, same as the comment above always
+		// intended ("hold the fire idle long enough to be visible/audible").
+		//
+		// Still an immediate interrupt (bypasses the floor): the player
+		// releasing ADS mid-idle, or starting a reload. Both are the
+		// player actively initiating a real state change — sitting
+		// through the remaining floor first would fight their input
+		// instead of just honoring it. Distinct from the fire-button
+		// pulsing above: ADS hold (SecondaryAttack) isn't re-pulsed by
+		// the weapon's fire-rate the way PrimaryAttack is, so s_adsHeld
+		// going false here is a genuine release, not a cyclic artifact.
+		// reloadStartThisFrame is peeked (load, not exchange) so the
+		// later consumer at the top of Update() still sees it.
 		if (fireOnEmptyAnimActive) {
 			fireOnEmptyStopTimer -= delta;
+			fireOnEmptyAnimElapsed += delta;
+
+			// Deferred OAR duration query (see OARFireIdleQuery comment):
+			// the fire clip usually isn't visible to OAR on the trigger
+			// frame, so retry each frame for a short window. On a hit,
+			// replace the provisional floor with the clip's real
+			// remaining time. The freshness bound grows with elapsed time
+			// so a clip that activated a couple frames after the trigger
+			// still qualifies.
+			if (fireOnEmptyDurationQueryTimer > 0.0f) {
+				fireOnEmptyDurationQueryTimer -= delta;
+				const bool lastAttempt = fireOnEmptyDurationQueryTimer <= 0.0f;
+				const float d = OARFireIdleQuery::QueryFireClipDuration(
+					fireOnEmptyAnimElapsed + 0.1f, lastAttempt);
+				if (d > 0.02f) {
+					fireOnEmptyDurationQueryTimer = 0.0f;
+					fireOnEmptyStopTimer =
+						std::max(std::clamp(d, 0.05f, 2.0f) - fireOnEmptyAnimElapsed, 0.05f);
+					logger::info("[FireOnEmpty] Stop timer updated to {:.3f}s remaining "
+						"(OAR duration {:.3f}s, {:.3f}s already elapsed)",
+						fireOnEmptyStopTimer, d, fireOnEmptyAnimElapsed);
+				} else if (lastAttempt) {
+					fireOnEmptyDurationQueryTimer = 0.0f;
+					logger::info("[FireOnEmpty] No OAR fire clip found within query window — keeping floor timer");
+				}
+			}
+
+			const bool adsReleasedMidFlight =
+				fireOnEmptyWasADS && AttackInput::s_installed && !AttackInput::s_adsHeld;
+			const bool reloadInterrupt =
+				animEventSink.reloadStartThisFrame.load(std::memory_order_relaxed);
 			const char* stopReason =
+				adsReleasedMidFlight           ? "ADS released" :
+				reloadInterrupt                ? "reload started" :
 				(fireOnEmptyStopTimer <= 0.0f) ? "fire cycle complete" :
-				!foeFireHeld                   ? "trigger released" :
 				(foeMagAmmo > 0)               ? "ammo returned" :
 				                                 nullptr;
 			if (stopReason) {
-				StopEmptyFireAnimation(player, stopReason);
+				// Hard stop, always — the soft-stop ("park in the special
+				// idle while ADS is held") experiment is dead: the parked
+				// idle owns the whole first-person graph, so locomotion /
+				// sway / everything else froze until release (reported
+				// in-game 2026-07-22 01:28), and no engine-side exit can
+				// run from the parked state (all five stimuli refused;
+				// see SoftStop post-mortem above StopEmptyFireAnimation).
+				(void)StopEmptyFireAnimation(player, stopReason);
+				// Hard reset forces a re-draw even fast-forwarded;
+				// lock FOE (not Early Equip) until that window clears.
+				fireOnEmptyMotionLock = std::max(fireOnEmptyMotionLock, 0.6f);
+				// ADS still physically held → re-enter sighted instantly
+				// via a synthetic release+press tap and fast-forward the
+				// aim-enter blend (see AttackInput::SimulateTap for why a
+				// tap, not a bare press). Restores the graph to the REAL
+				// sighted state, so locomotion works and the eventual
+				// real button release plays the engine's natural exit.
+				if (fireOnEmptyWasADS && !adsReleasedMidFlight && !reloadInterrupt &&
+				    AttackInput::s_installed && AttackInput::s_adsHeld) {
+					if (AttackInput::SimulateTap("SecondaryAttack")) {
+						g_suppressEquipSounds.store(true, std::memory_order_relaxed);
+						player->UpdateAnimation(1000.0f);
+						g_suppressEquipSounds.store(false, std::memory_order_relaxed);
+						logger::info("[FireOnEmpty] Re-entered ADS via synthetic tap (gs={})",
+							static_cast<std::uint32_t>(player->gunState));
+					}
+				}
 				fireOnEmptyAnimActive = false;
 				fireOnEmptyStopTimer  = 0.0f;
-				// Keep the annotation suppression window open through the
-				// loop's exit tail — the graph can land a few more
-				// annotations while it unwinds out of the attack state.
+				fireOnEmptyDurationQueryTimer = 0.0f;
+				fireOnEmptyAnimElapsed = 0.0f;
+				fireOnEmptyWasADS = false;
+				fireOnEmptyAdsHeldAtTrigger = false;
 				fireOnEmptySuppressGrace = 0.6f;
 			}
 		}
@@ -2604,6 +2985,8 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 				fireOnEmptyVerifyTimer = 0.0f;
 				if (foeMagAmmo == 0 && GunStateLocal::IsFiringGunState(gsNow)) {
 					ForceGraphBaseStateReset(player);
+					// Hard reset re-draws — block FOE (not Early Equip) briefly.
+					fireOnEmptyMotionLock = std::max(fireOnEmptyMotionLock, 2.5f);
 				}
 			}
 		}
@@ -2613,8 +2996,8 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		    !fireOnEmptyLatched &&
 		    !fireOnEmptyAnimActive &&
 		    foeMagAmmo == 0 &&
-		    !GunStateLocal::IsFiringGunState(gsNow) &&
 		    gsNow != GunStateLocal::kReloading &&
+		    gsNow != GunStateLocal::kThrowing &&
 		    !earlyAdsAutoFireWatching)
 		{
 			// First-person / iron-sights only (matches the mod's other
@@ -2626,7 +3009,21 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 				               camState == RE::CameraStates::kIronSights);
 			}
 
-			if (firstPerson && weaponDrawn) {
+			// Idle, ADS idle, or fire/attack (gunState 0 / 6 / 7 / 8).
+			// Mid-draw / mid-holster are blocked by motionLock + flags.
+			const bool inAllowedGunState =
+				gsNow == GunStateLocal::kDrawn ||
+				gsNow == GunStateLocal::kSighted ||
+				gsNow == GunStateLocal::kFire ||
+				gsNow == GunStateLocal::kFireSighted;
+
+			const bool motionBlocked =
+				fireOnEmptyMotionLock > 0.0f ||
+				isCurrentlyEquipping ||
+				isCurrentlyHolstering;
+
+			if (firstPerson && weaponDrawn && inAllowedGunState && !motionBlocked)
+			{
 				// One attempt per trigger hold, whatever the outcome — also
 				// prevents per-frame log spam while holding on an empty mag.
 				fireOnEmptyLatched = true;
@@ -2638,25 +3035,39 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 					FireOnEmpty::FOEEntry entry;
 					const bool found = FireOnEmpty::Manager::GetSingleton()->GetEntry(eid, entry);
 					if (found && entry.enabled) {
-						// Open the weaponFire suppression window BEFORE the
-						// idle starts — the first WeaponFire annotation
-						// lands synchronously with PlayIdle (verified in
-						// the 23:29 trace: same-millisecond timestamps).
-						FireAnnotationGuard::s_suppress.store(true, std::memory_order_relaxed);
+						// Open both suppress windows BEFORE PlayIdle —
+						// first WeaponFire/attackState land synchronously.
+						FireAnnotationGuard::s_suppressWeaponFire.store(true, std::memory_order_relaxed);
+						FireAnnotationGuard::s_suppressAttackState.store(true, std::memory_order_relaxed);
+						FireAnnotationGuard::s_suppress.store(false, std::memory_order_relaxed);
+
 						const bool ok = TriggerEmptyFireAction(player, entry.autoFire);
 						logger::info("[FireOnEmpty] Empty-fire on '{}' (autoFire={}, gs={}, edge={}) -> triggered={}",
 							eid, entry.autoFire, gsNow, fireRisingEdge, ok);
 						if (ok) {
-							// Arm the lifecycle above: re-trigger throttle
-							// paced by the weapon's own fire interval
-							// (clamped so a missing/zero interval can't
-							// jam the throttle open or shut).
+							// Provisional stop timer: the tuned floor (0.5s,
+							// per 2026-07-21 direction). The real bound-clip
+							// duration comes from OAR's Clips API, but the
+							// fire clip is only sometimes visible on the
+							// trigger frame (see OARFireIdleQuery comment),
+							// so the query is DEFERRED: retried each frame
+							// for the next ~0.3s by the active block above.
+							// If it never lands, this floor stands.
 							fireOnEmptyAnimActive = true;
 							fireOnEmptyStopTimer  =
-								std::clamp(EquippedWeapon::GetWeaponFireInterval(player), 0.05f, 1.0f);
-							// Arm the wedged-graph safety net (see above);
-							// expected to be a no-op on the idle path.
+								std::clamp(EquippedWeapon::GetWeaponFireInterval(player), 0.5f, 1.0f);
+							fireOnEmptyDurationQueryTimer = 0.3f;
+							fireOnEmptyAnimElapsed = 0.0f;
+							logger::info("[FireOnEmpty] Stop timer provisionally {:.3f}s (floor; OAR query deferred)",
+								fireOnEmptyStopTimer);
 							fireOnEmptyVerifyTimer = 1.5f;
+							// Preserve ADS when started sighted (6) or
+							// firing-from-ADS (8).
+							fireOnEmptyWasADS =
+								gsNow == GunStateLocal::kSighted ||
+								gsNow == GunStateLocal::kFireSighted;
+							fireOnEmptyAdsHeldAtTrigger =
+								AttackInput::s_installed && AttackInput::s_adsHeld;
 							PushEvent("Fire on Empty triggered");
 						}
 					} else {
@@ -2664,23 +3075,29 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 							eid, found, found && entry.enabled);
 					}
 				}
+			} else if (firstPerson && fireRisingEdge) {
+				logger::info("[FireOnEmpty] Gated: drawn={} allowedGS={} motionLock={:.2f} equipping={} holstering={} gs={}",
+					weaponDrawn, inAllowedGunState, fireOnEmptyMotionLock,
+					isCurrentlyEquipping, isCurrentlyHolstering, gsNow);
 			}
 		}
 
-		// ---- weaponFire suppression window (see FireAnnotationGuard) ----
-		// Recomputed every frame: open while the dry-fire idle is in
-		// flight or blending out, and ONLY while the magazine is still
-		// empty — the instant ammo returns (reload) real firing must
-		// reach the engine again, grace or no grace.
+		// ---- annotation suppression (see FireAnnotationGuard) ----
+		// weaponFire: idle in flight OR short blend-out grace (empty mag).
+		// attackState: ONLY while the dry-fire idle is in flight — keeping
+		// it open after ADS soft-stop blocked SightedRelease (2026-07-21).
 		if (fireOnEmptySuppressGrace > 0.0f) {
 			fireOnEmptySuppressGrace -= delta;
 			if (fireOnEmptySuppressGrace < 0.0f) fireOnEmptySuppressGrace = 0.0f;
 		}
-		const bool suppressFire =
-			foeSettings->fireOnEmptyEnabled &&
-			foeMagAmmo == 0 &&
-			(fireOnEmptyAnimActive || fireOnEmptySuppressGrace > 0.0f);
-		FireAnnotationGuard::s_suppress.store(suppressFire, std::memory_order_relaxed);
+		const bool foeOn = foeSettings->fireOnEmptyEnabled && foeMagAmmo == 0;
+		FireAnnotationGuard::s_suppressWeaponFire.store(
+			foeOn && (fireOnEmptyAnimActive || fireOnEmptySuppressGrace > 0.0f),
+			std::memory_order_relaxed);
+		FireAnnotationGuard::s_suppressAttackState.store(
+			foeOn && fireOnEmptyAnimActive,
+			std::memory_order_relaxed);
+		FireAnnotationGuard::s_suppress.store(false, std::memory_order_relaxed);
 
 		prevFireInputHeld = foeFireHeld;
 	}
@@ -2774,7 +3191,8 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		hasLoggedSkeleton  = false;
 		pivotWarmupTimer   = 0.5f;
 		isCurrentlyEquipping = true;
-		equipAnimTimer       = 1.5f;
+		equipAnimTimer       = 2.5f;
+		fireOnEmptyMotionLock = std::max(fireOnEmptyMotionLock, 2.5f);
 		earlyEquipAdsArmed   = false;
 		earlyEquipFireArmed  = false;
 		earlyEquipPending    = false;
@@ -4433,6 +4851,8 @@ void Inertia::InertiaManager::Reset()
 	isCurrentlyReloading  = false;
 	isCurrentlyEquipping  = false;
 	equipAnimTimer        = 0.0f;
+	isCurrentlyHolstering = false;
+	holsterAnimTimer      = 0.0f;
 	earlyEquipAdsArmed    = false;
 	earlyEquipFireArmed   = false;
 	earlyEquipPending     = false;
@@ -4471,8 +4891,23 @@ void Inertia::InertiaManager::Reset()
 	fireOnEmptyVerifyTimer = 0.0f;
 	fireOnEmptyLatched     = false;
 	prevFireInputHeld      = false;
+	fireOnEmptyWasADS = false;
+	fireOnEmptyAdsHeldAtTrigger = false;
+	fireOnEmptyGuardAdsRelease = false;
+	fireOnEmptyMotionLock = 0.0f;
+	fireOnEmptyDurationQueryTimer = 0.0f;
+	fireOnEmptyAnimElapsed = 0.0f;
 	fireOnEmptySuppressGrace = 0.0f;
 	FireAnnotationGuard::s_suppress.store(false, std::memory_order_relaxed);
+	FireAnnotationGuard::s_suppressWeaponFire.store(false, std::memory_order_relaxed);
+	FireAnnotationGuard::s_suppressAttackState.store(false, std::memory_order_relaxed);
+
+	// Defensive: Early Equip / Early ADS can leave the attack handler
+	// disabled if Reset() runs mid force-idle. Restore so ADS/holster work.
+	if (auto* pcCtrl = RE::PlayerControls::GetSingleton(); pcCtrl && pcCtrl->attackHandler) {
+		auto* atk = reinterpret_cast<RE::HeldStateHandler*>(pcCtrl->attackHandler);
+		atk->inputEventHandlingEnabled = true;
+	}
 
 	pendingFallImpulse = false;
 	pendingFallTimer   = 0.0f;
