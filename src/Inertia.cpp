@@ -1660,6 +1660,14 @@ static void ForceGraphBaseStateReset(RE::PlayerCharacter* a_player)
 	static const RE::BSFixedString kEvtAttackStop{ "attackStop" };
 	a_player->NotifyAnimationGraphImpl(kEvtAttackStop);
 
+	// Fast-forward the reset's mandatory re-draw (equip sounds muted),
+	// exactly like the hard stop and the bash trigger do. Before this,
+	// the net's reset was the ONE reset that played its re-draw visibly —
+	// the "fast equip after every few dry fires" report (2026-07-22).
+	g_suppressEquipSounds.store(true, std::memory_order_relaxed);
+	a_player->UpdateAnimation(1000.0f);
+	g_suppressEquipSounds.store(false, std::memory_order_relaxed);
+
 	logger::warn("[FireOnEmpty] Graph stuck in fire loop after stop — forced base-state reset (ran={})", ran);
 }
 
@@ -3535,7 +3543,13 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			fireOnEmptyMotionLock = std::max(fireOnEmptyMotionLock, kFOEMotionLock);
 			// Abort an in-flight dry-fire so it can't finish over the sheathe.
 			if (fireOnEmptyAnimActive) {
-				StopEmptyFireAnimation(player, "holster started");
+				// Disarm the wedged-graph safety net on a successful reset —
+				// same stale-gunState misfire as the main stop path (see the
+				// comment there); a spurious forced reset mid-sheathe would
+				// visibly re-draw the weapon the player is putting away.
+				if (StopEmptyFireAnimation(player, "holster started")) {
+					fireOnEmptyVerifyTimer = 0.0f;
+				}
 				fireOnEmptyAnimActive = false;
 				fireOnEmptyStopTimer = 0.0f;
 				fireOnEmptyDurationQueryTimer = 0.0f;
@@ -3689,7 +3703,19 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 				// in-game 2026-07-22 01:28), and no engine-side exit can
 				// run from the parked state (all five stimuli refused;
 				// see SoftStop post-mortem above StopEmptyFireAnimation).
-				(void)StopEmptyFireAnimation(player, stopReason);
+				const bool stopResetRan = StopEmptyFireAnimation(player, stopReason);
+				// A successful stop leaves the graph AT base state — the
+				// exact state the wedged-graph safety net below would force.
+				// Disarm it: gunState keeps reading "firing" for a while
+				// after the stop (we suppress the attackState Exit
+				// annotation, so the engine's bookkeeping never sees the
+				// cycle end), and the net misread that stale value as a
+				// wedge, firing a second visible re-draw ~0.8s after every
+				// few dry fires (in-game log 2026-07-22 23:18). Only a stop
+				// whose InitializeToBaseState was REFUSED still needs it.
+				if (stopResetRan) {
+					fireOnEmptyVerifyTimer = 0.0f;
+				}
 				// Hard reset forces a re-draw even fast-forwarded;
 				// lock FOE (not Early Equip) until that window clears.
 				fireOnEmptyMotionLock = std::max(fireOnEmptyMotionLock, 0.6f);
