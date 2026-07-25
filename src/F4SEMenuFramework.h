@@ -5,7 +5,18 @@
 #include <locale>
 #include <string>
 
-static auto menuFramework = GetModuleHandle(L"F4SEMenuFramework");
+// F4SE loads plugins in plugins.txt order. Resolve the framework module on
+// every use so this consumer still works when our DLL loads first.
+[[nodiscard]] inline HMODULE F4SEMenuFramework_GetHostModule() noexcept
+{
+	HMODULE module = ::GetModuleHandleW(L"F4SEMenuFramework.dll");
+	if (!module) {
+		module = ::GetModuleHandleW(L"F4SEMenuFramework");
+	}
+	return module;
+}
+#define menuFramework (F4SEMenuFramework_GetHostModule())
+
 #define MENU_WINDOW F4SEMenuFramework::Model::WindowInterface*
 namespace ImGuiMCP {
     typedef struct ImVec2 ImVec2;
@@ -18,8 +29,9 @@ namespace ImGuiMCP {
 namespace F4SEMenuFramework {
     using namespace ImGuiMCP;
     inline bool IsInstalled() {
-        constexpr auto dllPath = "Data/F4SE/Plugins/F4SEMenuFramework.dll";
-        return std::filesystem::exists(dllPath);
+        // A file check is insufficient under mod managers because the process
+        // working directory can differ from the game directory.
+        return F4SEMenuFramework_GetHostModule() != nullptr;
     }
 
     namespace Model {

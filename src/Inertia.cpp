@@ -565,10 +565,10 @@ namespace HavokVar {
 	{
 		RE::BSTSmartPointer<RE::BSAnimationGraphManager> mgr;
 		if (!a_actor->GetAnimationGraphManagerImpl(mgr) || !mgr) return nullptr;
-		auto mgrAddr = reinterpret_cast<std::uintptr_t>(mgr.get());
 
-		// graphToCacheFor at offset 0xC0 (BSAnimationGraphVariableCache.graphToCacheFor)
-		auto* graphPtr = *reinterpret_cast<void**>(mgrAddr + 0xC0);
+		// Use CommonLib's declared manager layout for the first link. The
+		// remaining Havok offsets are the verified OG/NG/AE graph contract.
+		auto* graphPtr = mgr->variableCache.graphToCacheFor.get();
 		if (!graphPtr) return nullptr;
 		auto graphAddr = reinterpret_cast<std::uintptr_t>(graphPtr);
 
@@ -3377,18 +3377,10 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			}
 		}
 
-		// Fire input from the AttackInput vtable hook (ground truth from
-		// the engine's own ButtonEvent dispatch). The old raw-byte peek
-		// (AttackBlockHandler @ 0x72) proved unreliable in-game — see the
-		// AttackInput namespace comment. Fall back to the byte peek only
-		// if the hook failed to install.
-		bool foeFireHeld = false;
-		if (AttackInput::s_installed) {
-			foeFireHeld = AttackInput::s_fireHeld;
-		} else if (auto* pcCtrl = RE::PlayerControls::GetSingleton(); pcCtrl && pcCtrl->attackHandler) {
-			auto* handlerBytes = reinterpret_cast<const std::uint8_t*>(pcCtrl->attackHandler);
-			foeFireHeld = (handlerBytes[0x72] != 0);
-		}
+		// Fire input comes from the engine-dispatched ButtonEvent hook. If
+		// installation failed, leave it false instead of reading a raw handler
+		// offset whose layout is not guaranteed across runtimes.
+		const bool foeFireHeld = AttackInput::s_installed && AttackInput::s_fireHeld;
 
 		const std::uint32_t foeMagAmmo = EquippedWeapon::GetMagazineAmmoCount(player);
 		const auto gsNow = static_cast<std::uint32_t>(player->gunState);
@@ -4179,10 +4171,8 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 
 	// Read ADS / Fire input state.
 	// Fire comes from the AttackInput vtable hook (engine-dispatched
-	// "PrimaryAttack" ButtonEvents — ground truth). The old raw-byte peek
-	// of AttackBlockHandler @ 0x72 proved unreliable in-game (whole
-	// sessions of live fire never read non-zero); it remains only as a
-	// fallback if the hook failed to install.
+	// "PrimaryAttack" ButtonEvents). Do not fall back to raw handler bytes:
+	// that field is both unreliable and layout-sensitive across runtimes.
 	// ADS keeps the generic HeldStateHandler::heldStateActive flag for
 	// compatibility with the existing EarlyADS arm behavior (it's a
 	// "either attack button held" flag, which EarlyADS was tuned around).
@@ -4194,12 +4184,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		atkHandler = reinterpret_cast<RE::HeldStateHandler*>(pc->attackHandler);
 		// Generic flag (kept for compatibility with the existing EarlyADS arm).
 		adsInputHeld = atkHandler->heldStateActive;
-		if (AttackInput::s_installed) {
-			fireInputHeld = AttackInput::s_fireHeld;
-		} else {
-			auto* base = reinterpret_cast<const std::uint8_t*>(pc->attackHandler);
-			fireInputHeld = (base[0x72] != 0);
-		}
+		fireInputHeld = AttackInput::s_installed && AttackInput::s_fireHeld;
 	}
 
 	// Force-idle: keep the ADS/attack handler suppressed for a few frames

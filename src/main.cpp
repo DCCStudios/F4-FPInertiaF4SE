@@ -72,6 +72,12 @@ namespace
 		}
 
 		switch (msg->type) {
+		case F4SE::MessagingInterface::kPostLoad:
+			// Every F4SE plugin has returned from Load at this point, so the
+			// framework module is available regardless of plugins.txt order.
+			Menu::Register();
+			break;
+
 		case F4SE::MessagingInterface::kGameDataReady:
 		{
 			logger::info("[FPGunplayOverhaul] kGameDataReady - initializing");
@@ -84,7 +90,6 @@ namespace
 			ContextualLean::Manager::GetSingleton()->Init();
 			Inertia::InertiaManager::GetSingleton()->InitSuperSprint();
 			Inertia::Install();
-			Menu::Register();
 			break;
 		}
 

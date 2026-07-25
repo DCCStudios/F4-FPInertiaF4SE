@@ -86,6 +86,13 @@ namespace Menu
 	// ============================================================
 	void Register()
 	{
+		// kPostLoad and kPostPostLoad can both be useful registration points,
+		// so keep this idempotent if the caller ever retries at either stage.
+		static bool registered = false;
+		if (registered) {
+			return;
+		}
+
 		if (!F4SEMenuFramework::IsInstalled()) {
 			logger::warn("[FPGunplayOverhaul] F4SE Menu Framework is not installed - menu will not be available");
 			return;
@@ -97,6 +104,7 @@ namespace Menu
 		F4SEMenuFramework::AddSectionItem("Debug Info", RenderDebugInfo);
 		F4SEMenuFramework::AddSectionItem("Extras", RenderExtras);
 		State::debugPopoutWindow = F4SEMenuFramework::AddWindow(RenderDebugPopout, false);
+		registered = true;
 
 		logger::info("[FPGunplayOverhaul] Menu registered with F4SE Menu Framework");
 	}
