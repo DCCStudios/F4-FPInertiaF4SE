@@ -420,6 +420,22 @@ public:
 	bool  bashComboBlendEnabled{ true };
 	float bashComboBlendTime{ 0.18f };               // seconds (0.05-0.50)
 
+	// === CONTEXTUAL LEAN ===
+	// Automatically triggers UneducatedShooter's lean while aiming down
+	// sights near cover (raycast obstacle detection; lean toward the open
+	// side). Requires UneducatedShooter.dll — auto-disabled when absent.
+	bool  contextualLeanEnabled{ true };
+	bool  contextualLeanKBM{ true };       // active when last input was keyboard+mouse
+	bool  contextualLeanGamepad{ true };   // active when last input was gamepad
+	float contextualLeanEngageDistance{ 65.0f };     // obstacle distance (units) to start leaning
+	float contextualLeanDisengageDistance{ 80.0f };  // anchored probe length: keep lean while cover within this
+	float contextualLeanSideOffset{ 28.0f };         // lateral offset (units) of the side probe rays
+	float contextualLeanEngageDelay{ 0.20f };        // sec the pattern must hold before engaging
+	float contextualLeanDisengageDelay{ 0.30f };     // sec of "cover gone" before releasing
+	float contextualLeanMinHold{ 0.45f };            // min sec a lean is held before a cover-gone release
+	float contextualLeanMoveTolerance{ 48.0f };      // units of movement from the engage spot that release the lean
+	float contextualLeanYawTolerance{ 65.0f };       // degrees of turning from the engage aim that release the lean
+
 	// Debug settings
 	bool debugLogging{ false };
 	bool debugOnScreen{ false };

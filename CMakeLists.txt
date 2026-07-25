@@ -61,6 +61,7 @@ set(SOURCES
 	src/ChamberExclusion.cpp
 	src/WeaponFOV.cpp
 	src/FireOnEmpty.cpp
+	src/ContextualLean.cpp
 )
 
 set(HEADERS
@@ -74,6 +75,7 @@ set(HEADERS
 	src/ChamberExclusion.h
 	src/WeaponFOV.h
 	src/FireOnEmpty.h
+	src/ContextualLean.h
 	src/OpenAnimationReplacerAPI-Clips.h
 )
 

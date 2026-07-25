@@ -3,6 +3,7 @@
 #include "ChamberExclusion.h"
 #include "WeaponFOV.h"
 #include "FireOnEmpty.h"
+#include "ContextualLean.h"
 #include <format>
 
 // Pull ImGuiMCP types into scope so we don't need to prefix every ImVec4, ImGuiCol_*, etc.
@@ -3239,6 +3240,180 @@ namespace Menu
 						settings->bashComboStaminaThreshold = std::clamp(settings->bashComboStaminaThreshold, 0.0f, 100.0f);
 						State::hasUnsavedChanges = true;
 					}
+				}
+			}
+		}
+
+		// ====== CONTEXTUAL LEAN ======
+		ImGuiMCP::Spacing();
+		if (ImGuiMCP::CollapsingHeader("Contextual Lean")) {
+			auto* settings = Settings::GetSingleton();
+			auto* cl = ContextualLean::Manager::GetSingleton();
+
+			ImGuiMCP::Indent(8.0f);
+			ImGuiMCP::Spacing();
+			ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "What it does:");
+			ImGuiMCP::TextWrapped(
+				"While aiming down sights right up against cover, raycasts detect the "
+				"obstacle in front of you and automatically trigger UneducatedShooter's "
+				"lean toward the OPEN side so you can see around it. The lean is held "
+				"until you step away, turn away, or the cover is gone.");
+			ImGuiMCP::Spacing();
+			ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "Details:");
+			ImGuiMCP::BulletText("Requires UneducatedShooter (drives its lean via your lean keybinds)");
+			ImGuiMCP::BulletText("Honors UneducatedShooter settings: blend time, toggle/hold, ADS-only");
+			ImGuiMCP::BulletText("UneducatedShooter's own collision checks prevent leaning into walls");
+			ImGuiMCP::BulletText("Only triggers on cover under your crosshair — aiming at open space\nnext to a wall never leans");
+			ImGuiMCP::BulletText("Deliberately strict: ambiguous geometry (e.g. a column with a wall\nbehind it) will not trigger a lean at all");
+			ImGuiMCP::BulletText("Manually cancelling a lean makes the auto-lean back off briefly");
+			ImGuiMCP::Unindent(8.0f);
+			ImGuiMCP::Spacing();
+
+			// ---- Dependency status ----
+			if (!cl->IsUSInstalled()) {
+				ImGuiMCP::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+					"UneducatedShooter.dll not detected — feature disabled.");
+			} else if (cl->IsUSLeanDisabled()) {
+				ImGuiMCP::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+					"Leaning is disabled in UneducatedShooter's settings — feature disabled.");
+			} else if (!cl->AreKeysUsable()) {
+				ImGuiMCP::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f),
+					"Lean Left/Right keys are not bound in UneducatedShooter's MCM.\n"
+					"Bind both keys (to two different inputs) to enable this feature.");
+			} else {
+				ImGuiMCP::TextColored(ImVec4(0.45f, 1.0f, 0.55f, 1.0f),
+					"UneducatedShooter detected — ready.");
+				ImGuiMCP::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+					"Lean mode: %s%s | keybinds L=%u R=%u",
+					cl->IsToggleMode() ? "Toggle" : "Hold",
+					cl->IsUSADSOnly() ? " (ADS-only)" : "",
+					cl->GetLeanLeftKey(), cl->GetLeanRightKey());
+			}
+			ImGuiMCP::Spacing();
+
+			if (CheckboxWithTooltip("Enable Contextual Lean##ctxLean", &settings->contextualLeanEnabled,
+				"Master toggle for the Contextual Lean feature.\n"
+				"Only active while UneducatedShooter is installed with\n"
+				"leaning enabled and both lean keys bound.")) {
+				State::hasUnsavedChanges = true;
+			}
+
+			if (settings->contextualLeanEnabled) {
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Input Devices");
+				ImGuiMCP::Spacing();
+
+				if (CheckboxWithTooltip("Enable for Keyboard + Mouse##ctxLeanKBM", &settings->contextualLeanKBM,
+					"Auto-lean triggers while your most recent input came\n"
+					"from the keyboard or mouse.")) {
+					State::hasUnsavedChanges = true;
+				}
+				if (CheckboxWithTooltip("Enable for Gamepad##ctxLeanPad", &settings->contextualLeanGamepad,
+					"Auto-lean triggers while your most recent input came\n"
+					"from a gamepad.")) {
+					State::hasUnsavedChanges = true;
+				}
+
+				ImGuiMCP::Spacing();
+				ImGuiMCP::Separator();
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Obstacle Detection");
+				ImGuiMCP::Spacing();
+
+				if (SliderFloatWithTooltip("Engage Distance##ctxLeanEngageDist", &settings->contextualLeanEngageDistance,
+					32.0f, 400.0f, "%.0f units",
+					"How close the cover must be (in game units, ~70 units\n"
+					"per meter) before the auto-lean engages. Keep this small\n"
+					"so leans only trigger right up against cover.\n"
+					"Default: 65")) {
+					settings->contextualLeanEngageDistance = std::clamp(settings->contextualLeanEngageDistance, 32.0f, 400.0f);
+					if (settings->contextualLeanDisengageDistance < settings->contextualLeanEngageDistance)
+						settings->contextualLeanDisengageDistance = settings->contextualLeanEngageDistance;
+					State::hasUnsavedChanges = true;
+				}
+
+				if (SliderFloatWithTooltip("Open-Side Clearance##ctxLeanDisengageDist", &settings->contextualLeanDisengageDistance,
+					32.0f, 500.0f, "%.0f units",
+					"The open side must be clear out to this distance before a\n"
+					"lean engages (so a column with a wall behind it never\n"
+					"triggers). While leaning, the cover is also tracked out\n"
+					"to this distance before a release.\n"
+					"Default: 80")) {
+					settings->contextualLeanDisengageDistance = std::clamp(settings->contextualLeanDisengageDistance,
+						settings->contextualLeanEngageDistance, 500.0f);
+					State::hasUnsavedChanges = true;
+				}
+
+				if (SliderFloatWithTooltip("Side Probe Offset##ctxLeanSideOff", &settings->contextualLeanSideOffset,
+					8.0f, 64.0f, "%.0f units",
+					"Lateral distance of the left/right detection rays from\n"
+					"the view center. Larger values require wider obstacles\n"
+					"before a lean triggers; smaller values react to narrow\n"
+					"cover (poles, doorframes) more readily.\n"
+					"Default: 28")) {
+					settings->contextualLeanSideOffset = std::clamp(settings->contextualLeanSideOffset, 8.0f, 64.0f);
+					State::hasUnsavedChanges = true;
+				}
+
+				ImGuiMCP::Spacing();
+				ImGuiMCP::Separator();
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Timing");
+				ImGuiMCP::Spacing();
+
+				if (SliderFloatWithTooltip("Engage Delay##ctxLeanEngageDelay", &settings->contextualLeanEngageDelay,
+					0.0f, 1.0f, "%.2f sec",
+					"The cover pattern must hold this long before the lean\n"
+					"starts. Prevents leans while sweeping your view. The timer\n"
+					"already runs before you aim, so if you were facing the\n"
+					"cover, entering ADS leans immediately.\n"
+					"Default: 0.20s")) {
+					settings->contextualLeanEngageDelay = std::clamp(settings->contextualLeanEngageDelay, 0.0f, 1.0f);
+					State::hasUnsavedChanges = true;
+				}
+
+				if (SliderFloatWithTooltip("Release Delay##ctxLeanDisengageDelay", &settings->contextualLeanDisengageDelay,
+					0.0f, 2.0f, "%.2f sec",
+					"How long the cover must be gone before the lean releases.\n"
+					"Bridges brief geometry gaps (fences, railings).\n"
+					"Default: 0.30s")) {
+					settings->contextualLeanDisengageDelay = std::clamp(settings->contextualLeanDisengageDelay, 0.0f, 2.0f);
+					State::hasUnsavedChanges = true;
+				}
+
+				if (SliderFloatWithTooltip("Minimum Hold##ctxLeanMinHold", &settings->contextualLeanMinHold,
+					0.0f, 3.0f, "%.2f sec",
+					"Once engaged, the lean is held at least this long before a\n"
+					"cover-gone release. (Moving or turning away always releases\n"
+					"immediately.) Keeps the motion deliberate.\n"
+					"Default: 0.45s")) {
+					settings->contextualLeanMinHold = std::clamp(settings->contextualLeanMinHold, 0.0f, 3.0f);
+					State::hasUnsavedChanges = true;
+				}
+
+				ImGuiMCP::Spacing();
+				ImGuiMCP::Separator();
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Release Conditions");
+				ImGuiMCP::Spacing();
+
+				if (SliderFloatWithTooltip("Movement Tolerance##ctxLeanMoveTol", &settings->contextualLeanMoveTolerance,
+					16.0f, 160.0f, "%.0f units",
+					"The lean is bound to the spot where it engaged: moving\n"
+					"farther than this from that spot releases it immediately.\n"
+					"Smaller = tighter, more deliberate leans.\n"
+					"Default: 48")) {
+					settings->contextualLeanMoveTolerance = std::clamp(settings->contextualLeanMoveTolerance, 16.0f, 160.0f);
+					State::hasUnsavedChanges = true;
+				}
+
+				if (SliderFloatWithTooltip("Turn Tolerance##ctxLeanYawTol", &settings->contextualLeanYawTolerance,
+					10.0f, 90.0f, "%.0f deg",
+					"Turning your aim farther than this from the direction you\n"
+					"were facing at engage releases the lean immediately.\n"
+					"Default: 65")) {
+					settings->contextualLeanYawTolerance = std::clamp(settings->contextualLeanYawTolerance, 10.0f, 90.0f);
+					State::hasUnsavedChanges = true;
 				}
 			}
 		}

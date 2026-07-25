@@ -2,6 +2,7 @@
 #include "ChamberExclusion.h"
 #include "WeaponFOV.h"
 #include "FireOnEmpty.h"
+#include "ContextualLean.h"
 #include "OpenAnimationReplacerAPI-Clips.h"
 
 // ============================================================
@@ -2886,6 +2887,12 @@ namespace AttackInput
 	static void HookedAttackHandleButton(void* self, const RE::ButtonEvent* event)
 	{
 		if (event) {
+			// Record the physical device of real input for Contextual
+			// Lean's KB+M / gamepad enable options. Synthetic taps from
+			// this plugin bypass the hook (they call s_originalHandleButton
+			// directly), so they never pollute this signal.
+			ContextualLean::Manager::GetSingleton()->NotifyInputDevice(event->device.get());
+
 			const RE::BSFixedString& userEvent = event->QUserEvent();
 			if (userEvent == "PrimaryAttack"sv) {
 				s_fireHeld = (event->value != 0.0f);
@@ -3493,6 +3500,12 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			ChamberExclusion::Manager::GetSingleton()->ApplyKeywordToEquippedInstance(player);
 		}
 	}
+
+	// Contextual Lean (auto-triggers UneducatedShooter's lean near cover
+	// while in ADS). Called unconditionally: the manager handles its own
+	// gating, including releasing an active lean when the feature (or
+	// ADS) turns off mid-lean.
+	ContextualLean::Manager::GetSingleton()->Update(player, delta);
 
 	// ============================================================
 	// Fire on Empty (EXTRAS — must NOT sit behind the inertia gates)

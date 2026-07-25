@@ -819,6 +819,27 @@ void Settings::Load()
 	bashComboStaminaThreshold = std::clamp(bashComboStaminaThreshold, 0.0f, 100.0f);
 	bashComboBlendTime = std::clamp(bashComboBlendTime, 0.05f, 0.5f);
 
+	// Contextual Lean
+	contextualLeanEnabled = ini.GetBoolValue("Extras", "bContextualLeanEnabled", true);
+	contextualLeanKBM     = ini.GetBoolValue("Extras", "bContextualLeanKBM", true);
+	contextualLeanGamepad = ini.GetBoolValue("Extras", "bContextualLeanGamepad", true);
+	contextualLeanEngageDistance    = static_cast<float>(ini.GetDoubleValue("Extras", "fContextualLeanEngageDistance", 65.0));
+	contextualLeanDisengageDistance = static_cast<float>(ini.GetDoubleValue("Extras", "fContextualLeanDisengageDistance", 80.0));
+	contextualLeanSideOffset        = static_cast<float>(ini.GetDoubleValue("Extras", "fContextualLeanSideOffset", 28.0));
+	contextualLeanEngageDelay       = static_cast<float>(ini.GetDoubleValue("Extras", "fContextualLeanEngageDelay", 0.20));
+	contextualLeanDisengageDelay    = static_cast<float>(ini.GetDoubleValue("Extras", "fContextualLeanDisengageDelay", 0.30));
+	contextualLeanMinHold           = static_cast<float>(ini.GetDoubleValue("Extras", "fContextualLeanMinHold", 0.45));
+	contextualLeanMoveTolerance     = static_cast<float>(ini.GetDoubleValue("Extras", "fContextualLeanMoveTolerance", 48.0));
+	contextualLeanYawTolerance      = static_cast<float>(ini.GetDoubleValue("Extras", "fContextualLeanYawTolerance", 65.0));
+	contextualLeanEngageDistance    = std::clamp(contextualLeanEngageDistance, 32.0f, 400.0f);
+	contextualLeanDisengageDistance = std::clamp(contextualLeanDisengageDistance, contextualLeanEngageDistance, 500.0f);
+	contextualLeanSideOffset        = std::clamp(contextualLeanSideOffset, 8.0f, 64.0f);
+	contextualLeanEngageDelay       = std::clamp(contextualLeanEngageDelay, 0.0f, 1.0f);
+	contextualLeanDisengageDelay    = std::clamp(contextualLeanDisengageDelay, 0.0f, 2.0f);
+	contextualLeanMinHold           = std::clamp(contextualLeanMinHold, 0.0f, 3.0f);
+	contextualLeanMoveTolerance     = std::clamp(contextualLeanMoveTolerance, 16.0f, 160.0f);
+	contextualLeanYawTolerance      = std::clamp(contextualLeanYawTolerance, 10.0f, 90.0f);
+
 	// Debug
 	debugLogging       = ini.GetBoolValue("Debug", "bDebugLogging", false);
 	debugOnScreen      = ini.GetBoolValue("Debug", "bDebugOnScreen", false);
@@ -952,6 +973,21 @@ void Settings::Save()
 	ini.SetDoubleValue("Extras", "fBashComboStaminaThreshold", bashComboStaminaThreshold);
 	setBool("Extras", "bBashComboBlendEnabled", bashComboBlendEnabled);
 	ini.SetDoubleValue("Extras", "fBashComboBlendTime", bashComboBlendTime);
+
+	setBool("Extras", "bContextualLeanEnabled", contextualLeanEnabled);
+	setBool("Extras", "bContextualLeanKBM", contextualLeanKBM);
+	setBool("Extras", "bContextualLeanGamepad", contextualLeanGamepad);
+	ini.SetDoubleValue("Extras", "fContextualLeanEngageDistance", contextualLeanEngageDistance);
+	ini.SetDoubleValue("Extras", "fContextualLeanDisengageDistance", contextualLeanDisengageDistance);
+	ini.SetDoubleValue("Extras", "fContextualLeanSideOffset", contextualLeanSideOffset);
+	ini.SetDoubleValue("Extras", "fContextualLeanEngageDelay", contextualLeanEngageDelay);
+	ini.SetDoubleValue("Extras", "fContextualLeanDisengageDelay", contextualLeanDisengageDelay);
+	ini.SetDoubleValue("Extras", "fContextualLeanMinHold", contextualLeanMinHold);
+	ini.SetDoubleValue("Extras", "fContextualLeanMoveTolerance", contextualLeanMoveTolerance);
+	ini.SetDoubleValue("Extras", "fContextualLeanYawTolerance", contextualLeanYawTolerance);
+	// Remove the obsolete side-switch delay key (the lean direction is
+	// latched now; switching requires a full release + fresh engage).
+	ini.Delete("Extras", "fContextualLeanSwitchDelay");
 
 	setBool("Debug", "bDebugLogging", debugLogging);
 	setBool("Debug", "bDebugOnScreen", debugOnScreen);

@@ -5,6 +5,7 @@
 #include "ChamberExclusion.h"
 #include "WeaponFOV.h"
 #include "FireOnEmpty.h"
+#include "ContextualLean.h"
 
 // ============================================================
 // Plugin Info
@@ -107,6 +108,7 @@ namespace
 			ChamberExclusion::Manager::GetSingleton()->Init();
 			WeaponFOV::Manager::GetSingleton()->Init();
 			FireOnEmpty::Manager::GetSingleton()->Init();
+			ContextualLean::Manager::GetSingleton()->Init();
 			Inertia::InertiaManager::GetSingleton()->InitSuperSprint();
 			Inertia::Install();
 			Menu::Register();
@@ -122,6 +124,7 @@ namespace
 				RE::PlayerCharacter::GetSingleton());
 			WeaponFOV::Manager::GetSingleton()->RefreshDefaults();
 			WeaponFOV::Manager::GetSingleton()->ScheduleLoadRetry();
+			ContextualLean::Manager::GetSingleton()->OnGameLoaded();
 			break;
 
 		case F4SE::MessagingInterface::kNewGame:
@@ -133,6 +136,7 @@ namespace
 				RE::PlayerCharacter::GetSingleton());
 			WeaponFOV::Manager::GetSingleton()->RefreshDefaults();
 			WeaponFOV::Manager::GetSingleton()->ScheduleLoadRetry();
+			ContextualLean::Manager::GetSingleton()->OnGameLoaded();
 			break;
 
 		default:
