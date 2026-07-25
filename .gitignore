@@ -1,6 +1,7 @@
 # Build outputs
 build/
 out/
+.xmake/
 CMakeUserPresets.json
 
 # Staged game install (DLL / PDB)

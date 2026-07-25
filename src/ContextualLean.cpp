@@ -10,80 +10,29 @@
 #include <fstream>
 
 // ============================================================
-// bhkPickData shim (pre-NG Address Library IDs)
+// bhkPickData ray helper
 // ------------------------------------------------------------
-// The vendored CommonLibF4 does not declare bhkPickData, so we call
-// the engine's own member functions by pre-NG REL::ID. The IDs and
-// the ctor + SetCollisionLayer + SetStartEnd + CellPick contract are
-// documented in F4SE_Plugin_Development_Reference.md ("bhkPickData"
-// table + RainSplashesF4SE historical CellPick notes) and this shim
-// mirrors the verified RainSplashesF4SE/src/shim/bhkPickData.h.
+// Multi-runtime CommonLib supplies bhkPickData and TESObjectCELL::Pick
+// wrappers with OG/NG/AE relocations. The collision-layer setter is not
+// exposed, so that one verified layout write remains local.
 // ============================================================
 namespace
 {
-	struct PickData
+	// The pick's own collision layer lives in the collision-filter word
+	// at +0x0A. bhkPickData is 0xE0 on every supported runtime, and this
+	// offset is the verified CellPick contract used by RainSplashesF4SE.
+	void SetCollisionLayer(RE::bhkPickData& a_pick, std::uint32_t a_layer)
 	{
-		PickData()
-		{
-			// bhkPickData ctor — REL::ID(526783) pre-NG
-			using func_t = PickData* (*)(PickData*);
-			static REL::Relocation<func_t> func{ REL::ID(526783) };
-			func(this);
-		}
-
-		void SetStartEnd(const RE::NiPoint3& a_start, const RE::NiPoint3& a_end)
-		{
-			// bhkPickData::SetStartEnd — REL::ID(747470) pre-NG
-			using func_t = void (*)(PickData*, const RE::NiPoint3&, const RE::NiPoint3&);
-			static REL::Relocation<func_t> func{ REL::ID(747470) };
-			func(this, a_start, a_end);
-		}
-
-		bool HasHit()
-		{
-			// bhkPickData::HasHit — REL::ID(1181584) pre-NG
-			using func_t = bool (*)(PickData*);
-			static REL::Relocation<func_t> func{ REL::ID(1181584) };
-			return func(this);
-		}
-
-		float GetHitFraction()
-		{
-			// bhkPickData::GetHitFraction — REL::ID(476687) pre-NG
-			using func_t = float (*)(PickData*);
-			static REL::Relocation<func_t> func{ REL::ID(476687) };
-			return func(this);
-		}
-
-		// The pick's own collision layer lives in the collision filter
-		// word at +0x0A (same offset RainSplashesF4SE used).
-		void SetCollisionLayer(std::uint32_t a_layer)
-		{
-			constexpr std::size_t kCFilterOffset = 0x0A;
-			auto* raw = reinterpret_cast<std::uint32_t*>(
-				reinterpret_cast<std::byte*>(this) + kCFilterOffset);
-			*raw = a_layer;
-		}
-
-		std::uint8_t _pad[0xE0]{};
-	};
-	static_assert(sizeof(PickData) == 0xE0);
+		constexpr std::size_t kCFilterOffset = 0x0A;
+		auto* raw = reinterpret_cast<std::uint32_t*>(
+			reinterpret_cast<std::byte*>(&a_pick) + kCFilterOffset);
+		*raw = a_layer;
+	}
 
 	// kLOS = 41 — the "what blocks line of sight" layer. Semantically the
 	// right query for "is there cover in front of me worth peeking around",
 	// and it does not register bipeds, so passing NPCs don't trigger leans.
 	constexpr std::uint32_t kColLayerLOS = 41;
-
-	// TESObjectCELL::Pick — REL::ID(434717) pre-NG. Runs the Havok ray
-	// pick against the cell's world. Safe from our callsite: we run on
-	// the main thread inside the RunActorUpdates hook, the same place
-	// UneducatedShooter itself runs its lean collision picks every frame.
-	RE::NiAVObject* CellPick(RE::TESObjectCELL* a_cell, PickData& a_pick)
-	{
-		using func_t = RE::NiAVObject* (*)(RE::TESObjectCELL*, PickData&);
-		static REL::Relocation<func_t> func{ REL::ID(434717) };
-		return func(a_cell, a_pick);
-	}
 
 	// Cast a ray from a_from to a_to against the player's parent cell.
 	// Returns true and writes the hit fraction (0..1 along the segment)
@@ -94,10 +43,10 @@ namespace
 		const RE::NiPoint3& a_to, float& a_fractionOut)
 	{
 		if (!a_cell) return false;
-		PickData pick{};
-		pick.SetCollisionLayer(kColLayerLOS);
+		RE::bhkPickData pick{};
+		SetCollisionLayer(pick, kColLayerLOS);
 		pick.SetStartEnd(a_from, a_to);
-		RE::NiAVObject* hitObj = CellPick(a_cell, pick);
+		RE::NiAVObject* hitObj = a_cell->Pick(pick);
 		if (pick.HasHit() || hitObj) {
 			a_fractionOut = pick.GetHitFraction();
 			return true;
@@ -194,7 +143,6 @@ namespace
 	void FillButtonEvent(RE::ButtonEvent& a_evt, const DecomposedKey& a_key,
 		float a_value, float a_heldSecs)
 	{
-		RE::stl::emplace_vtable(&a_evt);
 		a_evt.device       = a_key.device;
 		a_evt.deviceID     = 0;
 		a_evt.eventType    = RE::INPUT_EVENT_TYPE::kButton;
@@ -526,7 +474,7 @@ namespace ContextualLean
 		float sinTheta = 0.0f;
 		if (auto* fpRoot = a_player->Get3D(true)) {
 			if (auto* camInserted = fpRoot->GetObjectByName("CameraInserted1st")) {
-				sinTheta = std::clamp(camInserted->local.rotate.entry[0].v.z, -1.0f, 1.0f);
+			sinTheta = std::clamp(camInserted->local.rotate.entry[0].z, -1.0f, 1.0f);
 			}
 		}
 		const float sinMax = std::sin(std::max(usLeanMax * 0.017453292f, 0.001f));

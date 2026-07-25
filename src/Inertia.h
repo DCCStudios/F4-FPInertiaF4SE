@@ -3,28 +3,6 @@
 #include "Settings.h"
 #include "InertiaPresets.h"
 
-namespace RE
-{
-	struct BSAnimationGraphEvent
-	{
-		TESObjectREFR* refr;
-		BSFixedString animEvent;
-		BSFixedString argument;
-	};
-
-	namespace BGSAnimationSystemUtils
-	{
-		inline bool GetEventSourcePointersFromGraph(
-			const TESObjectREFR* a_refr,
-			BSScrapArray<BSTEventSource<BSAnimationGraphEvent>*>& a_sourcesOut)
-		{
-			using func_t = decltype(&GetEventSourcePointersFromGraph);
-			REL::Relocation<func_t> func{ REL::ID(897074) };
-			return func(a_refr, a_sourcesOut);
-		}
-	}
-}
-
 namespace Inertia
 {
 	// Ring buffer entry for impulse trigger events
@@ -222,6 +200,13 @@ namespace Inertia
 		// Register/unregister anim event sink on the player
 		void RegisterAnimEventSink();
 		void UnregisterAnimEventSink();
+
+		// Called by the player graph-event vtable hook. Routing events
+		// through the already-required guard removes the runtime-specific
+		// GetEventSourcePointersFromGraph relocation.
+		void HandleAnimationEvent(
+			const RE::BSAnimationGraphEvent& a_event,
+			RE::BSTEventSource<RE::BSAnimationGraphEvent>* a_source);
 
 		// Call after save/new game to allow form lookups
 		void OnGameLoaded();

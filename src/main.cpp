@@ -13,7 +13,7 @@
 namespace Plugin
 {
 	static constexpr auto NAME    = "FPGunplayOverhaul"sv;
-	static constexpr auto VERSION = REL::Version{ 1, 0, 0 };
+	static constexpr auto VERSION = REL::Version{ 1, 1, 0 };
 }
 
 // ============================================================
@@ -37,33 +37,6 @@ namespace
 			logger::info("[FPGunplayOverhaul] LighthousePapyrusExtender v{} detected.",
 				lighthouseInfo->version);
 		}
-	}
-
-	// ============================================================
-	// Logging setup
-	// ============================================================
-	void InitializeLogging()
-	{
-		auto path = F4SE::log::log_directory();
-		if (!path) {
-			F4SE::stl::report_and_fail("Failed to find F4SE log directory"sv);
-		}
-		*path /= std::format("{}.log"sv, Plugin::NAME);
-
-		std::shared_ptr<spdlog::logger> log;
-#ifndef NDEBUG
-		log = std::make_shared<spdlog::logger>(
-			"global"s,
-			std::make_shared<spdlog::sinks::basic_file_sink_mt>(path->string(), true));
-		log->set_level(spdlog::level::trace);
-#else
-		log = std::make_shared<spdlog::logger>(
-			"global"s,
-			std::make_shared<spdlog::sinks::basic_file_sink_mt>(path->string(), true));
-		log->set_level(spdlog::level::trace);
-#endif
-		log->flush_on(spdlog::level::info);
-		set_default_logger(std::move(log));
 	}
 
 	// ============================================================
@@ -173,13 +146,20 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface* F
 // ============================================================
 extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* F4SE)
 {
-	InitializeLogging();
+	F4SE::Init(F4SE, {
+		.log = true,
+		.logName = Plugin::NAME.data(),
+		.trampoline = true,
+		.trampolineSize = 128,
+	});
+
 	logger::info("{} v{}.{}.{} loading", Plugin::NAME,
 		Plugin::VERSION[0], Plugin::VERSION[1], Plugin::VERSION[2]);
-
-	F4SE::Init(F4SE);
-
-	F4SE::AllocTrampoline(128);
+	logger::info(
+		"Runtime {} selected ({})",
+		F4SE->RuntimeVersion().string(),
+		REX::FModule::IsRuntimeOG() ? "OG" :
+			REX::FModule::IsRuntimeNG() ? "NG" : "AE");
 
 	auto* messaging = F4SE::GetMessagingInterface();
 	if (!messaging || !messaging->RegisterListener(MessageCallback)) {

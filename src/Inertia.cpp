@@ -26,18 +26,11 @@ static constexpr const char* kKW_WeapTypeGun       = "WeaponTypeGun";
 static constexpr const char* kKW_IsMelee           = "WeaponTypeMelee";
 static constexpr const char* kKW_IsUnarmed         = "WeaponTypeUnarmed";
 
-// WEAPON_FLAGS from TESObjectWEAP::InstanceData::flags (offset 0x110)
-static constexpr std::uint32_t kWeapFlag_Automatic = 0x00008000;
-
-// Global time multiplier set by the `sgtm` console command. This is a raw
-// engine global (not an INI setting); its address is resolved through the
-// address library. ID 388442 is post-NG — verified against
-// CommonLibSSE's BSTimer::QGlobalTimeMultiplier (RELOCATION_ID(511882, 388442))
-// and Open Animation Replacer's Offsets.h.
+// Global time multiplier set by the `sgtm` console command. CommonLib
+// supplies the correct global relocation for each runtime.
 static float GetGlobalTimeMult()
 {
-	static REL::Relocation<float*> sgtmValue{ REL::ID(388442) };
-	float v = *sgtmValue;
+	float v = RE::BSTimer::QGlobalTimeMultiplier();
 	if (v <= 0.0f || v > 100.0f) v = 1.0f;
 	return v;
 }
@@ -52,27 +45,7 @@ static bool IsPipboyMenuOpen()
 }
 
 // ============================================================
-// TaskQueueInterface — minimal declaration for QueueWeaponFire
-// ============================================================
-class TaskQueueInterfaceLocal
-{
-public:
-	static TaskQueueInterfaceLocal* GetSingleton()
-	{
-		REL::Relocation<TaskQueueInterfaceLocal**> singleton{ REL::ID(7491) };
-		return *singleton;
-	}
-
-	void QueueWeaponFire(RE::TESObjectWEAP* a_weapon, RE::TESObjectREFR* a_refObject, RE::BGSEquipIndex a_equipIndex, RE::TESAmmo* a_ammo)
-	{
-		using func_t = decltype(&TaskQueueInterfaceLocal::QueueWeaponFire);
-		REL::Relocation<func_t> func{ REL::ID(15449) };
-		return func(this, a_weapon, a_refObject, a_equipIndex, a_ammo);
-	}
-};
-
-// ============================================================
-// Action-system declarations (kept for reference / future use)
+// Action-system compatibility
 //
 // FIRST ATTEMPT for "Fire on Empty" was the vanilla fire ACTION
 // (BGSAction default object) via BGSAnimationSystemUtils::
@@ -86,139 +59,27 @@ public:
 // event directly (see TriggerEmptyFireAction) and skips the
 // action layer entirely.
 //
-// The declarations below stay because RunActionOnActor is the
-// correct tool for OTHER forced actions (reload, holster, etc.)
-// where ammo validation is not in the way.
-//
-// This CommonLibF4 build does not vendor ActionInput / TESActionData
-// (only their RTTI / VTABLE IDs), so we declare the minimal layouts
-// here. Layout verified against:
-//   - CommonLibF4 (Fell63 fork) RE/A/ActionInput.h  (0x28, member offsets)
-//   - Native Animation Framework RE/TESActionData.h (extra members,
-//     RunActionOnActor at REL::ID(22408))
-// stl::emplace_vtable installs the engine's real vtable so the object
-// behaves as a genuine TESActionData when RunActionOnActor uses it.
+// The old build constructed TESActionData and called RunActionOnActor.
+// TESActionData's engine vtable is not mapped for every runtime, so the
+// action call sites now use CommonLib's multi-runtime Actor::PerformAction.
 // ============================================================
 namespace RE
 {
-	class ActionQueue;
-
-	class __declspec(novtable) ActionInput
-	{
-	public:
-		static constexpr auto RTTI{ RTTI::ActionInput };
-		static constexpr auto VTABLE{ VTABLE::ActionInput };
-
-		enum class ACTIONPRIORITY
-		{
-			kImperative = 0x0,
-			kQueue      = 0x1,
-			kTry        = 0x2
-		};
-
-		class Data
-		{
-		public:
-			union
-			{
-				float         f;
-				std::int32_t  i;
-				std::uint32_t ui;
-			};  // 00
-		};
-
-		virtual ~ActionInput() {}  // 00 (body irrelevant — emplace_vtable installs the engine vtable)
-
-		// members
-		NiPointer<TESObjectREFR> ref;         // 08
-		NiPointer<TESObjectREFR> targetRef;   // 10
-		BGSAction*               action;      // 18
-		std::uint32_t            priority;    // 20 (ACTIONPRIORITY stored as u32)
-		Data                     actionData;  // 24
-	};
-	static_assert(sizeof(ActionInput) == 0x28);
-
-	class __declspec(novtable) TESActionData :
-		public ActionInput
-	{
-	public:
-		static constexpr auto RTTI{ RTTI::TESActionData };
-		static constexpr auto VTABLE{ VTABLE::TESActionData };
-
-		TESActionData(ACTIONPRIORITY a_priority, TESObjectREFR* a_refr, BGSAction* a_action)
-		{
-			stl::emplace_vtable(this);
-			priority = static_cast<std::uint32_t>(a_priority);
-			ref      = NiPointer<TESObjectREFR>(a_refr);
-			action   = a_action;
-		}
-
-		virtual ~TESActionData() {}
-
-		virtual ActorState*            GetActorState() { return nullptr; }
-		virtual ActionQueue*           GetActionQueue() { return nullptr; }
-		virtual BGSAnimationSequencer* GetAnimationSequencer() { return nullptr; }
-		virtual TESActionData*         CreateCopy() { return nullptr; }
-		virtual bool                   DoIt() { return false; }
-
-		// members (opaque tail — sized to match the engine object so
-		// RunActionOnActor can freely write into it)
-		BSFixedString unkStr01;
-		BSFixedString unkStr02;
-		std::int32_t  unk01 = 0;
-		std::int64_t  unk02 = 0;
-		std::int64_t  unk03 = 0;
-		std::int32_t  unk04 = 0;
-		std::int32_t  unk05 = 0;
-		std::uint8_t  padding[32]{};
-	};
-
 	namespace BGSAnimationSystemUtils
 	{
-		inline bool RunActionOnActor(Actor* a_actor, TESActionData& a_action, bool a_unk = false)
-		{
-			using func_t = decltype(&RunActionOnActor);
-			REL::Relocation<func_t> func{ REL::ID(22408) };
-			return func(a_actor, a_action, a_unk);
-		}
-
-		// The "InitializeToBaseState" BGSAction — running it via
-		// RunActionOnActor resets the actor's behavior graph to its base
+		// The "InitializeToBaseState" BGSAction. Performing it resets the
+		// actor's behavior graph to its base
 		// state. Native Animation Framework uses exactly this to recover
 		// a graph after custom animations (SmartIdle.h), which is the
 		// proven precedent; here it is the last-resort unstick for a
 		// dry-fire attack state that ignored every stop stimulus.
-		// (REL::ID verified against NAF's BGSAnimationSystemUtils.h.)
+		// IDs verified against the installed OG, NG, and AE Address
+		// Library databases. NG and AE intentionally share the post-OG ID.
 		inline BGSAction* GetDefaultObjectForActionInitializeToBaseState()
 		{
 			using func_t = decltype(&GetDefaultObjectForActionInitializeToBaseState);
-			REL::Relocation<func_t> func{ REL::ID(639576) };
+			static REL::Relocation<func_t> func{ REL::ID{ 639576, 2214309 } };
 			return func();
-		}
-
-		// Read-only query: would sending this anim event to the actor's
-		// graph cause a state transition right now? Used to diagnose which
-		// fire stimuli the graph accepts on an empty magazine without
-		// actually disturbing the graph. (REL::ID verified against NAF's
-		// BGSAnimationSystemUtils.h.)
-		inline bool WillEventChangeState(const TESObjectREFR& a_ref, const BSFixedString& a_event)
-		{
-			using func_t = decltype(&WillEventChangeState);
-			REL::Relocation<func_t> func{ REL::ID(35074) };
-			return func(a_ref, a_event);
-		}
-
-		// Instantly re-initialize the actor's behavior graph (no blend).
-		// SeamlessInspect calls this on the IdleStop graph event to make
-		// the engine's mandatory post-special-idle re-equip invisible
-		// (paired with a small UpdateAnimation step to advance past it).
-		// (Signature + REL::ID(672857) verified against NAF's
-		// BGSAnimationSystemUtils.h; same usage in SeamlessInspect.)
-		inline bool InitializeActorInstant(Actor* a_actor, bool a_initializeNodes)
-		{
-			using func_t = decltype(&InitializeActorInstant);
-			REL::Relocation<func_t> func{ REL::ID(672857) };
-			return func(a_actor, a_initializeNodes);
 		}
 	}
 
@@ -247,7 +108,7 @@ namespace RE
 	{
 		if (!a_process) return false;
 		using func_t = bool (*)(AIProcess*, Actor&, DEFAULT_OBJECT, TESIdleForm*, bool, TESObjectREFR*);
-		REL::Relocation<func_t> func{ REL::ID(1446774) };
+		static REL::Relocation<func_t> func{ ID::AIProcess::SetupSpecialIdle };
 		return func(a_process, a_actor, a_action, a_idle, a_testConditions, a_targetOverride);
 	}
 
@@ -262,7 +123,7 @@ namespace RE
 	{
 		if (!a_process) return;
 		using func_t = void (*)(AIProcess*, Actor*, bool, bool);
-		REL::Relocation<func_t> func{ REL::ID(434460) };
+		static REL::Relocation<func_t> func{ ID::AIProcess::StopCurrentIdle };
 		return func(a_process, a_actor, a_instant, a_killFlavor);
 	}
 }
@@ -422,20 +283,18 @@ static bool StopEmptyFireAnimation(RE::PlayerCharacter* a_player, const char* a_
 static void ForceGraphBaseStateReset(RE::PlayerCharacter* a_player);
 
 // ============================================================
-// BSSoundHandle::FadeOutAndRelease — Pre-NG REL::ID(260328).
+// BSSoundHandle::FadeOutAndRelease.
 // Used to fade out and release a looping fire sound that the
 // engine starts via BSAudioManager but whose stop annotation
 // never fires (because our QueueWeaponFire bypasses the proper
 // attack state machine).  Pre-NG version of CommonLibF4 in this
-// project doesn't expose the method, so we declare it locally.
+// CommonLib maps the method for every supported runtime.
 // ============================================================
 namespace LocalSound
 {
 	inline bool FadeOutAndRelease(RE::BSSoundHandle& a_handle, std::uint16_t a_milliseconds)
 	{
-		using func_t = bool (RE::BSSoundHandle::*)(std::uint16_t);
-		REL::Relocation<func_t> func{ REL::ID(260328) };
-		return func(&a_handle, a_milliseconds);
+		return a_handle.FadeOutAndRelease(a_milliseconds);
 	}
 
 	// Fades out every sound handle owned by the player's currently equipped
@@ -489,13 +348,9 @@ namespace LocalSound
 // are accepted by the graph — clear them whenever we repair visibility.
 //
 // NotifyAnimationGraphImpl() feeds Havok / the behavior graph directly.
-// It does NOT reliably fan out through BSTEventSource<BSAnimationGraphEvent>,
-// so registered BSTEventSinks (F4SE plugins, OAR, etc.) never see those
-// events.  Clip-driven annotations do hit that path.  After each batch of
-// NotifyAnimationGraphImpl calls we therefore synthesize BSAnimationGraphEvent
-// and call BSTEventSource::Notify on every source returned by
-// BGSAnimationSystemUtils::GetEventSourcePointersFromGraph (same sources
-// FPGunplayOverhaul's AnimEventSink registers on).
+// The plugin's own annotation tracking is routed through the player's
+// ProcessEvent hook below, avoiding a separate runtime-specific graph
+// event-source lookup.
 // ============================================================
 static void ClearEngineWeaponCullFlags(RE::Actor* a_actor)
 {
@@ -507,23 +362,9 @@ static void ClearEngineWeaponCullFlags(RE::Actor* a_actor)
 	mh->weaponCullCounter  = 0;
 }
 
-// Sends all UncullBone events as an ordered batch, then a_triggerEvent (if non-null).
-//
-//   Phase 1 — NotifyAnimationGraphImpl (Havok / behavior graph):
-//             UncullBone × 13  →  a_triggerEvent
-//   Phase 2 — BSTEventSource::Notify (F4SE plugin sinks, AnimationEventLog…):
-//             UncullBone × 13  →  a_triggerEvent
-//
-// This mirrors how a native HKX clip annotation batch works: the graph sees
-// every event before any BSTEventSink observer does.  UncullBone events are
-// placed before a_triggerEvent in both phases so the reload sub-graph can
-// accept them while still active — prior to the state-transition event.
-//
-// CRASH NOTE: BSFixedString{} default-constructs with _data = nullptr.
-// AnimationEventLog.dll and ActorMediator::ProcessEvent both call
-// argument.c_str() which then crashes on the null ptr.  Always pass
-// BSFixedString{""} for the argument field (interns the empty string,
-// guarantees a valid non-null _data pointer).
+// Sends all UncullBone events as an ordered batch, then a_triggerEvent (if
+// non-null). UncullBone events are placed first so the reload sub-graph can
+// accept them while it is still active, before the transition event.
 //
 // Returns the NotifyAnimationGraphImpl result for a_triggerEvent
 // (false when a_triggerEvent is nullptr).
@@ -553,38 +394,12 @@ static bool SendUncullBatch(RE::PlayerCharacter* a_player,
 		"UncullBone.WeaponOptics2",
 	};
 
-	// Phase 1: Havok / behavior graph
 	for (const auto& evt : kUnCullEvents) {
 		a_player->NotifyAnimationGraphImpl(evt);
 	}
 	bool triggerResult = false;
 	if (a_triggerEvent) {
 		triggerResult = a_player->NotifyAnimationGraphImpl(*a_triggerEvent);
-	}
-
-	// Phase 2: BSTEventSource sinks (same event order as Phase 1)
-	auto* refr = static_cast<RE::TESObjectREFR*>(a_player);
-	RE::BSScrapArray<RE::BSTEventSource<RE::BSAnimationGraphEvent>*> sources;
-	if (!RE::BGSAnimationSystemUtils::GetEventSourcePointersFromGraph(a_player, sources)) {
-		return triggerResult;
-	}
-	const RE::BSFixedString emptyArg{ "" };
-	for (auto* src : sources) {
-		if (!src) continue;
-		for (const auto& evt : kUnCullEvents) {
-			RE::BSAnimationGraphEvent ge{};
-			ge.refr      = refr;
-			ge.animEvent = evt;
-			ge.argument  = emptyArg;
-			src->Notify(ge);
-		}
-		if (a_triggerEvent) {
-			RE::BSAnimationGraphEvent ge{};
-			ge.refr      = refr;
-			ge.animEvent = *a_triggerEvent;
-			ge.argument  = emptyArg;
-			src->Notify(ge);
-		}
 	}
 
 	return triggerResult;
@@ -705,18 +520,6 @@ namespace EquippedWeapon
 		return false;
 	}
 }
-
-// ============================================================
-// BSAnimationGraphManager — minimal definition for
-// BSTSmartPointer ref-counting (BSIntrusiveRefCounted).
-// ============================================================
-class RE::BSAnimationGraphManager :
-	public RE::BSTEventSink<RE::BSAnimationGraphEvent>,
-	public RE::BSIntrusiveRefCounted
-{
-public:
-	char _pad[0xD0];
-};
 
 // ============================================================
 // Direct Havok variable access — bypasses the broken
@@ -1002,8 +805,7 @@ static bool StopEmptyFireAnimation(RE::PlayerCharacter* a_player, const char* a_
 
 	bool resetRan = false;
 	if (auto* resetAction = RE::BGSAnimationSystemUtils::GetDefaultObjectForActionInitializeToBaseState()) {
-		RE::TESActionData action(RE::ActionInput::ACTIONPRIORITY::kTry, a_player, resetAction);
-		resetRan = RE::BGSAnimationSystemUtils::RunActionOnActor(a_player, action);
+		resetRan = a_player->PerformAction(resetAction, nullptr);
 	} else {
 		logger::warn("[FireOnEmpty] InitializeToBaseState default object missing");
 	}
@@ -1152,10 +954,10 @@ namespace BashBlend
 		RE::NiMatrix3 r;
 		for (int i = 0; i < 3; ++i)
 			for (int j = 0; j < 3; ++j)
-				r.entry[i].pt[j] =
-					a.entry[i].pt[0] * b.entry[0].pt[j] +
-					a.entry[i].pt[1] * b.entry[1].pt[j] +
-					a.entry[i].pt[2] * b.entry[2].pt[j];
+				r.entry[i][j] =
+					a.entry[i][0] * b.entry[0][j] +
+					a.entry[i][1] * b.entry[1][j] +
+					a.entry[i][2] * b.entry[2][j];
 		return r;
 	}
 
@@ -1164,16 +966,16 @@ namespace BashBlend
 		RE::NiMatrix3 r;
 		for (int i = 0; i < 3; ++i)
 			for (int j = 0; j < 3; ++j)
-				r.entry[i].pt[j] = a.entry[j].pt[i];
+				r.entry[i][j] = a.entry[j][i];
 		return r;
 	}
 
 	static RE::NiPoint3 MulP(const RE::NiMatrix3& m, const RE::NiPoint3& p)
 	{
 		return {
-			m.entry[0].pt[0] * p.x + m.entry[0].pt[1] * p.y + m.entry[0].pt[2] * p.z,
-			m.entry[1].pt[0] * p.x + m.entry[1].pt[1] * p.y + m.entry[1].pt[2] * p.z,
-			m.entry[2].pt[0] * p.x + m.entry[2].pt[1] * p.y + m.entry[2].pt[2] * p.z
+			m.entry[0][0] * p.x + m.entry[0][1] * p.y + m.entry[0][2] * p.z,
+			m.entry[1][0] * p.x + m.entry[1][1] * p.y + m.entry[1][2] * p.z,
+			m.entry[2][0] * p.x + m.entry[2][1] * p.y + m.entry[2][2] * p.z
 		};
 	}
 
@@ -1187,15 +989,15 @@ namespace BashBlend
 		const float x = a_axis.x, y = a_axis.y, z = a_axis.z;
 
 		RE::NiMatrix3 r;
-		r.entry[0].pt[0] = t * x * x + c;
-		r.entry[0].pt[1] = t * x * y - s * z;
-		r.entry[0].pt[2] = t * x * z + s * y;
-		r.entry[1].pt[0] = t * x * y + s * z;
-		r.entry[1].pt[1] = t * y * y + c;
-		r.entry[1].pt[2] = t * y * z - s * x;
-		r.entry[2].pt[0] = t * x * z - s * y;
-		r.entry[2].pt[1] = t * y * z + s * x;
-		r.entry[2].pt[2] = t * z * z + c;
+		r.entry[0][0] = t * x * x + c;
+		r.entry[0][1] = t * x * y - s * z;
+		r.entry[0][2] = t * x * z + s * y;
+		r.entry[1][0] = t * x * y + s * z;
+		r.entry[1][1] = t * y * y + c;
+		r.entry[1][2] = t * y * z - s * x;
+		r.entry[2][0] = t * x * z - s * y;
+		r.entry[2][1] = t * y * z + s * x;
+		r.entry[2][2] = t * z * z + c;
 		return r;
 	}
 
@@ -1219,9 +1021,9 @@ namespace BashBlend
 		while (node && node != a_top) {
 			// prepend node->local:  chain = local ∘ chain
 			pos = {
-				node->local.translate.x + (node->local.rotate.entry[0].pt[0] * pos.x + node->local.rotate.entry[0].pt[1] * pos.y + node->local.rotate.entry[0].pt[2] * pos.z),
-				node->local.translate.y + (node->local.rotate.entry[1].pt[0] * pos.x + node->local.rotate.entry[1].pt[1] * pos.y + node->local.rotate.entry[1].pt[2] * pos.z),
-				node->local.translate.z + (node->local.rotate.entry[2].pt[0] * pos.x + node->local.rotate.entry[2].pt[1] * pos.y + node->local.rotate.entry[2].pt[2] * pos.z)
+				node->local.translate.x + (node->local.rotate.entry[0][0] * pos.x + node->local.rotate.entry[0][1] * pos.y + node->local.rotate.entry[0][2] * pos.z),
+				node->local.translate.y + (node->local.rotate.entry[1][0] * pos.x + node->local.rotate.entry[1][1] * pos.y + node->local.rotate.entry[1][2] * pos.z),
+				node->local.translate.z + (node->local.rotate.entry[2][0] * pos.x + node->local.rotate.entry[2][1] * pos.y + node->local.rotate.entry[2][2] * pos.z)
 			};
 			rot = Mul(node->local.rotate, rot);
 			node = node->parent;
@@ -1453,7 +1255,7 @@ namespace BashBlend
 		const RE::NiPoint3 dP{ capPosW.x - animPos.x, capPosW.y - animPos.y, capPosW.z - animPos.z };
 		const RE::NiMatrix3 dR = Mul(capRotW, Transpose(animRot));
 		const float mag = std::sqrt(dP.x * dP.x + dP.y * dP.y + dP.z * dP.z);
-		const float trace = dR.entry[0].pt[0] + dR.entry[1].pt[1] + dR.entry[2].pt[2];
+		const float trace = dR.entry[0][0] + dR.entry[1][1] + dR.entry[2][2];
 		const float cosAng = std::clamp((trace - 1.0f) * 0.5f, -1.0f, 1.0f);
 
 		// Pathological gap (bone re-parented, cell transition mid blend):
@@ -1482,9 +1284,9 @@ namespace BashBlend
 		// bail above keeps sin(angle) well away from zero at large angles).
 		const float angle = std::acos(cosAng);
 		RE::NiPoint3 axis{
-			dR.entry[2].pt[1] - dR.entry[1].pt[2],
-			dR.entry[0].pt[2] - dR.entry[2].pt[0],
-			dR.entry[1].pt[0] - dR.entry[0].pt[1]
+			dR.entry[2][1] - dR.entry[1][2],
+			dR.entry[0][2] - dR.entry[2][0],
+			dR.entry[1][0] - dR.entry[0][1]
 		};
 		const float axisLen = std::sqrt(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
 		RE::NiMatrix3 dRotW;
@@ -1579,8 +1381,7 @@ static bool TriggerGunBashAction(RE::PlayerCharacter* a_player)
 
 	// -- attempt 1: direct request (works when the graph is already idle) --
 	{
-		RE::TESActionData action(RE::ActionInput::ACTIONPRIORITY::kTry, a_player, meleeAction);
-		if (RE::BGSAnimationSystemUtils::RunActionOnActor(a_player, action)) {
+		if (a_player->PerformAction(meleeAction, nullptr)) {
 			logger::info("[GunBash] Follow-up bash via kActionMelee, no interrupt needed (meleeState={})",
 				meleeStateBefore);
 			return true;
@@ -1604,8 +1405,7 @@ static bool TriggerGunBashAction(RE::PlayerCharacter* a_player)
 
 	bool resetRan = false;
 	if (auto* resetAction = RE::BGSAnimationSystemUtils::GetDefaultObjectForActionInitializeToBaseState()) {
-		RE::TESActionData reset(RE::ActionInput::ACTIONPRIORITY::kTry, a_player, resetAction);
-		resetRan = RE::BGSAnimationSystemUtils::RunActionOnActor(a_player, reset);
+		resetRan = a_player->PerformAction(resetAction, nullptr);
 	}
 
 	// Fast-forward the reset's mandatory re-draw so the follow-up bash can
@@ -1616,8 +1416,7 @@ static bool TriggerGunBashAction(RE::PlayerCharacter* a_player)
 	g_suppressEquipSounds.store(false, std::memory_order_relaxed);
 
 	{
-		RE::TESActionData action(RE::ActionInput::ACTIONPRIORITY::kTry, a_player, meleeAction);
-		if (RE::BGSAnimationSystemUtils::RunActionOnActor(a_player, action)) {
+		if (a_player->PerformAction(meleeAction, nullptr)) {
 			logger::info("[GunBash] Follow-up bash via kActionMelee after graph reset (resetRan={}, meleeState {}->{})",
 				resetRan, meleeStateBefore, static_cast<std::uint32_t>(a_player->meleeAttackState));
 			BashBlend::ArmAfterReset(Settings::GetSingleton()->bashComboBlendTime);
@@ -1654,9 +1453,7 @@ static void ForceGraphBaseStateReset(RE::PlayerCharacter* a_player)
 		return;
 	}
 
-	// kTry priority mirrors NAF's SmartIdle stop path exactly.
-	RE::TESActionData action(RE::ActionInput::ACTIONPRIORITY::kTry, a_player, resetAction);
-	const bool ran = RE::BGSAnimationSystemUtils::RunActionOnActor(a_player, action);
+	const bool ran = a_player->PerformAction(resetAction, nullptr);
 
 	static const RE::BSFixedString kEvtAttackStop{ "attackStop" };
 	a_player->NotifyAnimationGraphImpl(kEvtAttackStop);
@@ -2014,73 +1811,73 @@ RE::BSEventNotifyControl Inertia::AnimEventSink::ProcessEvent(
 	// so we drop it at the sink.  Every downstream consumer of
 	// `firedThisFrame` already gates on these same values, but filtering at
 	// the source means we also stop polluting the trace log.
-	const bool isWeaponFire = (a_event.animEvent == "weaponFire" || a_event.animEvent == "WeaponFire");
+	const bool isWeaponFire = (a_event.tag == "weaponFire" || a_event.tag == "WeaponFire");
 	if (isWeaponFire && !GunStateLocal::IsFiringGunState(gs)) {
 		// Drop entirely — no log spam, no firedThisFrame.
 		return RE::BSEventNotifyControl::kContinue;
 	}
 
-	const char* arg = a_event.argument.c_str();
+	const char* arg = a_event.payload.c_str();
 	if (arg && arg[0])
-		logger::trace("[AnimEvent] {} arg=\"{}\" gunState={}", a_event.animEvent.c_str(), arg, gs);
+		logger::trace("[AnimEvent] {} arg=\"{}\" gunState={}", a_event.tag.c_str(), arg, gs);
 	else
-		logger::trace("[AnimEvent] {} gunState={}", a_event.animEvent.c_str(), gs);
+		logger::trace("[AnimEvent] {} gunState={}", a_event.tag.c_str(), gs);
 
 	if (isWeaponFire) {
 		firedThisFrame.store(true, std::memory_order_relaxed);
 		logger::trace("[AnimEvent] weaponFire");
 	}
-	if (a_event.animEvent == "reloadComplete" || a_event.animEvent == "ReloadComplete" ||
-	    a_event.animEvent == "reloadStart"    || a_event.animEvent == "ReloadStart") {
+	if (a_event.tag == "reloadComplete" || a_event.tag == "ReloadComplete" ||
+	    a_event.tag == "reloadStart"    || a_event.tag == "ReloadStart") {
 		reloadingThisFrame.store(true, std::memory_order_relaxed);
 	}
-	if (a_event.animEvent == "reloadStart" || a_event.animEvent == "ReloadStart" ||
-	    a_event.animEvent == "reloadStateEnter") {
+	if (a_event.tag == "reloadStart" || a_event.tag == "ReloadStart" ||
+	    a_event.tag == "reloadStateEnter") {
 		reloadStartThisFrame.store(true, std::memory_order_relaxed);
-		logger::trace("[AnimEvent] reloadStart (event={})", a_event.animEvent.c_str());
+		logger::trace("[AnimEvent] reloadStart (event={})", a_event.tag.c_str());
 	}
-	if (a_event.animEvent == "reloadEnd" || a_event.animEvent == "ReloadEnd" ||
-	    a_event.animEvent == "reloadStateExit") {
+	if (a_event.tag == "reloadEnd" || a_event.tag == "ReloadEnd" ||
+	    a_event.tag == "reloadStateExit") {
 		reloadEndThisFrame.store(true, std::memory_order_relaxed);
-		logger::trace("[AnimEvent] reloadEnd (event={})", a_event.animEvent.c_str());
+		logger::trace("[AnimEvent] reloadEnd (event={})", a_event.tag.c_str());
 	}
-	if (a_event.animEvent == "reloadComplete" || a_event.animEvent == "ReloadComplete") {
+	if (a_event.tag == "reloadComplete" || a_event.tag == "ReloadComplete") {
 		reloadCompleteThisFrame.store(true, std::memory_order_relaxed);
 		logger::trace("[AnimEvent] reloadComplete");
 	}
-	if (a_event.animEvent == "InitiateStart" || a_event.animEvent == "initiateStart") {
+	if (a_event.tag == "InitiateStart" || a_event.tag == "initiateStart") {
 		initiateStartThisFrame.store(true, std::memory_order_relaxed);
 		logger::trace("[AnimEvent] InitiateStart");
 	}
-	if (a_event.animEvent == "weaponSheathe" || a_event.animEvent == "BeginWeaponSheathe") {
+	if (a_event.tag == "weaponSheathe" || a_event.tag == "BeginWeaponSheathe") {
 		sheatheStartedThisFrame.store(true, std::memory_order_relaxed);
-		logger::trace("[AnimEvent] weaponSheathe (event={})", a_event.animEvent.c_str());
+		logger::trace("[AnimEvent] weaponSheathe (event={})", a_event.tag.c_str());
 	}
-	if (a_event.animEvent == "BeginWeaponDraw") {
+	if (a_event.tag == "BeginWeaponDraw") {
 		beginWeaponDrawThisFrame.store(true, std::memory_order_relaxed);
 		logger::trace("[AnimEvent] BeginWeaponDraw");
 	}
-	if (a_event.animEvent == "SightedStateExit") {
+	if (a_event.tag == "SightedStateExit") {
 		sightedExitThisFrame.store(true, std::memory_order_relaxed);
 	}
 	// Repeatable Gun Bash: HitFrame is the engine's own melee-impact
 	// annotation (a HitFrameHandler functor is registered for this exact
 	// name engine-side). Consumed by the bash combo block in Update.
-	if (a_event.animEvent == "HitFrame" || a_event.animEvent == "hitFrame") {
+	if (a_event.tag == "HitFrame" || a_event.tag == "hitFrame") {
 		hitFrameThisFrame.store(true, std::memory_order_relaxed);
 		logger::trace("[AnimEvent] HitFrame (meleeState={})",
 			player ? static_cast<std::uint32_t>(player->meleeAttackState) : 99);
 	}
-	if (a_event.animEvent == "sneakStateEnter" || a_event.animEvent == "sneakStart" ||
-	    a_event.animEvent == "SneakStart" || a_event.animEvent == "tagSneakStart" ||
-	    a_event.animEvent == "tagCrouchStart" || a_event.animEvent == "crouchStart" ||
-	    a_event.animEvent == "tagCrouchEnter") {
+	if (a_event.tag == "sneakStateEnter" || a_event.tag == "sneakStart" ||
+	    a_event.tag == "SneakStart" || a_event.tag == "tagSneakStart" ||
+	    a_event.tag == "tagCrouchStart" || a_event.tag == "crouchStart" ||
+	    a_event.tag == "tagCrouchEnter") {
 		sneakStartedThisFrame.store(true, std::memory_order_relaxed);
 	}
-	if (a_event.animEvent == "sneakStateExit" || a_event.animEvent == "sneakStop" ||
-	    a_event.animEvent == "SneakStop" || a_event.animEvent == "tagSneakStop" ||
-	    a_event.animEvent == "tagCrouchStop" || a_event.animEvent == "crouchStop" ||
-	    a_event.animEvent == "tagCrouchExit") {
+	if (a_event.tag == "sneakStateExit" || a_event.tag == "sneakStop" ||
+	    a_event.tag == "SneakStop" || a_event.tag == "tagSneakStop" ||
+	    a_event.tag == "tagCrouchStop" || a_event.tag == "crouchStop" ||
+	    a_event.tag == "tagCrouchExit") {
 		sneakStoppedThisFrame.store(true, std::memory_order_relaxed);
 	}
 	return RE::BSEventNotifyControl::kContinue;
@@ -2088,33 +1885,23 @@ RE::BSEventNotifyControl Inertia::AnimEventSink::ProcessEvent(
 
 void Inertia::InertiaManager::RegisterAnimEventSink()
 {
-	if (animEventSink.registered) return;
-	auto* player = RE::PlayerCharacter::GetSingleton();
-	if (!player) return;
-
-	RE::BSScrapArray<RE::BSTEventSource<RE::BSAnimationGraphEvent>*> sources;
-	if (RE::BGSAnimationSystemUtils::GetEventSourcePointersFromGraph(player, sources)) {
-		for (auto* src : sources) {
-			if (src) src->RegisterSink(&animEventSink);
-		}
-		animEventSink.registered = true;
-		logger::info("[FPGunplayOverhaul] Registered animation event sink ({} sources)", sources.size());
-	}
+	// FireAnnotationGuard owns the PlayerCharacter ProcessEvent hook and
+	// forwards every graph event here before applying suppression. The
+	// vtable hook survives graph rebuilds, so no per-save registration is
+	// required.
+	animEventSink.registered = true;
 }
 
 void Inertia::InertiaManager::UnregisterAnimEventSink()
 {
-	if (!animEventSink.registered) return;
-	auto* player = RE::PlayerCharacter::GetSingleton();
-	if (!player) return;
-
-	RE::BSScrapArray<RE::BSTEventSource<RE::BSAnimationGraphEvent>*> sources;
-	if (RE::BGSAnimationSystemUtils::GetEventSourcePointersFromGraph(player, sources)) {
-		for (auto* src : sources) {
-			if (src) src->UnregisterSink(&animEventSink);
-		}
-	}
 	animEventSink.registered = false;
+}
+
+void Inertia::InertiaManager::HandleAnimationEvent(
+	const RE::BSAnimationGraphEvent& a_event,
+	RE::BSTEventSource<RE::BSAnimationGraphEvent>* a_source)
+{
+	animEventSink.ProcessEvent(a_event, a_source);
 }
 
 RE::TESBoundObject* Inertia::InertiaManager::GetEquippedWeaponBaseStatic(RE::PlayerCharacter* player)
@@ -2190,11 +1977,11 @@ void Inertia::InertiaManager::FillDebugSnapshot(DebugSnapshot& snap)
 	if (player && player->currentProcess && player->currentProcess->middleHigh &&
 	    player->currentProcess->middleHigh->charController) {
 		auto* cc = player->currentProcess->middleHigh->charController.get();
-		auto havokState = cc->context.currentState.underlying();
-		snap.havokCharState = havokState;
+		const auto havokState = cc->context.m_currentState;
+		snap.havokCharState = static_cast<std::int32_t>(havokState);
 		using HkStateType = RE::hknpCharacterState::hknpCharacterStateType;
-		snap.isJumping = (cc->context.currentState.get() == HkStateType::kJumping);
-		snap.isInAir   = (cc->context.currentState.get() == HkStateType::kInAir);
+		snap.isJumping = (havokState == HkStateType::kJumping);
+		snap.isInAir   = (havokState == HkStateType::kInAir);
 		snap.isFalling = snap.isInAir && (cc->fallTime > 0.1f);
 	}
 
@@ -2296,7 +2083,7 @@ bool Inertia::InertiaManager::IsWeaponAutomatic(RE::PlayerCharacter* player) con
 	if (!idata) return false;
 	auto* wid = static_cast<RE::TESObjectWEAP::InstanceData*>(idata);
 	if (!wid) return false;
-	return (wid->flags & kWeapFlag_Automatic) != 0;
+	return wid->flags.any(RE::WEAPON_FLAGS::kAutomatic);
 }
 
 // Check if the equipped weapon has a given keyword (checks base form keywords AND
@@ -2429,7 +2216,7 @@ WeaponType Inertia::InertiaManager::DetectWeaponType(
 	// Check primitive type for melee/unarmed without keywords
 	// weaponData.type is std::int8_t: 0=HandToHand, 1-6=Melee varieties, 14=Thrown
 	if (weapObj) {
-		auto t = static_cast<std::int8_t>(weapObj->weaponData.type);
+		auto t = static_cast<std::int8_t>(weapObj->weaponData.type.get());
 		if (t == 0) { baseType = WeaponType::Unarmed;   goto pa_map; }
 		if (t >= 1 && t <= 6) { baseType = WeaponType::Melee; goto pa_map; }
 		if (t == 14) { baseType = WeaponType::Throwable; goto pa_map; }
@@ -2798,7 +2585,7 @@ namespace SuperSprintInput
 
 	static void HookedSprintHandleButton(void* self, const RE::ButtonEvent* event)
 	{
-		if (s_eatEnabled && event && event->JustPressed()) {
+		if (s_eatEnabled && event && event->QJustPressed()) {
 			// Eat the press — don't let the engine toggle sprint off
 			s_eatTriggered = true;
 			return;
@@ -2896,7 +2683,7 @@ namespace AttackInput
 			const RE::BSFixedString& userEvent = event->QUserEvent();
 			if (userEvent == "PrimaryAttack"sv) {
 				s_fireHeld = (event->value != 0.0f);
-				if (event->JustPressed()) {
+				if (event->QJustPressed()) {
 					logger::trace("[AttackInput] PrimaryAttack pressed");
 				}
 			} else if (userEvent == "SecondaryAttack"sv) {
@@ -2948,7 +2735,6 @@ namespace AttackInput
 		if (!s_originalHandleButton || !pc || !pc->attackHandler) return false;
 
 		RE::ButtonEvent evt{};
-		RE::stl::emplace_vtable(&evt);
 		evt.device       = RE::INPUT_DEVICE::kKeyboard;
 		evt.deviceID     = 0;
 		evt.eventType    = RE::INPUT_EVENT_TYPE::kButton;
@@ -3039,7 +2825,7 @@ namespace MeleeInput
 
 	static void HookedMeleeHandleButton(void* self, const RE::ButtonEvent* event)
 	{
-		if (event && event->QUserEvent() == "Melee"sv && event->JustPressed()) {
+		if (event && event->QUserEvent() == "Melee"sv && event->QJustPressed()) {
 			s_meleePressedEdge = true;
 			logger::trace("[MeleeInput] Melee pressed");
 		}
@@ -3062,7 +2848,6 @@ namespace MeleeInput
 		if (!s_originalHandleButton || !pc || !pc->meleeThrowHandler) return false;
 
 		auto makeEvent = [&](RE::ButtonEvent& a_evt, float a_value, float a_heldSecs) {
-			RE::stl::emplace_vtable(&a_evt);
 			a_evt.device       = RE::INPUT_DEVICE::kKeyboard;
 			a_evt.deviceID     = 0;
 			a_evt.eventType    = RE::INPUT_EVENT_TYPE::kButton;
@@ -3181,12 +2966,17 @@ namespace FireAnnotationGuard
 		const RE::BSAnimationGraphEvent& a_event,
 		RE::BSTEventSource<RE::BSAnimationGraphEvent>* a_source)
 	{
+		// Observe every engine graph event before any suppression decision.
+		// This replaces the runtime-specific graph-source registration
+		// function while preserving the manager's event-driven state.
+		Inertia::InertiaManager::GetSingleton()->HandleAnimationEvent(a_event, a_source);
+
 		// Re-equip SoundPlay from the stop's UpdateAnimation(1000) —
 		// draw/bolt/foley annotations (WPNSCARDrawFoley, BoltBack, …).
 		if (g_suppressEquipSounds.load(std::memory_order_relaxed)) {
-			if (a_event.animEvent == "SoundPlay" || a_event.animEvent == "SoundPlay3D") {
+			if (a_event.tag == "SoundPlay" || a_event.tag == "SoundPlay3D") {
 				logger::info("[FireOnEmpty] Suppressed re-equip {} '{}' (stop fast-forward)",
-					a_event.animEvent.c_str(), a_event.argument.c_str());
+					a_event.tag.c_str(), a_event.payload.c_str());
 				return RE::BSEventNotifyControl::kContinue;
 			}
 		}
@@ -3197,23 +2987,23 @@ namespace FireAnnotationGuard
 		                        s_suppress.load(std::memory_order_relaxed);
 
 		if (suppressWF || suppressAS) {
-			if (suppressWF && (a_event.animEvent == "weaponFire" || a_event.animEvent == "WeaponFire")) {
+			if (suppressWF && (a_event.tag == "weaponFire" || a_event.tag == "WeaponFire")) {
 				// Swallow: the engine's handler never sees the event, so no
 				// discharge. kContinue (not kStop) so OTHER registered sinks
 				// (OAR's log, our own AnimEventSink) still observe it.
 				logger::info("[FireOnEmpty] Suppressed weaponFire annotation (dry-fire window)");
 				return RE::BSEventNotifyControl::kContinue;
 			}
-			if (suppressAS && a_event.animEvent == "attackState") {
+			if (suppressAS && a_event.tag == "attackState") {
 				// Swallow only while the dry-fire idle is in flight — this
 				// is the loop-breaker (attackState Enter → gunState 7 →
 				// isFiring re-sync every frame). Cleared on ADS soft-stop
 				// so SightedRelease can proceed.
 				logger::info("[FireOnEmpty] Suppressed attackState '{}' annotation (dry-fire window)",
-					a_event.argument.c_str());
+					a_event.payload.c_str());
 				return RE::BSEventNotifyControl::kContinue;
 			}
-			if (a_event.animEvent == "IdleStop") {
+			if (a_event.tag == "IdleStop") {
 				// Intentionally NOT calling UpdateAnimation(1000) here.
 				// idlestopfix uses that to hide the post-idle re-draw, but
 				// combined with our former InitializeToBaseState hard-stop
@@ -3375,9 +3165,9 @@ void Inertia::InertiaManager::UpdateImpulseSpring(
 static RE::NiPoint3 MatMulPoint(const RE::NiMatrix3& m, const RE::NiPoint3& p)
 {
 	return {
-		m.entry[0].pt[0] * p.x + m.entry[0].pt[1] * p.y + m.entry[0].pt[2] * p.z,
-		m.entry[1].pt[0] * p.x + m.entry[1].pt[1] * p.y + m.entry[1].pt[2] * p.z,
-		m.entry[2].pt[0] * p.x + m.entry[2].pt[1] * p.y + m.entry[2].pt[2] * p.z
+		m.entry[0][0] * p.x + m.entry[0][1] * p.y + m.entry[0][2] * p.z,
+		m.entry[1][0] * p.x + m.entry[1][1] * p.y + m.entry[1][2] * p.z,
+		m.entry[2][0] * p.x + m.entry[2][1] * p.y + m.entry[2][2] * p.z
 	};
 }
 
@@ -3399,13 +3189,13 @@ void Inertia::InertiaManager::ApplyOffset(
 		float cy = std::cos(ry), sy = std::sin(ry);
 		float cz = std::cos(rz), sz = std::sin(rz);
 
-		rot.entry[0].pt[0] =  cy * cz;  rot.entry[0].pt[1] = -cy * sz;  rot.entry[0].pt[2] =  sy;
-		rot.entry[1].pt[0] =  cx * sz + sx * sy * cz;
-		rot.entry[1].pt[1] =  cx * cz - sx * sy * sz;
-		rot.entry[1].pt[2] = -sx * cy;
-		rot.entry[2].pt[0] =  sx * sz - cx * sy * cz;
-		rot.entry[2].pt[1] =  sx * cz + cx * sy * sz;
-		rot.entry[2].pt[2] =  cx * cy;
+		rot.entry[0][0] =  cy * cz;  rot.entry[0][1] = -cy * sz;  rot.entry[0][2] =  sy;
+		rot.entry[1][0] =  cx * sz + sx * sy * cz;
+		rot.entry[1][1] =  cx * cz - sx * sy * sz;
+		rot.entry[1][2] = -sx * cy;
+		rot.entry[2][0] =  sx * sz - cx * sy * cz;
+		rot.entry[2][1] =  sx * cz + cx * sy * sz;
+		rot.entry[2][2] =  cx * cy;
 	} else {
 		rot.MakeIdentity();
 	}
@@ -4586,7 +4376,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 				auto* weap = base ? base->As<RE::TESObjectWEAP>() : nullptr;
 				auto* ammo = player->GetCurrentAmmo(RE::BGSEquipIndex{ 0 });
 				if (weap) {
-					auto* tqi = TaskQueueInterfaceLocal::GetSingleton();
+					auto* tqi = RE::TaskQueueInterface::GetSingleton();
 					if (tqi) {
 						const std::uint32_t magBefore = curMagAmmo;
 						tqi->QueueWeaponFire(weap, player, RE::BGSEquipIndex{ 0 }, ammo);
@@ -5375,7 +5165,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	if (player->currentProcess && player->currentProcess->middleHigh &&
 	    player->currentProcess->middleHigh->charController) {
 		using HkStateType = RE::hknpCharacterState::hknpCharacterStateType;
-		auto hkState = player->currentProcess->middleHigh->charController->context.currentState.get();
+		auto hkState = player->currentProcess->middleHigh->charController->context.m_currentState;
 		currentlyJumping = (hkState == HkStateType::kJumping);
 		currentlyInAir   = currentlyJumping || (hkState == HkStateType::kInAir);
 	} else {
@@ -5483,7 +5273,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	//   entry[0] = [ cos(θ), 0, sin(θ) ]
 	//   entry[1] = [ 0,      1, 0      ]
 	//   entry[2] = [-sin(θ), 0, cos(θ) ]
-	// So entry[0].v.z == sin(θ) encodes the lean angle.
+	// So entry[0].z == sin(θ) encodes the lean angle.
 	// Pure inertia visual — gated. Lean smoothing state is reset with the
 	// other spring state on the falling edge.
 	if (springsActive) {
@@ -5492,7 +5282,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		if (fpRoot) {
 			auto* camInserted = fpRoot->GetObjectByName("CameraInserted1st");
 			if (camInserted) {
-				const float sinTheta = camInserted->local.rotate.entry[0].v.z;
+				const float sinTheta = camInserted->local.rotate.entry[0].z;
 				rawLeanWeight = std::clamp(sinTheta, -1.0f, 1.0f);
 			}
 		}
@@ -6026,43 +5816,57 @@ void Inertia::InertiaManager::InitSuperSprint()
 // ============================================================
 namespace
 {
-	using RunActorUpdatesFn = void(*)(void*, float, bool);
-	REL::Relocation<std::uintptr_t> ptr_RunActorUpdates{ REL::ID(556439), 0x17 };
-	RunActorUpdatesFn RunActorUpdatesOrig{ nullptr };
-
-	void HookedActorUpdate(void* list, float dt, bool instant)
+	struct PlayerUpdateAnimationHook
 	{
-		if (RunActorUpdatesOrig) RunActorUpdatesOrig(list, dt, instant);
+		static void Thunk(RE::PlayerCharacter* a_player, float a_delta)
+		{
+			Original(a_player, a_delta);
 
-		// The dt parameter at this hook site is always 0.
-		// UneducatedShooter also ignores it and computes its own delta
-		// from the engine time global. We use a high-resolution clock
-		// and then scale by the global time multiplier (set by `sgtm`)
-		// so our spring physics and procedural animations stay in sync
-		// with the game world when slow-motion is active.
-		static auto lastClock = std::chrono::high_resolution_clock::now();
-		auto now = std::chrono::high_resolution_clock::now();
-		float realDelta = std::chrono::duration<float>(now - lastClock).count();
-		lastClock = now;
+			// This plugin deliberately calls UpdateAnimation with large
+			// deltas to fast-forward graph resets. Those calls re-enter this
+			// vfunc, so only the outer gameplay update may run our manager.
+			static thread_local bool updatingPlugin = false;
+			if (updatingPlugin) {
+				return;
+			}
 
-		realDelta = std::clamp(realDelta, 0.0001f, 0.1f);
+			updatingPlugin = true;
 
-		const float gameDelta = realDelta * GetGlobalTimeMult();
+			// Use a high-resolution wall clock, then apply the game's
+			// global time multiplier so springs and procedural effects stay
+			// synchronized with slow motion on every runtime.
+			static auto lastClock = std::chrono::high_resolution_clock::now();
+			const auto now = std::chrono::high_resolution_clock::now();
+			float realDelta = std::chrono::duration<float>(now - lastClock).count();
+			lastClock = now;
+			realDelta = std::clamp(realDelta, 0.0001f, 0.1f);
 
-		Inertia::InertiaManager::GetSingleton()->Update(gameDelta, realDelta);
-	}
+			const float gameDelta = realDelta * GetGlobalTimeMult();
+			Inertia::InertiaManager::GetSingleton()->Update(gameDelta, realDelta);
+
+			updatingPlugin = false;
+		}
+
+		static void Install()
+		{
+			// PlayerCharacter::UpdateAnimation is vtable slot 0x9F on all
+			// three supported layouts. CommonLib's PlayerCharacter vtable
+			// relocation supplies the runtime-specific address.
+			REL::Relocation<std::uintptr_t> vtable{ RE::VTABLE::PlayerCharacter[0] };
+			Original = vtable.write_vfunc(0x9F, Thunk);
+		}
+
+		inline static REL::Relocation<decltype(Thunk)> Original;
+	};
 }
 
 void Inertia::Install()
 {
-	auto& trampoline = F4SE::GetTrampoline();
-	RunActorUpdatesOrig = reinterpret_cast<RunActorUpdatesFn>(
-		trampoline.write_call<5>(ptr_RunActorUpdates.address(), &HookedActorUpdate));
-
-	logger::info("[FPGunplayOverhaul] Hooks installed: RunActorUpdates @ REL::ID(556439)+0x17");
+	PlayerUpdateAnimationHook::Install();
+	logger::info("[FPGunplayOverhaul] Hook installed: PlayerCharacter::UpdateAnimation vfunc 0x9F");
 
 	// Validate global time multiplier access (sgtm). At startup it should
-	// be 1.0; if we read something wildly different, the REL::ID is wrong.
+	// be 1.0; a wildly different value indicates a runtime mapping issue.
 	float initSgtm = GetGlobalTimeMult();
 	logger::info("[FPGunplayOverhaul] Global time multiplier (sgtm) at init: {:.4f}", initSgtm);
 }

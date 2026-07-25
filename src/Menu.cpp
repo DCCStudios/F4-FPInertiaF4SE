@@ -1005,7 +1005,7 @@ namespace Menu
 									detected = presets->GetWeaponTypeOverride(equippedWeaponID);
 								} else {
 									// F4: weaponData.type int8_t: 0=HandToHand, 1-6=Melee, 14=Thrown
-									auto t = static_cast<std::int8_t>(weap->weaponData.type);
+									auto t = static_cast<std::int8_t>(weap->weaponData.type.get());
 									if (t == 0)                      detected = WeaponType::Unarmed;
 									else if (t >= 1 && t <= 6)       detected = WeaponType::Melee;
 									else if (t == 14)                detected = WeaponType::Throwable;
