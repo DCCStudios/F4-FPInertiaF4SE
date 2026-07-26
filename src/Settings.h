@@ -439,6 +439,11 @@ public:
 	// Debug settings
 	bool debugLogging{ false };
 	bool debugOnScreen{ false };
+	// Diagnostic: run all inertia logic but force the inserted node to
+	// identity (no skeleton writes), and emit 1 Hz rig telemetry. Used to
+	// isolate whether FP rig corruption comes from our writes or from
+	// elsewhere (INI-only, no menu UI).
+	bool debugDisableNodeWrites{ false };
 
 	// === AUTO-FIRE SOUND FADE-OUT ===
 	// When the phantom-fire override exits (player releases trigger, safety

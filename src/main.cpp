@@ -22,6 +22,7 @@ namespace Plugin
 namespace
 {
 	std::atomic<bool> g_pluginEnabled{ true };
+	bool g_fovSliderListenerRegistered{ false };
 
 	void DisableWithError(std::string_view title, std::string_view body)
 	{
@@ -76,6 +77,18 @@ namespace
 			// Every F4SE plugin has returned from Load at this point, so the
 			// framework module is available regardless of plugins.txt order.
 			Menu::Register();
+
+			// F4SE's messaging API requires the requested sender to be loaded.
+			// Registering for FOV Slider from our Load function can run first
+			// and makes AE F4SE fail-fast while looking up that sender.
+			if (!g_fovSliderListenerRegistered) {
+				if (auto* messaging = F4SE::GetMessagingInterface();
+					messaging && messaging->RegisterListener(MessageCallback, "FOVSliderF4SE")) {
+					g_fovSliderListenerRegistered = true;
+				} else {
+					logger::warn("[FPGunplayOverhaul] FOVSliderF4SE listener unavailable (cross-plugin refresh disabled)");
+				}
+			}
 			break;
 
 		case F4SE::MessagingInterface::kGameDataReady:
@@ -170,15 +183,6 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* F4S
 	if (!messaging || !messaging->RegisterListener(MessageCallback)) {
 		logger::critical("[FPGunplayOverhaul] Failed to register messaging listener");
 		return false;
-	}
-	// Second registration for cross-plugin messages from FOV Slider F4SE.
-	// F4SE's RegisterListener filters by SENDER plugin name; the default
-	// listener above only sees messages whose sender is "F4SE" (the
-	// kGameDataReady / kPostLoadGame stream). To receive our 'FSRF' refresh
-	// from FOV Slider F4SE we register a second listener targeting that
-	// plugin's name as the sender filter.
-	if (!messaging->RegisterListener(MessageCallback, "FOVSliderF4SE")) {
-		logger::warn("[FPGunplayOverhaul] Failed to register FOVSliderF4SE message listener (cross-plugin refresh disabled)");
 	}
 
 	logger::info("[FPGunplayOverhaul] Plugin loaded, waiting for kGameDataReady");

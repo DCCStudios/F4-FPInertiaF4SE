@@ -4,6 +4,7 @@
 #include "FireOnEmpty.h"
 #include "ContextualLean.h"
 #include "OpenAnimationReplacerAPI-Clips.h"
+#include "SyntheticInput.h"
 
 // ============================================================
 // Static members
@@ -73,8 +74,11 @@ namespace RE
 		// a graph after custom animations (SmartIdle.h), which is the
 		// proven precedent; here it is the last-resort unstick for a
 		// dry-fire attack state that ignored every stop stimulus.
-		// IDs verified against the installed OG, NG, and AE Address
-		// Library databases. NG and AE intentionally share the post-OG ID.
+		// Address Library RVAs and function bodies were verified against
+		// unpacked 1.10.163, 1.10.984, and 1.11.221 executables. The AE
+		// public symbols independently identify the same function, and an
+		// AE dry-fire session confirmed PerformAction returned true.
+		// NG and AE intentionally share the post-OG ID.
 		inline BGSAction* GetDefaultObjectForActionInitializeToBaseState()
 		{
 			using func_t = decltype(&GetDefaultObjectForActionInitializeToBaseState);
@@ -442,6 +446,15 @@ namespace GunStateLocal
 	inline bool IsFiringGunState(std::uint32_t gs) noexcept
 	{
 		return gs == kFire || gs == kFireSighted;
+	}
+
+	// Dear-Modding exposes gunState as GUN_STATE : int32_t in a 4-bit
+	// field. Values with bit 3 set (kFireSighted = 8) sign-extend to
+	// 0xFFFFFFF8 when cast to uint32_t. Always mask to the live nibble.
+	inline std::uint32_t Read(const RE::Actor* a_actor) noexcept
+	{
+		if (!a_actor) return 99;
+		return static_cast<std::uint32_t>(a_actor->gunState) & 0xFu;
 	}
 }
 
@@ -814,7 +827,7 @@ static bool StopEmptyFireAnimation(RE::PlayerCharacter* a_player, const char* a_
 	a_player->UpdateAnimation(1000.0f);
 	g_suppressEquipSounds.store(false, std::memory_order_relaxed);
 
-	const auto gsAfter = static_cast<std::uint32_t>(a_player->gunState);
+	const auto gsAfter = GunStateLocal::Read(a_player);
 	logger::info("[FireOnEmpty] Stopped dry-fire ({}) hard-stop baseStateReset={} + fast-forward (gs={})",
 		a_reason, resetRan, gsAfter);
 	return resetRan;
@@ -876,65 +889,116 @@ namespace MeleeInput
 // skinned wrist/forearm visibly stretched between the displaced hand
 // and the un-displaced elbow during larger corrections.
 //
-// V3 (this version — GunMover's aesthetic): GunMover never corrects a
-// single joint; it shifts the WHOLE viewmodel rigidly (the a_loc
-// anchor in Set1stPersonCameraLocation + the 1st-person camera node's
-// world rotation), which is why its offsets blend in and out of any
-// animation with zero distortion. The node-space equivalent: the
-// blend bone (FPBashBlendNode) is inserted above the SPINE anchor
-// (Spine2 — the subtree carrying both arms and the weapon, the same
-// one the inertia sway moves), and each frame its local transform is
-// SOLVED so the HAND's world pose lands exactly on the blend path:
+// V3 FINDING (2026-07-25, both runtimes): a per-frame CLOSED-LOOP
+// solve (re-measure the live pose every frame, lerp toward the
+// capture, write the bone) is impossible on this rig, for two
+// reasons proven in logs:
+//   a) NiAVObject::local of engine bones is the static bind pose
+//      (see ChainFromWorlds) — composing locals measures a phantom
+//      pose that never moves;
+//   b) the `world` fields of PLUGIN-INSERTED nodes are NOT
+//      maintained by the engine either. Reading hand->world (which
+//      DOES reflect our written offset) while bone->world stays
+//      stale breaks the cancellation the closed loop depends on:
+//      each frame re-measures its own previous write as "animation"
+//      and compounds it. OG 10:48 log: posDelta exploded 194 ->
+//      11857 units within 17ms before the guard tripped — the
+//      "arms broken/stretched" reports on OG and AE both.
 //
-//     target(w) = geodesic-lerp( live animated pose,
-//                                captured pre-reset pose,  w )
+// V4 FINDING (2026-07-25 11:33/11:37, OG) — original reading: even a
+// feed-forward, gated, one-shot write seemed unsafe; the rig stayed
+// PERSISTENTLY stretched after the decay and the identity restore.
 //
-// recomputed EVERY FRAME against the live animation. This is the
-// load-bearing design decision, learned the hard way: the first
-// implementation measured the pose delta ONCE (right after the
-// reset) and then composed that frozen offset onto the animation
-// while it kept swinging. Adding a stale ~90-degree offset to a fast
-// moving pose lands on orientations that belong to NEITHER endpoint
-// — the "blend looks completely random" report (2026-07-22 17:38).
-// With the lerp target recomputed per frame, the visible pose is
-// always BETWEEN the old on-screen pose (w=1) and the current
-// animation frame (w=0): it starts exactly where the screen was and
-// converges onto the moving swing — a real visual lerp into the
-// next bash. The whole upper body moves rigidly (no wrist stretch —
-// the seam is the spine junction, off-screen in first person), and
-// the solve collapses to the identity exactly at w=0. Correct
-// regardless of the inertia pivot setting, of inertia being enabled
-// at all, and of FPInertia_Node sitting anywhere above or below —
-// the chain from our bone down to the hand is composed live.
+// CORRECTED SAME DAY (14:0x, AE telemetry): the corruption was never
+// the write magnitude. The vendored Dear-Modding CommonLib shipped
+// NiMatrix3::IDENTITY with all three rows = IDENTITY0 — a singular
+// rank-1 matrix — and NiTransform::MakeIdentity() assigns exactly
+// that constant. Every blend version's bone insertion and cleanup
+// path (`local.MakeIdentity()`) therefore wrote a matrix that
+// collapses the subtree onto a line (RigDiag log: constant 90-deg
+// local, spine and hand converging to the SAME point, then NaN).
+// That is why the damage appeared exactly when a blend ran and
+// "persisted" after it: the restore itself was the poison. The
+// header is fixed (see lib/.../NiMatrix3.h); inertia sway was never
+// affected because ApplyOffset builds its matrix with the correct
+// NiMatrix3::MakeIdentity() and explicit elements.
 //
-// This also masks the trigger frame itself: the skeleton shows the
-// fast-forwarded weapon-DRAW pose there (the InitializeToBaseState
-// re-draw; ~34 units / ~134 deg from the captured pose in testing),
-// and at w~1 the lerp pulls the hand back onto the captured pose,
-// hiding the one-frame draw flash that used to slip through.
+// V5 (this version): the blend is MEASUREMENT-ONLY. The phase machine
+// still captures, gates, and solves the would-be offset — and logs it
+// — but never inserts the bone and never writes the skeleton. This is
+// the runtime behavior of the last known-good OG build (11e0e19),
+// whose 60-unit guard rejected every blend before writing (its
+// "animation" endpoint was measured against a never-updated inserted
+// bone world, i.e. the world origin — thousands of units away), which
+// is exactly why that build never broke arms. The combo mechanic
+// itself needs no writes; the reset snap shows raw, masked only by
+// the new bash starting the same frame.
 //
-// Flow: 1. CaptureBeforeReset (visible hand pose, FP-root frame —
-// the root is placed from the camera, not animated by the bash, so
-// it is stable across the reset; "visible" includes any residual
-// offset from a still-decaying previous blend, so chained combos
-// hand over without a pop)  2. ArmAfterReset starts the decay clock
-// 3. Apply re-solves the bone local every frame until it expires.
+// The V4 design below is kept intact behind kWritesEnabled so a
+// future in-game A/B (with a save to burn) can re-attempt masking
+// with hard clamps; do NOT re-enable without reading the findings
+// above.
+//
+//   1. CaptureBeforeReset — visible hand pose in the FP-root frame
+//      (world transforms; includes any still-decaying previous
+//      blend, so chained combos hand over without a pop).
+//   2. ArmAfterReset — restore the blend bone to identity (so later
+//      reads are uncontaminated) and enter a MEASURING phase.
+//   3. Measuring (a few frames of budget): each frame, read the live
+//      hand pose from engine-maintained worlds only, and gate it:
+//        - identical to the capture => the world pass has not
+//          consumed the graph reset yet (trigger-frame reads are one
+//          frame stale) — wait;
+//        - outside a plausible viewmodel box, or absurdly far from
+//          the capture => the UpdateAnimation(1000) fast-forward
+//          transient (logged poses 138 units right / 11572 units
+//          below root) — wait;
+//        - sane => lock the offset: solve the bone local B0 that
+//          would put the hand back on the captured pose, using ONLY
+//          trusted transforms (the spine anchor's world, the hand's
+//          world, the FP root's world, and the anchor's constant
+//          bind-pose local for the conjugation into bone space).
+//      Budget exhausted => no blend this combo (raw snap, safe).
+//   4. Decaying: bone->local = B0 scaled by w = (t/T)^2 (axis-angle
+//      rotation geodesically scaled, translation linearly), reaching
+//      the identity exactly at w=0. NO world reads in this phase —
+//      write-only, exactly like the inertia sway that has moved this
+//      same subtree correctly for weeks.
+//
+// The offset rides on top of the new bash swing instead of pinning
+// the hand to an exact lerp path; that is GunMover's aesthetic and
+// the price of feed-forward. The earlier "blend looks completely
+// random" report against a frozen offset (2026-07-22) was caused by
+// the bind-pose measurement bug (a), not by the frozen-offset design.
 //
 // All state is main-thread only (poked from Update and from
 // TriggerGunBashAction, which Update calls).
 // ============================================================
 namespace BashBlend
 {
-	// -- capture + active blend --
-	// The captured pose stays live for the whole blend: Apply re-derives
-	// the (capture minus current-animation) delta fresh each frame and
-	// weights it, so there is no frozen offset anywhere. The per-frame
-	// rotation delta is taken as AXIS-ANGLE and the angle scaled by w —
-	// the exact geodesic (shortest-arc) between the two orientations.
+	// -- phase machine --
+	// kIdle -> (trigger) kMeasuring -> (sane pose found) kDecaying -> kIdle
+	enum class Phase { kIdle, kMeasuring, kDecaying };
+	static Phase s_phase = Phase::kIdle;
+	static int   s_measureBudget = 0;  // frames left to find a sane post-reset pose
+
+	// Master write switch — see V5 in the namespace comment. false =
+	// measure, solve, and log the would-be offset, but NEVER touch the
+	// skeleton (no bone insertion, no local writes). Large one-shot
+	// spine offsets persistently corrupt the FP rig (2026-07-25 logs).
+	static constexpr bool kWritesEnabled = false;
+
+	// -- capture (world-derived, FP-root frame) --
 	static bool          s_captureValid = false;  // s_capPos/s_capRot hold a usable pose
 	static RE::NiPoint3  s_capPos{};              // hand position, FP-root frame (before reset)
 	static RE::NiMatrix3 s_capRot;                // hand orientation, FP-root frame (before reset)
-	static float         s_timer    = 0.0f;       // counts down from s_duration
+
+	// -- locked offset (bone-local), written feed-forward during decay --
+	static RE::NiPoint3  s_lockAxis{ 0.0f, 0.0f, 1.0f };  // unit rotation axis of B0
+	static float         s_lockAngle = 0.0f;              // radians; 0 => position-only
+	static RE::NiPoint3  s_lockTrans{};                   // B0 translation
+
+	static float         s_timer    = 0.0f;       // decay clock, counts down from s_duration
 	static float         s_duration = 0.0f;
 
 	// -- dedicated inserted bone (above the spine anchor) --
@@ -947,6 +1011,7 @@ namespace BashBlend
 	};
 	static RE::NiNode* s_bone      = nullptr;     // cached; revalidated by name each use
 	static bool        s_boneDirty = false;       // bone local holds a non-identity offset
+	static bool        s_diagPending = false;     // log pose diagnostics on the blend's first frame
 
 	// 3x3 helpers — this vendored CommonLibF4's NiMatrix3 has no operators.
 	static RE::NiMatrix3 Mul(const RE::NiMatrix3& a, const RE::NiMatrix3& b)
@@ -989,6 +1054,7 @@ namespace BashBlend
 		const float x = a_axis.x, y = a_axis.y, z = a_axis.z;
 
 		RE::NiMatrix3 r;
+		r.MakeIdentity();
 		r.entry[0][0] = t * x * x + c;
 		r.entry[0][1] = t * x * y - s * z;
 		r.entry[0][2] = t * x * z + s * y;
@@ -1007,32 +1073,39 @@ namespace BashBlend
 		return a_fpRoot ? a_fpRoot->GetObjectByName(kHand) : nullptr;
 	}
 
-	// Compose the local transforms from (exclusive) a_top down to
-	// (inclusive) a_node: the pose of a_node in a_top's frame. Returns
-	// false when a_top is not an ancestor of a_node.
-	static bool ComposeChain(RE::NiAVObject* a_node, RE::NiAVObject* a_top,
+	// Live chain from a_ref (exclusive) down to a_node (inclusive),
+	// extracted from WORLD transforms: K = a_ref.world⁻¹ ∘ a_node.world.
+	//
+	// DO NOT compose NiAVObject::local on the first-person rig. The FP
+	// skeleton is a BSFlattenedBoneTree: the animation system drives the
+	// bones through its flat transform array and writes the results back
+	// to each NiAVObject's WORLD transform only — the `local` fields keep
+	// the nif's static bind pose forever. Verified 2026-07-25 10:08 (AE):
+	// across three combos ~1s apart mid-swing, the local-composed hand
+	// pose froze at (-13.9,-27.0,43.9) in the root frame (waist-height,
+	// behind the root = bind pose) while the engine's hand->world moved
+	// normally. A solver fed those stale locals shoved the spine subtree
+	// ~60 units / ~180 deg — the "arms broken and stretched" report.
+	//
+	// SECOND CONSTRAINT (verified 2026-07-25 10:48, OG): the `world`
+	// fields of PLUGIN-INSERTED nodes are not engine-maintained either
+	// — writes to an inserted node's local visibly move the subtree,
+	// but the node's own world stays stale. So a_ref and a_node must
+	// BOTH be engine bones (or the FP root), and the chain between
+	// them must not contain a plugin node holding a non-identity
+	// local, or the extraction reads back our own offset. In practice:
+	// only measure while the blend bone is at identity.
+	static void ChainFromWorlds(const RE::NiAVObject* a_node, const RE::NiAVObject* a_ref,
 		RE::NiMatrix3& a_outRot, RE::NiPoint3& a_outPos)
 	{
-		RE::NiMatrix3 rot;
-		rot.MakeIdentity();
-		RE::NiPoint3 pos{ 0.0f, 0.0f, 0.0f };
-
-		auto* node = a_node;
-		while (node && node != a_top) {
-			// prepend node->local:  chain = local ∘ chain
-			pos = {
-				node->local.translate.x + (node->local.rotate.entry[0][0] * pos.x + node->local.rotate.entry[0][1] * pos.y + node->local.rotate.entry[0][2] * pos.z),
-				node->local.translate.y + (node->local.rotate.entry[1][0] * pos.x + node->local.rotate.entry[1][1] * pos.y + node->local.rotate.entry[1][2] * pos.z),
-				node->local.translate.z + (node->local.rotate.entry[2][0] * pos.x + node->local.rotate.entry[2][1] * pos.y + node->local.rotate.entry[2][2] * pos.z)
-			};
-			rot = Mul(node->local.rotate, rot);
-			node = node->parent;
-		}
-		if (node != a_top) return false;
-
-		a_outRot = rot;
-		a_outPos = pos;
-		return true;
+		const RE::NiMatrix3 refRotT = Transpose(a_ref->world.rotate);
+		const RE::NiPoint3 rel{
+			a_node->world.translate.x - a_ref->world.translate.x,
+			a_node->world.translate.y - a_ref->world.translate.y,
+			a_node->world.translate.z - a_ref->world.translate.z
+		};
+		a_outRot = Mul(refRotT, a_node->world.rotate);
+		a_outPos = MulP(refRotT, rel);
 	}
 
 	// VISIBLE hand pose (everything applied, including our own bone) in
@@ -1061,11 +1134,15 @@ namespace BashBlend
 	}
 
 	// Abort the blend entirely (bad capture, unloading rig, cell move).
+	// The next Apply's idle branch restores the bone to identity.
 	static void CancelBlend()
 	{
-		s_captureValid = false;
-		s_timer        = 0.0f;
-		s_duration     = 0.0f;
+		s_phase         = Phase::kIdle;
+		s_measureBudget = 0;
+		s_captureValid  = false;
+		s_timer         = 0.0f;
+		s_duration      = 0.0f;
+		s_lockAngle     = 0.0f;
 	}
 
 	// Step 1 — TriggerGunBashAction, right before the graph interrupt.
@@ -1078,16 +1155,28 @@ namespace BashBlend
 	}
 
 	// Step 2 — TriggerGunBashAction, after the reset ran and the
-	// follow-up bash was requested: start the blend immediately. No
-	// delta is measured here — Apply re-derives it fresh every frame
-	// against the live animation (see the namespace comment for why a
-	// frozen one-shot delta produced garbage poses).
+	// follow-up bash was requested: enter the MEASURING phase. The
+	// actual snap delta is locked by Apply on the first frame the
+	// post-reset pose shows up sane in the world transforms (the
+	// trigger frame itself reads one frame stale, and the frame after
+	// can hold the fast-forward transient — see namespace comment).
 	static void ArmAfterReset(float a_blendTime)
 	{
 		if (!s_captureValid) return;
-		s_duration = std::max(a_blendTime, 0.01f);
-		s_timer    = s_duration;
-		logger::info("[GunBash] Blend started — {:.2f}s", s_duration);
+		s_duration      = std::max(a_blendTime, 0.01f);
+		s_timer         = 0.0f;  // decay clock starts at lock, not here
+		s_phase         = Phase::kMeasuring;
+		s_measureBudget = 6;
+		s_diagPending   = true;
+		// A previous combo's blend may still be mid-decay: zero the bone
+		// NOW so measuring reads pure animation. The visible pop lands
+		// on the reset frame, which is chaos anyway (and the capture
+		// already recorded the offset pose, so the new blend still
+		// starts from what was on screen).
+		if (s_boneDirty && s_bone) {
+			s_bone->local.MakeIdentity();
+			s_boneDirty = false;
+		}
 	}
 
 	// Kept for the trigger fallback path: a synthetic tap that failed
@@ -1097,11 +1186,12 @@ namespace BashBlend
 	// Per-frame decay clock (runs from the bash block, before Apply).
 	static void Tick(float a_delta)
 	{
-		if (s_timer > 0.0f) {
+		if (s_phase == Phase::kDecaying && s_timer > 0.0f) {
 			s_timer -= a_delta;
 			if (s_timer <= 0.0f) {
 				s_timer = 0.0f;
-				s_captureValid = false;  // capture consumed
+				s_phase = Phase::kIdle;   // Apply's idle branch restores identity
+				s_captureValid = false;   // capture consumed
 			}
 		}
 	}
@@ -1109,8 +1199,6 @@ namespace BashBlend
 	static void ResetState()
 	{
 		CancelPending();
-		s_timer    = 0.0f;
-		s_duration = 0.0f;
 		// The cached bone may belong to an unloading skeleton; drop the
 		// pointer (Apply revalidates by name) and let s_boneDirty make
 		// the next Apply restore the identity if the rig survives.
@@ -1132,11 +1220,10 @@ namespace BashBlend
 		return nullptr;
 	}
 
-	// Get (or crash-safe insert) the blend bone above the spine anchor.
-	// Same insertion pattern as GetOrInsertInertiaBone: pre-detach the
-	// child via the NiPointer overload so AttachChild reuses the freed
-	// slot without growing the parent's child array.
-	static RE::NiNode* EnsureBone(RE::NiAVObject* a_fpRoot, RE::NiAVObject* a_hand)
+	// Non-mutating lookup: return the blend bone only if it is already
+	// wired into this skeleton with the hand underneath it. Never inserts
+	// and never detaches — safe to call from measurement-only paths.
+	static RE::NiNode* FindExistingBone(RE::NiAVObject* a_fpRoot, RE::NiAVObject* a_hand)
 	{
 		static const RE::BSFixedString kName{ kBashBoneName };
 
@@ -1155,7 +1242,37 @@ namespace BashBlend
 					s_bone = existingNode;
 					return s_bone;
 				}
-				// Structure mismatch — detach the orphan and reinsert.
+			}
+		}
+		return nullptr;
+	}
+
+	// Get (or crash-safe insert) the blend bone above the spine anchor.
+	// Same insertion pattern as GetOrInsertInertiaBone: pre-detach the
+	// child via the NiPointer overload so AttachChild reuses the freed
+	// slot without growing the parent's child array.
+	static RE::NiNode* EnsureBone(RE::NiAVObject* a_fpRoot, RE::NiAVObject* a_hand)
+	{
+		static const RE::BSFixedString kName{ kBashBoneName };
+
+		if (auto* found = FindExistingBone(a_fpRoot, a_hand))
+			return found;
+
+		// A stale node by our name without the hand underneath it is a
+		// structure mismatch (partial skeleton rebuild). Only detach it
+		// when it is CHILDLESS: a populated node still carries a live
+		// subtree (potentially the whole spine/arms rig if the hand check
+		// failed spuriously), and detaching that would delete the player's
+		// visible arms until a save reload. Better to skip blending for
+		// this session than to risk that.
+		if (auto* existing = a_fpRoot->GetObjectByName(kName)) {
+			if (auto* existingNode = existing->IsNode()) {
+				if (!existingNode->children.empty()) {
+					logger::warn(
+						"[GunBash] Stale blend bone still has {} children — refusing to detach; blend disabled this pass",
+						existingNode->children.size());
+					return nullptr;
+				}
 				if (auto* staleParent = existingNode->parent) {
 					staleParent->DetachChild(existingNode);
 				}
@@ -1170,6 +1287,12 @@ namespace BashBlend
 		if (!inserted) return nullptr;
 		inserted->name = kName;
 		inserted->local.MakeIdentity();
+		// Seed the world transform (identity local => parent's world).
+		// NOTE: the engine never maintains an inserted node's world —
+		// this seed is the only value it will ever hold, so nothing may
+		// treat it as live (see ChainFromWorlds). Seeded anyway so a
+		// stray reader sees a sane snapshot instead of zeros.
+		inserted->world = parent->world;
 
 		RE::NiPointer<RE::NiAVObject> anchorRef;
 		parent->DetachChild(anchor, anchorRef);  // detach + keep alive
@@ -1185,31 +1308,27 @@ namespace BashBlend
 		return s_bone;
 	}
 
-	// Solve and write the blend bone's local transform for this frame.
-	// Runs every frame from Update's tail (after the engine's world
-	// update, alongside the inertia ApplyOffset — the engine consumes
-	// these locals when building the render transforms).
+	// Per-frame driver. Runs from Update's tail every frame.
 	//
-	// Let P = the bone's parent world transform, K = the composed
-	// animation-authored chain from the bone down to the hand. The
-	// clean animated hand pose is  H_anim = P ∘ K  (our bone treated as
-	// identity — the compose stops below it). The captured pose is
-	// re-expressed in world via the CURRENT root transform (so it
-	// survives the player turning), the delta  capture ∘ H_animᵀ  is
-	// taken FRESH THIS FRAME, and the target is the geodesic lerp:
-	//     H_tgt.R = R(axis, w·angle) · H_anim.R      (axis, angle from the fresh delta)
-	//     H_tgt.T = H_anim.T + w·(capture.T − H_anim.T)
-	// Then the bone local B satisfying  P ∘ B ∘ K = H_tgt  is
-	//     B.R = P.Rᵀ · H_tgt.R · K.Rᵀ
-	//     B.T = P.Rᵀ · (H_tgt.T − P.T) − B.R·K.T
-	// At w=0 this collapses to the identity exactly; at w=1 the hand
-	// sits exactly on the captured pose, whatever the animation is
-	// doing underneath.
+	// MEASURING: read the live hand pose from engine-maintained world
+	// transforms (our bone is at identity, so nothing of ours is in
+	// them), gate it, and on the first sane frame lock the offset:
+	// with Q = anchor world, K = chain anchor->hand (from worlds),
+	// H_cap = capture re-expressed through the live FP root, the
+	// anchor world that would put the hand back on the capture is
+	//     Q'.R = H_cap.R · K.Rᵀ        Q'.T = H_cap.T − Q'.R·K.T
+	// and since the current chain satisfies A ∘ I ∘ L = Q (A = bone
+	// parent world, L = anchor's constant local), the bone local that
+	// realizes Q' is the conjugation
+	//     B0 = L ∘ (Q⁻¹ ∘ Q') ∘ L⁻¹
+	// which never touches A — i.e. no plugin-node worlds anywhere.
+	//
+	// DECAYING: bone->local = B0 scaled by w = (t/T)^2, write-only.
 	static void Apply(RE::PlayerCharacter* a_player)
 	{
-		if (s_timer <= 0.0f || s_duration <= 0.0f || !s_captureValid) {
+		if (s_phase == Phase::kIdle) {
 			// Blend over — restore the identity once so no stale offset
-			// stays frozen on the hand.
+			// stays frozen on the rig.
 			if (s_boneDirty && s_bone) {
 				s_bone->local.MakeIdentity();
 				s_boneDirty = false;
@@ -1219,109 +1338,168 @@ namespace BashBlend
 
 		auto* fpRoot = a_player ? a_player->Get3D(true) : nullptr;
 		auto* hand = FindHand(fpRoot);
-		if (!hand || !hand->parent) return;
+		if (!hand || !hand->parent) {
+			CancelBlend();
+			return;
+		}
+
+		if (s_phase == Phase::kMeasuring) {
+			if (!s_captureValid) { CancelBlend(); return; }
+
+			RE::NiPoint3  livePos;
+			RE::NiMatrix3 liveRot;
+			const bool readOK = ReadHandPoseInRootFrame(a_player, livePos, liveRot);
+
+			const float dx = livePos.x - s_capPos.x;
+			const float dy = livePos.y - s_capPos.y;
+			const float dz = livePos.z - s_capPos.z;
+			const float gap = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+			// Gates, in order of what they reject (all root-frame units):
+			//  - !readOK: rig unavailable this frame;
+			//  - gap < 1.5: world pass hasn't consumed the reset yet
+			//    (reads are one frame stale at the trigger — OG log
+			//    showed exactly gap=0.0 there); ALSO covers a genuinely
+			//    tiny snap, which needs no masking anyway;
+			//  - plausibility box: the fast-forward transient puts the
+			//    hand at impossible places (138u right / 11572u below
+			//    root in logs); a real viewmodel hand lives near
+			//    (|x|<70, -70<y<90, 30<z<170) of the FP root;
+			//  - gap > 150: not a bash snap (cell move, rig rebuild).
+			const bool sane =
+				readOK &&
+				gap >= 1.5f && gap <= 150.0f &&
+				std::abs(livePos.x) < 70.0f &&
+				livePos.y > -70.0f && livePos.y < 90.0f &&
+				livePos.z > 30.0f && livePos.z < 170.0f;
+
+			if (!sane) {
+				if (--s_measureBudget <= 0) {
+					if (s_diagPending) {
+						s_diagPending = false;
+						logger::info(
+							"[GunBash] Blend skipped — no sane post-reset pose within budget (last: live=({:.1f},{:.1f},{:.1f}) gap={:.1f}u readOK={})",
+							livePos.x, livePos.y, livePos.z, gap, readOK);
+					}
+					CancelBlend();
+				}
+				return;
+			}
+
+			// -- lock the offset --
+			auto* anchor = FindAnchor(fpRoot, hand);
+			if (!anchor) { CancelBlend(); return; }
+
+			// K = live chain anchor -> hand, from engine worlds only.
+			RE::NiMatrix3 kRot;
+			RE::NiPoint3  kPos;
+			ChainFromWorlds(hand, anchor, kRot, kPos);
+
+			// Capture -> world via the live root (survives player turning).
+			const RE::NiMatrix3& rootRot = fpRoot->world.rotate;
+			const RE::NiMatrix3 capRotW = Mul(rootRot, s_capRot);
+			const RE::NiPoint3  capOff = MulP(rootRot, s_capPos);
+			const RE::NiPoint3  capPosW{
+				fpRoot->world.translate.x + capOff.x,
+				fpRoot->world.translate.y + capOff.y,
+				fpRoot->world.translate.z + capOff.z
+			};
+
+			// Anchor world Q' that puts the hand on the capture.
+			const RE::NiMatrix3 qpR = Mul(capRotW, Transpose(kRot));
+			const RE::NiPoint3  qk = MulP(qpR, kPos);
+			const RE::NiPoint3  qpT{ capPosW.x - qk.x, capPosW.y - qk.y, capPosW.z - qk.z };
+
+			// Anchor-local delta G = Q⁻¹ ∘ Q'.
+			const RE::NiMatrix3 qRT = Transpose(anchor->world.rotate);
+			const RE::NiMatrix3 gR = Mul(qRT, qpR);
+			const RE::NiPoint3  gT = MulP(qRT, RE::NiPoint3{
+				qpT.x - anchor->world.translate.x,
+				qpT.y - anchor->world.translate.y,
+				qpT.z - anchor->world.translate.z });
+
+			// Conjugate into bone space through L (anchor's constant
+			// bind-pose local):  B0 = L ∘ G ∘ L⁻¹.
+			const RE::NiMatrix3& lR = anchor->local.rotate;
+			const RE::NiPoint3&  lT = anchor->local.translate;
+			const RE::NiMatrix3 b0R = Mul(Mul(lR, gR), Transpose(lR));
+			const RE::NiPoint3  lgT = MulP(lR, gT);
+			const RE::NiPoint3  bLt = MulP(b0R, lT);
+			const RE::NiPoint3  b0T{
+				lT.x + lgT.x - bLt.x,
+				lT.y + lgT.y - bLt.y,
+				lT.z + lgT.z - bLt.z
+			};
+
+			const float b0Mag = std::sqrt(b0T.x * b0T.x + b0T.y * b0T.y + b0T.z * b0T.z);
+			if (!std::isfinite(b0Mag) || b0Mag > 150.0f) {
+				logger::warn("[GunBash] Blend skipped — solved offset insane (|T|={:.1f})", b0Mag);
+				CancelBlend();
+				return;
+			}
+
+			// Axis-angle of B0.R for geodesic scaling. Near 180 degrees
+			// the axis is unrecoverable from the skew part — mask
+			// position only in that case (angle 0). Clamp to 90 degrees:
+			// a bigger rotation riding a live swing reads as flailing,
+			// worse than the snap it hides.
+			const float trace = b0R.entry[0][0] + b0R.entry[1][1] + b0R.entry[2][2];
+			const float cosAng = std::clamp((trace - 1.0f) * 0.5f, -1.0f, 1.0f);
+			float angle = std::acos(cosAng);
+			RE::NiPoint3 axis{
+				b0R.entry[2][1] - b0R.entry[1][2],
+				b0R.entry[0][2] - b0R.entry[2][0],
+				b0R.entry[1][0] - b0R.entry[0][1]
+			};
+			const float axisLen = std::sqrt(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
+			if (axisLen > 1.0e-3f && angle > 1.0e-4f) {
+				s_lockAxis = { axis.x / axisLen, axis.y / axisLen, axis.z / axisLen };
+				s_lockAngle = std::min(angle, 1.5708f);
+			} else {
+				s_lockAxis = { 0.0f, 0.0f, 1.0f };
+				s_lockAngle = 0.0f;
+			}
+			s_lockTrans = b0T;
+
+			if (s_diagPending) {
+				s_diagPending = false;
+				logger::info(
+					"[GunBash] Blend {} — gap={:.1f}u rot={:.0f}deg |B0.T|={:.1f} over {:.2f}s (budget left {})",
+					kWritesEnabled ? "locked" : "measured (writes disabled)",
+					gap, s_lockAngle * 57.2958f, b0Mag, s_duration, s_measureBudget);
+			}
+
+			// V5: measurement-only — never write the skeleton (see the
+			// namespace comment for the corruption findings).
+			if (!kWritesEnabled) {
+				CancelBlend();
+				return;
+			}
+
+			s_phase = Phase::kDecaying;
+			s_timer = s_duration;
+			s_captureValid = false;  // consumed
+			// fall through to write the first decay frame below
+		}
+
+		// DECAYING — write-only, no reads.
+		const float t = (s_duration > 0.0f) ? std::clamp(s_timer / s_duration, 0.0f, 1.0f) : 0.0f;
+		const float w = t * t;  // quadratic ease-out into the animation
 
 		auto* bone = EnsureBone(fpRoot, hand);
-		if (!bone || !bone->parent) return;
-
-		RE::NiMatrix3 chainRot;
-		RE::NiPoint3  chainPos;
-		if (!ComposeChain(hand, bone, chainRot, chainPos)) return;
-
-		auto* p = bone->parent;
-		const RE::NiMatrix3& pRot = p->world.rotate;
-		const RE::NiMatrix3 pRotT = Transpose(pRot);
-
-		// Clean animated hand pose in world.
-		const RE::NiMatrix3 animRot = Mul(pRot, chainRot);
-		const RE::NiPoint3  pk = MulP(pRot, chainPos);
-		const RE::NiPoint3  animPos{
-			p->world.translate.x + pk.x,
-			p->world.translate.y + pk.y,
-			p->world.translate.z + pk.z
-		};
-
-		// Captured pose, FP-root frame -> world (current root transform).
-		const RE::NiMatrix3& rootRot = fpRoot->world.rotate;
-		const RE::NiMatrix3 capRotW = Mul(rootRot, s_capRot);
-		const RE::NiPoint3  capOff = MulP(rootRot, s_capPos);
-		const RE::NiPoint3  capPosW{
-			fpRoot->world.translate.x + capOff.x,
-			fpRoot->world.translate.y + capOff.y,
-			fpRoot->world.translate.z + capOff.z
-		};
-
-		// Fresh delta for THIS frame.
-		const RE::NiPoint3 dP{ capPosW.x - animPos.x, capPosW.y - animPos.y, capPosW.z - animPos.z };
-		const RE::NiMatrix3 dR = Mul(capRotW, Transpose(animRot));
-		const float mag = std::sqrt(dP.x * dP.x + dP.y * dP.y + dP.z * dP.z);
-		const float trace = dR.entry[0][0] + dR.entry[1][1] + dR.entry[2][2];
-		const float cosAng = std::clamp((trace - 1.0f) * 0.5f, -1.0f, 1.0f);
-
-		// Pathological gap (bone re-parented, cell transition mid blend):
-		// dropping the blend beats flinging the viewmodel. A large-but-
-		// real gap (the trigger frame's fast-forwarded draw pose sits
-		// ~34 units / ~134 deg away) stays IN: the lerp path is always
-		// between two genuine poses, so big is fine — only absurd or
-		// axis-degenerate (angle -> 180 deg) gaps bail.
-		if (mag > 60.0f || cosAng < -0.94f) {  // ~160 degrees
-			logger::warn("[GunBash] Blend dropped mid-flight (posDelta={:.1f}, cosAng={:.2f})", mag, cosAng);
+		if (!bone) {
 			CancelBlend();
-			if (s_boneDirty) {
-				bone->local.MakeIdentity();
-				s_boneDirty = false;
-			}
 			return;
 		}
 
-		// Quadratic ease-out: full pull toward the captured pose at the
-		// snap, decaying with zero-ish velocity into the live animation.
-		const float t = s_timer / s_duration;
-		const float w = t * t;
-
-		// Axis-angle of the fresh delta (skew-symmetric part of dR:
-		// (R32-R23, R13-R31, R21-R12) = 2*sin(angle)*axis; the 160-degree
-		// bail above keeps sin(angle) well away from zero at large angles).
-		const float angle = std::acos(cosAng);
-		RE::NiPoint3 axis{
-			dR.entry[2][1] - dR.entry[1][2],
-			dR.entry[0][2] - dR.entry[2][0],
-			dR.entry[1][0] - dR.entry[0][1]
-		};
-		const float axisLen = std::sqrt(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
-		RE::NiMatrix3 dRotW;
-		if (axisLen > 1.0e-6f && angle > 1.0e-4f) {
-			axis.x /= axisLen;
-			axis.y /= axisLen;
-			axis.z /= axisLen;
-			dRotW = FromAxisAngle(axis, angle * w);
+		if (s_lockAngle > 1.0e-4f) {
+			bone->local.rotate = FromAxisAngle(s_lockAxis, s_lockAngle * w);
 		} else {
-			dRotW.MakeIdentity();
+			bone->local.rotate.MakeIdentity();
 		}
-
-		const RE::NiMatrix3 tgtRot = Mul(dRotW, animRot);
-		const RE::NiPoint3  tgtPos{
-			animPos.x + dP.x * w,
-			animPos.y + dP.y * w,
-			animPos.z + dP.z * w
+		bone->local.translate = {
+			s_lockTrans.x * w, s_lockTrans.y * w, s_lockTrans.z * w
 		};
-
-		// Solve the bone local.
-		const RE::NiMatrix3 boneRot = Mul(Mul(pRotT, tgtRot), Transpose(chainRot));
-		const RE::NiPoint3 relTgt{
-			tgtPos.x - p->world.translate.x,
-			tgtPos.y - p->world.translate.y,
-			tgtPos.z - p->world.translate.z
-		};
-		const RE::NiPoint3 relLocal = MulP(pRotT, relTgt);
-		const RE::NiPoint3 rk = MulP(boneRot, chainPos);
-		const RE::NiPoint3 boneT{ relLocal.x - rk.x, relLocal.y - rk.y, relLocal.z - rk.z };
-
-		if (!std::isfinite(boneT.x) || !std::isfinite(boneT.y) || !std::isfinite(boneT.z))
-			return;
-
-		bone->local.rotate = boneRot;
-		bone->local.translate = boneT;
 		s_boneDirty = true;
 	}
 }
@@ -1370,10 +1548,26 @@ static bool TriggerGunBashAction(RE::PlayerCharacter* a_player)
 {
 	if (!a_player || !a_player->currentProcess) return false;
 
-	auto* dom = RE::BGSDefaultObjectManager::GetSingleton();
-	auto* meleeAction = dom ? dom->GetDefaultObject<RE::BGSAction>(RE::DEFAULT_OBJECT::kActionMelee) : nullptr;
+	// Resolve ActionMelee by editor ID first. This is runtime-agnostic
+	// (the console's PerformAction command resolves actions the same way,
+	// and the AllFormsByEditorID relocations carry verified IDs for OG,
+	// NG, and AE). The default-object manager is only a fallback: its
+	// NG/AE GetSingleton ID history has already produced two AE crashes
+	// (missing ID 0 -> data RVA; PDB-mislabeled 2192850 -> by-index
+	// accessor fed garbage ECX), and GetDefaultObject<> would also break
+	// silently if the DEFAULT_OBJECT enum ever drifts between runtimes.
+	// ActionMelee is a static Fallout4.esm form, so caching is safe.
+	static RE::BGSAction* meleeAction = nullptr;
 	if (!meleeAction) {
-		logger::warn("[GunBash] ActionMelee default object missing");
+		meleeAction = RE::TESForm::GetFormByEditorID<RE::BGSAction>("ActionMelee");
+	}
+	if (!meleeAction) {
+		if (auto* dom = RE::BGSDefaultObjectManager::GetSingleton()) {
+			meleeAction = dom->GetDefaultObject<RE::BGSAction>(RE::DEFAULT_OBJECT::kActionMelee);
+		}
+	}
+	if (!meleeAction) {
+		logger::warn("[GunBash] ActionMelee could not be resolved (editor ID map and DOM both failed)");
 		return false;
 	}
 
@@ -1734,7 +1928,7 @@ bool Inertia::InertiaManager::IsADS(RE::PlayerCamera* camera) const
 	//   6 = sighted/ADS, 8 = firing while in ADS (UneducatedShooter pattern).
 	auto* player = RE::PlayerCharacter::GetSingleton();
 	if (player) {
-		auto gs = static_cast<std::uint32_t>(player->gunState);
+		auto gs = GunStateLocal::Read(player);
 		if (gs == 6 || gs == 8) return true;
 	}
 	// Fallback: camera state (in case some mod changes gunState behavior)
@@ -1793,7 +1987,7 @@ RE::BSEventNotifyControl Inertia::AnimEventSink::ProcessEvent(
 	RE::BSTEventSource<RE::BSAnimationGraphEvent>*)
 {
 	auto* player = RE::PlayerCharacter::GetSingleton();
-	std::uint32_t gs = player ? static_cast<std::uint32_t>(player->gunState) : 99;
+	std::uint32_t gs = GunStateLocal::Read(player);
 
 	// Engine quirk (verified): the player's animation graph emits `weaponFire`
 	// annotations from background idle/transition loops, especially right
@@ -2008,7 +2202,7 @@ void Inertia::InertiaManager::FillDebugSnapshot(DebugSnapshot& snap)
 
 	// Raw bitfield values
 	if (player) {
-		snap.gunStateRaw         = static_cast<std::uint32_t>(player->gunState);
+		snap.gunStateRaw         = GunStateLocal::Read(player);
 		snap.recoilRaw           = player->recoil;
 		snap.moveModeRaw         = player->moveMode;
 		snap.flyStateRaw         = player->flyState;
@@ -2395,8 +2589,17 @@ RE::NiNode* Inertia::InertiaManager::GetOrInsertInertiaBone(
 				cachedInsertedBone = existingNode;
 				return existingNode;
 			}
-			// Structure mismatch: detach the stale node so it doesn't remain as an
-			// orphan with no children in the skeleton, then fall through to reinsert.
+			// Structure mismatch: the pivot is no longer under our node.
+			// Only detach the stale node when it is CHILDLESS — if it
+			// still carries children it holds a live subtree (spine, arms,
+			// weapon), and detaching would remove the player's visible
+			// arms until a save reload. Skip this pass instead.
+			if (!existingNode->children.empty()) {
+				logger::warn(
+					"[FPGunplayOverhaul] Inserted bone structure mismatch but node still has {} children — refusing to detach",
+					existingNode->children.size());
+				return nullptr;
+			}
 			logger::warn("[FPGunplayOverhaul] Inserted bone structure mismatch, reinserting");
 			if (auto* staleParent = existingNode->parent) {
 				staleParent->DetachChild(existingNode);
@@ -2735,6 +2938,7 @@ namespace AttackInput
 		if (!s_originalHandleButton || !pc || !pc->attackHandler) return false;
 
 		RE::ButtonEvent evt{};
+		SyntheticInput::InitializeButtonEvent(evt);
 		evt.device       = RE::INPUT_DEVICE::kKeyboard;
 		evt.deviceID     = 0;
 		evt.eventType    = RE::INPUT_EVENT_TYPE::kButton;
@@ -2848,6 +3052,7 @@ namespace MeleeInput
 		if (!s_originalHandleButton || !pc || !pc->meleeThrowHandler) return false;
 
 		auto makeEvent = [&](RE::ButtonEvent& a_evt, float a_value, float a_heldSecs) {
+			SyntheticInput::InitializeButtonEvent(a_evt);
 			a_evt.device       = RE::INPUT_DEVICE::kKeyboard;
 			a_evt.deviceID     = 0;
 			a_evt.eventType    = RE::INPUT_EVENT_TYPE::kButton;
@@ -3172,14 +3377,40 @@ static RE::NiPoint3 MatMulPoint(const RE::NiMatrix3& m, const RE::NiPoint3& p)
 }
 
 void Inertia::InertiaManager::ApplyOffset(
-	RE::NiNode* node, const SpringState& combined, const WeaponInertiaSettings& ws)
+	RE::NiNode* node, const SpringState& a_combined, const WeaponInertiaSettings& ws)
 {
 	if (!node) return;
 
 	auto* gs = Settings::GetSingleton();
 
-	// Build rotation matrix from spring offsets
+	// Diagnostic mode: all spring logic upstream runs normally, but the
+	// skeleton write is replaced with identity. If the FP rig still
+	// corrupts in this mode, our offset writes are exonerated and the
+	// cause is the node insertion itself or another plugin.
+	if (gs->debugDisableNodeWrites) {
+		node->local.MakeIdentity();
+		return;
+	}
+
+	// Last-line clamp before the skeleton write. The COMBINE-time
+	// magnitude guard already neutralizes garbage frames, but this write
+	// site is also fed by the deferred (frame-gen) path; one oversized
+	// write permanently corrupts the FP rig (2026-07-25 findings), so
+	// bound it here unconditionally. Real sway never reaches these caps.
+	SpringState combined = a_combined;
+	auto clampAxes = [](RE::NiPoint3& v, float lim) {
+		v.x = std::clamp(std::isfinite(v.x) ? v.x : 0.0f, -lim, lim);
+		v.y = std::clamp(std::isfinite(v.y) ? v.y : 0.0f, -lim, lim);
+		v.z = std::clamp(std::isfinite(v.z) ? v.z : 0.0f, -lim, lim);
+	};
+	clampAxes(combined.positionOffset, 15.0f);
+	clampAxes(combined.rotationOffset, 25.0f);
+
+	// Build rotation matrix from spring offsets. Start from identity so
+	// the NiPoint4 row .w lanes stay 0 (Dear-Modding NiMatrix3 stores
+	// 3x NiPoint4; writing only xyz leaves w whatever MakeIdentity set).
 	RE::NiMatrix3 rot;
+	rot.MakeIdentity();
 	if (gs->enableRotation) {
 		float rx = combined.rotationOffset.x * 0.01745329f;
 		float ry = combined.rotationOffset.y * 0.01745329f;
@@ -3196,8 +3427,6 @@ void Inertia::InertiaManager::ApplyOffset(
 		rot.entry[2][0] =  sx * sz - cx * sy * cz;
 		rot.entry[2][1] =  sx * cz + cx * sy * sz;
 		rot.entry[2][2] =  cx * cy;
-	} else {
-		rot.MakeIdentity();
 	}
 
 	// Pivot correction: rotate around the pivot bone's position, not the
@@ -3214,6 +3443,13 @@ void Inertia::InertiaManager::ApplyOffset(
 		pivotT = (ws.useBindPosePivot && hasRefPosePivot)
 			? refPosePivotTranslate
 			: cachedTargetNode->local.translate;
+	}
+	// A bind-pose spine local translate is < ~20 units; anything larger
+	// means a stale/garbage pivot read, and the pivot correction below
+	// scales with it. Fall back to rotating about the node origin.
+	if (!std::isfinite(pivotT.x) || !std::isfinite(pivotT.y) || !std::isfinite(pivotT.z) ||
+		std::abs(pivotT.x) > 100.0f || std::abs(pivotT.y) > 100.0f || std::abs(pivotT.z) > 100.0f) {
+		pivotT = { 0.0f, 0.0f, 0.0f };
 	}
 
 	RE::NiPoint3 rotatedPivot = MatMulPoint(rot, pivotT);
@@ -3288,6 +3524,51 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		if (chamberExclusionTimer >= 1.0f) {
 			chamberExclusionTimer = 0.0f;
 			ChamberExclusion::Manager::GetSingleton()->ApplyKeywordToEquippedInstance(player);
+		}
+	}
+
+	// ---- UneducatedShooter NaN guard ----
+	// US inserts ChestInserted1st / COMInserted1st / CameraInserted1st
+	// into the FIRST-PERSON rig and rewrites their locals every frame
+	// from smoothed-input accumulators. On AE (TMR, frame generation
+	// active) one bad frame delta poisons those accumulators and US then
+	// writes NaN rotations forever: Chest sits between SPINE2 and the
+	// arms, so the hand chain goes NaN while the spine stays finite —
+	// exactly the RigDiag signature captured 2026-07-25 14:03/14:12.
+	// Heal: restore any non-finite US node local to identity each frame
+	// (we run inside PlayerCharacter::UpdateAnimation, before the world
+	// pass consumes locals). This keeps the arms alive; US's own sway
+	// output stays dead until reload, which is the lesser harm.
+	{
+		auto* fpRootGuard = static_cast<RE::NiNode*>(player->Get3D(true));
+		if (fpRootGuard) {
+			static const RE::BSFixedString kUSNodes[] = {
+				RE::BSFixedString("ChestInserted1st"),
+				RE::BSFixedString("COMInserted1st"),
+				RE::BSFixedString("CameraInserted1st")
+			};
+			auto finite3 = [](const RE::NiPoint3& v) {
+				return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+			};
+			for (const auto& name : kUSNodes) {
+				auto* obj = fpRootGuard->GetObjectByName(name);
+				if (!obj) continue;
+				bool bad = !finite3(obj->local.translate) || !std::isfinite(obj->local.scale);
+				for (int r = 0; r < 3 && !bad; ++r)
+					for (int c = 0; c < 3 && !bad; ++c)
+						if (!std::isfinite(obj->local.rotate.entry[r][c])) bad = true;
+				if (bad) {
+					obj->local.rotate.MakeIdentity();
+					obj->local.translate = { 0.0f, 0.0f, 0.0f };
+					obj->local.scale = 1.0f;
+					static float s_lastUSHealLog = -10.0f;
+					if (elapsedTime - s_lastUSHealLog > 2.0f) {
+						s_lastUSHealLog = elapsedTime;
+						logger::warn("[USGuard] UneducatedShooter node '{}' had non-finite local — healed to identity",
+							name.c_str());
+					}
+				}
+			}
 		}
 	}
 
@@ -3383,7 +3664,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		const bool foeFireHeld = AttackInput::s_installed && AttackInput::s_fireHeld;
 
 		const std::uint32_t foeMagAmmo = EquippedWeapon::GetMagazineAmmoCount(player);
-		const auto gsNow = static_cast<std::uint32_t>(player->gunState);
+		const auto gsNow = GunStateLocal::Read(player);
 		const bool fireRisingEdge = foeFireHeld && !prevFireInputHeld;
 
 		// Diagnostic: log every fresh fire press with full gate state so a
@@ -3539,7 +3820,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 						}
 						logger::info("[FireOnEmpty] {} ADS via synthetic tap (gs={})",
 							fireOnEmptyWasADS ? "Re-entered" : "Entered",
-							static_cast<std::uint32_t>(player->gunState));
+							GunStateLocal::Read(player));
 					}
 				} else if (adsReleasedMidFlight && AttackInput::s_installed &&
 				           !AttackInput::s_adsHeld && !reloadInterrupt) {
@@ -3561,7 +3842,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 						g_suppressEquipSounds.store(false, std::memory_order_relaxed);
 						AttackInput::DispatchButton("SecondaryAttack", 0.0f, 0.5f);
 						logger::info("[FireOnEmpty] Reconstructed natural ADS exit (gs={})",
-							static_cast<std::uint32_t>(player->gunState));
+							GunStateLocal::Read(player));
 					}
 				}
 				fireOnEmptyAnimActive = false;
@@ -3847,10 +4128,10 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		}
 
 		// Visual blend across the follow-up's graph reset (see BashBlend
-		// at the top of the file). Capture and blend start happen inside
+		// at the top of the file). Capture and arming happen inside
 		// TriggerGunBashAction; here we only run the decay clock.
-		// BashBlend::Apply at the end of Update re-derives the pose
-		// delta fresh and writes the blend bone for this frame.
+		// BashBlend::Apply at the end of Update measures/locks the snap
+		// offset and writes the blend bone for this frame.
 		BashBlend::Tick(delta);
 	}
 
@@ -4198,7 +4479,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			atkHandler->inputEventHandlingEnabled = false;
 		}
 		HavokVar::SetBool(player, HavokVar::kIsReloading, false);
-		auto idleGS = static_cast<std::uint32_t>(player->gunState);
+		auto idleGS = GunStateLocal::Read(player);
 		logger::info("[EarlyADS-Idle] frame={} gs={} (forcing idle, isReloading→false)",
 			earlyAdsForceIdleCountdown - earlyAdsForceIdleFrames, idleGS);
 		if (earlyAdsForceIdleFrames == 0 && atkHandler) {
@@ -4236,7 +4517,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	//     it via the EarlyADS-Idle path even if engine claims attacking,
 	//     and rely on ammo-decrement detection below to avoid duplicates.
 	if (!earlyAdsAutoFireWatching && ws.earlyAdsAutoFireEnabled && recentlyReloadedTimer > 0.0f) {
-		auto probeGS = static_cast<std::uint32_t>(player->gunState);
+		auto probeGS = GunStateLocal::Read(player);
 		bool gotFireProbe = animEventSink.firedThisFrame.load(std::memory_order_relaxed);
 		const bool probeIsFiringState = GunStateLocal::IsFiringGunState(probeGS);
 		if (gotFireProbe && probeIsFiringState) {
@@ -4287,7 +4568,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		earlyAdsAutoFireGraceTimer -= delta;
 		earlyAdsAutoFirePhantomGap += delta;
 
-		auto afGS = static_cast<std::uint32_t>(player->gunState);
+		auto afGS = GunStateLocal::Read(player);
 		bool gotFireEvent = animEventSink.firedThisFrame.load(std::memory_order_relaxed);
 		const bool afIsFiringState = GunStateLocal::IsFiringGunState(afGS);
 
@@ -4439,7 +4720,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		earlyEquipPending   = false;
 		earlyEquipTimer     = 0.0f;
 		logger::info("[EarlyEquip] ADS armed — ADS input held during equip (gunState={})",
-			static_cast<std::uint32_t>(player->gunState));
+			GunStateLocal::Read(player));
 	}
 
 	// Arm early equip fire (only if ADS not already armed)
@@ -4450,7 +4731,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		earlyEquipPending   = false;
 		earlyEquipTimer     = 0.0f;
 		logger::info("[EarlyEquip] Fire armed — fire input held during equip (gunState={})",
-			static_cast<std::uint32_t>(player->gunState));
+			GunStateLocal::Read(player));
 	}
 
 	// Disarm if equip ended naturally
@@ -4476,7 +4757,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			earlyEquipPending = false;
 			earlyEquipTimer   = 0.0f;
 
-			auto preGS = static_cast<std::uint32_t>(player->gunState);
+			auto preGS = GunStateLocal::Read(player);
 			bool isAdsEquip = earlyEquipAdsArmed;
 
 			// Briefly suppress the attack handler so the animation graph
@@ -4520,13 +4801,13 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		earlyAdsReturnPending = false;
 		earlyAdsReturnTimer   = 0.0f;
 		logger::debug("[EarlyADS] Armed — ADS input held during reload (gunState={})",
-			static_cast<std::uint32_t>(player->gunState));
+			GunStateLocal::Read(player));
 	}
 
 	// Disarm if reload ended naturally before our timer fired.
 	if (earlyAdsArmed && !isCurrentlyReloading) {
 		logger::debug("[EarlyADS] Disarmed — reload ended naturally (gunState={})",
-			static_cast<std::uint32_t>(player->gunState));
+			GunStateLocal::Read(player));
 		earlyAdsArmed         = false;
 		earlyAdsReturnPending = false;
 		earlyAdsReturnTimer   = 0.0f;
@@ -4552,7 +4833,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 				earlyAdsReturnPending = false;
 				earlyAdsReturnTimer   = 0.0f;
 
-				auto preGS = static_cast<std::uint32_t>(player->gunState);
+				auto preGS = GunStateLocal::Read(player);
 
 				if (preGS != 4) {
 					// Reload already ended naturally — don't send a redundant event
@@ -4583,7 +4864,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 				ClearEngineWeaponCullFlags(player);
 				RE::BSFixedString evtEnd("ReloadEnd");
 				bool r1 = SendUncullBatch(player, &evtEnd);
-				auto postGS = static_cast<std::uint32_t>(player->gunState);
+				auto postGS = GunStateLocal::Read(player);
 
 				HavokVar::SetBool(player, HavokVar::kIsReloading, false);
 				HavokVar::SetBool(player, HavokVar::kIsAttacking, false);
@@ -4634,7 +4915,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		earlyFireCancelPending = true;
 		earlyFireCancelTimer   = 0.05f;  // 50 ms hold-debounce
 		logger::info("[EarlyFireCancel] Armed — fire input held during reload (gunState={})",
-			static_cast<std::uint32_t>(player->gunState));
+			GunStateLocal::Read(player));
 	}
 
 	// Disarm if reload ended naturally before our debounce expired,
@@ -4643,7 +4924,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		if (earlyFireCancelPending) {
 			logger::debug("[EarlyFireCancel] Disarmed — {} (gunState={})",
 				!isCurrentlyReloading ? "reload ended naturally" : "fire released before debounce",
-				static_cast<std::uint32_t>(player->gunState));
+				GunStateLocal::Read(player));
 		}
 		earlyFireCancelArmed   = false;
 		earlyFireCancelPending = false;
@@ -4656,7 +4937,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			earlyFireCancelPending = false;
 			earlyFireCancelTimer   = 0.0f;
 
-			auto preGS = static_cast<std::uint32_t>(player->gunState);
+			auto preGS = GunStateLocal::Read(player);
 
 			if (preGS != 4) {
 				// Reload already ended naturally — skip force-end (would desync SM).
@@ -4695,7 +4976,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			ClearEngineWeaponCullFlags(player);
 			RE::BSFixedString evtEnd("ReloadEnd");
 			bool r1 = SendUncullBatch(player, &evtEnd);
-			auto postGS = static_cast<std::uint32_t>(player->gunState);
+			auto postGS = GunStateLocal::Read(player);
 
 			HavokVar::SetBool(player, HavokVar::kIsReloading, false);
 			HavokVar::SetBool(player, HavokVar::kIsAttacking, false);
@@ -4725,7 +5006,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	// Post-EarlyADS diagnostic: log attack variables for a few frames
 	if (earlyAdsPostDiagFrames > 0) {
 		--earlyAdsPostDiagFrames;
-		auto diagGS = static_cast<std::uint32_t>(player->gunState);
+		auto diagGS = GunStateLocal::Read(player);
 		std::int32_t atkState = -1;
 		bool diagFiring = false, diagReloading = false, diagAttacking = false, diagAtkReady = false, diagAtkNotReady = false;
 		HavokVar::GetInt(player, HavokVar::kIAttackState, atkState);
@@ -4749,7 +5030,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	// these at source, so this is defense-in-depth in case future code
 	// paths set firedThisFrame without going through the sink.
 	bool rawFireEvent = animEventSink.firedThisFrame.exchange(false, std::memory_order_relaxed);
-	const auto _rawGS = static_cast<std::uint32_t>(player->gunState);
+	const auto _rawGS = GunStateLocal::Read(player);
 	bool isCurrentlyFiring = rawFireEvent && GunStateLocal::IsFiringGunState(_rawGS);
 	if (rawFireEvent && !isCurrentlyFiring) {
 		logger::trace("[Fire] Ignored spurious weaponFire (gunState={})", _rawGS);
@@ -5458,6 +5739,68 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	sanitize(combined.positionOffset);
 	sanitize(combined.rotationOffset);
 
+	// ---- MAGNITUDE GUARD ----
+	// The NaN sanitize above lets huge-but-finite spikes straight through,
+	// and a SINGLE oversized write to the FP spine subtree corrupts the rig
+	// until a save reload (verified 2026-07-25 with the bash blend; the
+	// engine never recovers even after our node returns to identity).
+	// Legitimate combined output is a few units / a few degrees; anything
+	// past these bounds is a poisoned spring or garbage input, never real
+	// sway. On a trip: log WHICH spring carried the energy (so the source
+	// can be fixed rather than masked), reset all spring physics (self-
+	// heal — a poisoned spring never recovers on its own), and write
+	// neutral this frame.
+	{
+		constexpr float kMaxPosOffset = 15.0f;  // units, per axis
+		constexpr float kMaxRotOffset = 25.0f;  // degrees, per axis
+		auto maxAbs = [](const RE::NiPoint3& v) {
+			return std::max({ std::abs(v.x), std::abs(v.y), std::abs(v.z) });
+		};
+		const float posMag = maxAbs(combined.positionOffset);
+		const float rotMag = maxAbs(combined.rotationOffset);
+		if (posMag > kMaxPosOffset || rotMag > kMaxRotOffset) {
+			// Throttle the (expensive, multi-line) provenance dump; the
+			// neutralization itself runs every tripped frame regardless.
+			static float s_lastGuardLog = -10.0f;
+			if (elapsedTime - s_lastGuardLog > 5.0f) {
+				s_lastGuardLog = elapsedTime;
+				logger::warn(
+					"[Inertia] Magnitude guard tripped — combined pos=({:.1f},{:.1f},{:.1f}) rot=({:.1f},{:.1f},{:.1f}) deg. Resetting springs.",
+					combined.positionOffset.x, combined.positionOffset.y, combined.positionOffset.z,
+					combined.rotationOffset.x, combined.rotationOffset.y, combined.rotationOffset.z);
+				auto dump = [&](const char* name, const SpringState& s) {
+					const float p = maxAbs(s.positionOffset);
+					const float r = maxAbs(s.rotationOffset);
+					if (p > 0.5f || r > 0.5f)
+						logger::warn("[Inertia]   {}: pos=({:.1f},{:.1f},{:.1f}) rot=({:.1f},{:.1f},{:.1f})",
+							name,
+							s.positionOffset.x, s.positionOffset.y, s.positionOffset.z,
+							s.rotationOffset.x, s.rotationOffset.y, s.rotationOffset.z);
+				};
+				dump("cameraSpring", cameraSpring);
+				dump("movementSpring", movementSpring);
+				dump("sprintSpring", sprintSpring);
+				dump("jumpSpring", jumpSpring);
+				dump("equipImpulse", equipImpulse.state);
+				dump("adsEnterImpulse", adsEnterImpulse.state);
+				dump("adsExitImpulse", adsExitImpulse.state);
+				dump("fireRecoveryImpulse", fireRecoveryImpulse.state);
+				dump("adsFireRecoveryImpulse", adsFireRecoveryImpulse.state);
+				dump("reloadImpulse", reloadImpulse.state);
+				dump("emptyReloadImpulse", emptyReloadImpulse.state);
+				dump("leanImpulse", leanImpulse.state);
+				dump("sneakImpulse", sneakImpulse.state);
+				dump("adsTransitionOffset", adsTransitionOffset);
+				logger::warn("[Inertia]   leanAdditive=({:.1f},{:.1f},{:.1f}) walkW=({:.2f},{:.2f},{:.2f},{:.2f}) abf={:.2f} intensity={:.2f}",
+					leanAdditiveOffset.x, leanAdditiveOffset.y, leanAdditiveOffset.z,
+					walkWeightFwd, walkWeightBack, walkWeightLeft, walkWeightRight,
+					actionBlendFactor, intensityMult);
+			}
+			ResetSpringPhysicsState();
+			combined = SpringState{};  // neutral output this frame
+		}
+	}
+
 	// Store for deferred application (frame-gen safe)
 	deferredOffsets.hasOffsets = true;
 	deferredOffsets.isADS     = isCurrentlyADS;
@@ -5507,6 +5850,52 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			logger::warn("[FPGunplayOverhaul] FindTargetNode returned nullptr (isADS={}, pivotWarmup={:.2f})",
 				isCurrentlyADS, pivotWarmupTimer);
 		}
+	}
+
+	// Rig-state telemetry (1 Hz, info level) — active in diagnostic mode
+	// or with debug logging on. Gives a timeline of the FP rig alongside
+	// our node's local, so corruption can be attributed: if the hand or
+	// spine world goes insane while our local reads identity/small, the
+	// damage did not come from our writes.
+	if (doBaselineLog && (gs->debugDisableNodeWrites || gs->debugLogging) && fpNode) {
+		static const RE::BSFixedString kDiagHand{ "RArm_Hand" };
+		auto* handAV = fpNode->GetObjectByName(kDiagHand);
+		auto* spineAV = cachedTargetNode ? static_cast<RE::NiAVObject*>(cachedTargetNode) : nullptr;
+		auto* nodeAV = cachedInsertedBone ? static_cast<RE::NiAVObject*>(cachedInsertedBone) : nullptr;
+		auto rotAngleDeg = [](const RE::NiMatrix3& m) {
+			const float tr = m.entry[0][0] + m.entry[1][1] + m.entry[2][2];
+			return std::acos(std::clamp((tr - 1.0f) * 0.5f, -1.0f, 1.0f)) * 57.2958f;
+		};
+		auto relToRoot = [&](const RE::NiAVObject* o) -> RE::NiPoint3 {
+			if (!o) return { 0.0f, 0.0f, 0.0f };
+			return { o->world.translate.x - fpNode->world.translate.x,
+			         o->world.translate.y - fpNode->world.translate.y,
+			         o->world.translate.z - fpNode->world.translate.z };
+		};
+		const RE::NiPoint3 handRel = relToRoot(handAV);
+		const RE::NiPoint3 spineRel = relToRoot(spineAV);
+		// UneducatedShooter's FP nodes — rotation angle of each local, or
+		// "nan"/"---" (non-finite / absent). Chest is the arm-chain one.
+		auto usStat = [&](const char* n) -> std::string {
+			auto* o = fpNode->GetObjectByName(RE::BSFixedString(n));
+			if (!o) return "---";
+			for (int r = 0; r < 3; ++r)
+				for (int c = 0; c < 3; ++c)
+					if (!std::isfinite(o->local.rotate.entry[r][c])) return "nan";
+			if (!std::isfinite(o->local.translate.x) || !std::isfinite(o->local.translate.y) ||
+				!std::isfinite(o->local.translate.z)) return "nanT";
+			return std::format("{:.1f}", rotAngleDeg(o->local.rotate));
+		};
+		logger::info(
+			"[RigDiag] node.local T=({:.2f},{:.2f},{:.2f}) rot={:.1f}deg | spineW-root=({:.1f},{:.1f},{:.1f}) | handW-root=({:.1f},{:.1f},{:.1f}) | usChest={} usCOM={} usCam={} | writes={}",
+			nodeAV ? nodeAV->local.translate.x : 0.0f,
+			nodeAV ? nodeAV->local.translate.y : 0.0f,
+			nodeAV ? nodeAV->local.translate.z : 0.0f,
+			nodeAV ? rotAngleDeg(nodeAV->local.rotate) : 0.0f,
+			spineRel.x, spineRel.y, spineRel.z,
+			handRel.x, handRel.y, handRel.z,
+			usStat("ChestInserted1st"), usStat("COMInserted1st"), usStat("CameraInserted1st"),
+			gs->debugDisableNodeWrites ? "OFF" : "on");
 	}
 	}  // end if (springsActive) — transition/combine/apply/telemetry
 

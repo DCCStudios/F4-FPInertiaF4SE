@@ -190,29 +190,38 @@ namespace WeaponFOV
 		LoadAllEntries();
 
 		logger::info("[WeaponFOV] Initialized. VM default={:.2f} ({}), 1P camera={:.2f} ({}), 3P={:.2f}, {} entries loaded.",
-			defaultViewmodelFOV.load(), SourceName(defaultSource),
-			cameraFOV.load(),           SourceName(cameraSource),
+			defaultViewmodelFOV.load(), SourceName(defaultSource.load()),
+			cameraFOV.load(),           SourceName(cameraSource.load()),
 			thirdPersonFOV.load(),
 			entries.size());
 	}
 
 	void Manager::RefreshDefaults()
 	{
-		DetectAndLoadDefaultFOV();
-		logger::info("[WeaponFOV] Defaults refreshed. VM={:.2f} ({}), 1P camera={:.2f} ({}), 3P={:.2f}.",
-			defaultViewmodelFOV.load(), SourceName(defaultSource),
-			cameraFOV.load(),           SourceName(cameraSource),
-			thirdPersonFOV.load());
+		// Refresh can be requested from the F4SE Menu Framework render
+		// callback. Queue the complete refresh, including engine setting
+		// reads, game-object reads, and FOV writes, to the game thread.
+		const auto* taskInterface = F4SE::GetTaskInterface();
+		if (!taskInterface) {
+			logger::error("[WeaponFOV] Cannot refresh defaults: F4SE task interface unavailable");
+			return;
+		}
 
-		// Immediately apply rather than waiting for the next Update() tick.
-		// On game load the next Update may not fire for many frames (the
-		// player 3D isn't ready yet, the hook hasn't ticked, etc.), so
-		// deferring causes a visible FOV pop mid-equip animation.
-		auto* player = RE::PlayerCharacter::GetSingleton();
-		if (player && player->Get3D()) {
-			const bool drawn = player->GetWeaponMagicDrawn();
+		taskInterface->AddTask([this]() {
+			DetectAndLoadDefaultFOV();
+			logger::info("[WeaponFOV] Defaults refreshed. VM={:.2f} ({}), 1P camera={:.2f} ({}), 3P={:.2f}.",
+				defaultViewmodelFOV.load(), SourceName(defaultSource.load()),
+				cameraFOV.load(), SourceName(cameraSource.load()),
+				thirdPersonFOV.load());
 
-			// Check if the currently equipped weapon has a WBFOV entry
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!player || !player->Get3D()) {
+				// Player 3D is not ready yet. Force the next Update tick or
+				// scheduled load retry to perform the apply.
+				lastAppliedFOV = -1.0f;
+				return;
+			}
+
 			std::string curEditorID;
 			if (player->currentProcess && player->currentProcess->middleHigh) {
 				auto* mh = player->currentProcess->middleHigh;
@@ -230,18 +239,16 @@ namespace WeaponFOV
 			if (!curEditorID.empty()) {
 				std::lock_guard lock(entriesMtx);
 				auto it = entries.find(curEditorID);
-				if (it != entries.end())
+				if (it != entries.end()) {
 					targetFOV = it->second.viewmodelFOV;
+				}
 			}
 
 			ApplyViewmodelFOV(targetFOV);
 			lastAppliedFOV = targetFOV;
-			lastApplyTime  = std::chrono::steady_clock::now();
-			logger::info("[WeaponFOV] Immediate apply after refresh: vm={:.1f}", targetFOV);
-		} else {
-			// Player 3D not ready yet — force re-apply on next Update tick
-			lastAppliedFOV = -1.0f;
-		}
+			lastApplyTime = std::chrono::steady_clock::now();
+			logger::info("[WeaponFOV] Main-thread apply after refresh: vm={:.1f}", targetFOV);
+		});
 	}
 
 	void Manager::DetectAndLoadDefaultFOV()
@@ -373,7 +380,7 @@ namespace WeaponFOV
 
 	const char* Manager::GetDefaultSourceName() const
 	{
-		return SourceName(defaultSource);
+		return SourceName(defaultSource.load());
 	}
 
 	// ============================================================
@@ -581,23 +588,41 @@ namespace WeaponFOV
 	{
 		const float def = defaultViewmodelFOV.load();
 		logger::info("[WeaponFOV] RestoreDefault — WBFOV disabled, reverting vm to {:.1f} (source: {})",
-			def, SourceName(defaultSource));
-		ApplyViewmodelFOV(def);
-		lastAppliedFOV = def;
-		lastApplyTime  = std::chrono::steady_clock::now();
-		hadWeaponEntry = false;
+			def, SourceName(defaultSource.load()));
+
+		const auto* taskInterface = F4SE::GetTaskInterface();
+		if (!taskInterface) {
+			logger::error("[WeaponFOV] Cannot restore default: F4SE task interface unavailable");
+			return;
+		}
+
+		taskInterface->AddTask([this, def]() {
+			ApplyViewmodelFOV(def);
+			lastAppliedFOV = def;
+			lastApplyTime = std::chrono::steady_clock::now();
+			hadWeaponEntry = false;
+		});
 	}
 
 	void Manager::ScheduleLoadRetry()
 	{
 		const std::uint32_t gen = ++loadRetryGeneration;
+		loadRetryCompletedGeneration.store(0);
 
 		int maxAttempts = Settings::GetSingleton()->wbfovLoadRetries;
 		if (maxAttempts < 1) maxAttempts = 1;
 		if (maxAttempts > 5) maxAttempts = 5;
-		std::thread([this, gen, maxAttempts]() {
+
+		const auto* taskInterface = F4SE::GetTaskInterface();
+		if (!taskInterface) {
+			logger::error("[WeaponFOV] Cannot schedule load retries: F4SE task interface unavailable");
+			return;
+		}
+
+		std::thread([this, taskInterface, gen, maxAttempts]() {
 			// Increasing delays: try quickly, then back off. Stop as soon
-			// as one attempt succeeds so we don't cause repeated pops.
+			// as one main-thread attempt succeeds so we don't cause repeated
+			// pops. The timer thread never reads or writes live game state.
 			constexpr std::chrono::milliseconds kDelays[5] = {
 				std::chrono::milliseconds(50),
 				std::chrono::milliseconds(150),
@@ -610,53 +635,59 @@ namespace WeaponFOV
 				if (loadRetryGeneration.load() != gen) return;
 				std::this_thread::sleep_for(kDelays[i]);
 				if (loadRetryGeneration.load() != gen) return;
+				if (loadRetryCompletedGeneration.load() == gen) return;
 
-				auto* player = RE::PlayerCharacter::GetSingleton();
-				if (!player || !player->Get3D()) continue;
-
-				auto* cam = RE::PlayerCamera::GetSingleton();
-				if (cam && cam->currentState) {
-					auto st = cam->currentState->id.get();
-					if (st != RE::CameraStates::kFirstPerson &&
-					    st != RE::CameraStates::kIronSights)
-						continue;
-				}
-
-				std::string curEditorID;
-				if (player->currentProcess && player->currentProcess->middleHigh) {
-					auto* mh = player->currentProcess->middleHigh;
-					RE::BSAutoLock lock{ mh->equippedItemsLock };
-					for (auto& equipped : mh->equippedItems) {
-						auto* form = equipped.item.object;
-						if (!form || form->formType != RE::ENUM_FORM_ID::kWEAP) continue;
-						const char* eid = form->GetFormEditorID();
-						if (eid && eid[0]) curEditorID = eid;
-						break;
+				taskInterface->AddTask([this, gen, attempt = i + 1, maxAttempts]() {
+					if (loadRetryGeneration.load() != gen ||
+						loadRetryCompletedGeneration.load() == gen) {
+						return;
 					}
-				}
 
-				float targetFOV = defaultViewmodelFOV.load();
-				if (!curEditorID.empty()) {
-					std::lock_guard lock(entriesMtx);
-					auto it = entries.find(curEditorID);
-					if (it != entries.end())
-						targetFOV = it->second.viewmodelFOV;
-				}
+					auto* player = RE::PlayerCharacter::GetSingleton();
+					if (!player || !player->Get3D()) return;
 
-				logger::info("[WeaponFOV] LoadRetry attempt {}/{}: vm={:.1f} weapon='{}' cam={:.1f}",
-					i + 1, maxAttempts, targetFOV,
-					curEditorID.empty() ? "<none>" : curEditorID.c_str(),
-					cameraFOV.load());
-				ApplyViewmodelFOV(targetFOV);
-				lastAppliedFOV = targetFOV;
-				lastApplyTime  = std::chrono::steady_clock::now();
+					auto* cam = RE::PlayerCamera::GetSingleton();
+					if (cam && cam->currentState) {
+						const auto state = cam->currentState->id.get();
+						if (state != RE::CameraStates::kFirstPerson &&
+							state != RE::CameraStates::kIronSights) {
+							return;
+						}
+					}
 
-				// Success — stop retrying. The deferred firstPersonFOV fix
-				// in Update() will clean up the camera side on the next tick.
-				logger::info("[WeaponFOV] LoadRetry succeeded on attempt {} — stopping", i + 1);
-				break;
+					std::string curEditorID;
+					if (player->currentProcess && player->currentProcess->middleHigh) {
+						auto* mh = player->currentProcess->middleHigh;
+						RE::BSAutoLock lock{ mh->equippedItemsLock };
+						for (auto& equipped : mh->equippedItems) {
+							auto* form = equipped.item.object;
+							if (!form || form->formType != RE::ENUM_FORM_ID::kWEAP) continue;
+							const char* eid = form->GetFormEditorID();
+							if (eid && eid[0]) curEditorID = eid;
+							break;
+						}
+					}
+
+					float targetFOV = defaultViewmodelFOV.load();
+					if (!curEditorID.empty()) {
+						std::lock_guard lock(entriesMtx);
+						auto it = entries.find(curEditorID);
+						if (it != entries.end()) {
+							targetFOV = it->second.viewmodelFOV;
+						}
+					}
+
+					logger::info("[WeaponFOV] LoadRetry attempt {}/{}: vm={:.1f} weapon='{}' cam={:.1f}",
+						attempt, maxAttempts, targetFOV,
+						curEditorID.empty() ? "<none>" : curEditorID.c_str(),
+						cameraFOV.load());
+					ApplyViewmodelFOV(targetFOV);
+					lastAppliedFOV = targetFOV;
+					lastApplyTime = std::chrono::steady_clock::now();
+					loadRetryCompletedGeneration.store(gen);
+					logger::info("[WeaponFOV] LoadRetry succeeded on attempt {} — stopping", attempt);
+				});
 			}
-			logger::info("[WeaponFOV] Load retry complete (gen={})", gen);
 		}).detach();
 	}
 
@@ -709,8 +740,14 @@ namespace WeaponFOV
 		}
 
 		const std::uint64_t myGen = ++interpGeneration;
+		const auto* taskInterface = F4SE::GetTaskInterface();
+		if (!taskInterface) {
+			logger::error("[WeaponFOV] Cannot interpolate: F4SE task interface unavailable");
+			ApplyViewmodelFOV(to);
+			return;
+		}
 
-		std::thread([this, from, to, frames, myGen]() {
+		std::thread([this, taskInterface, from, to, frames, myGen]() {
 			const float delta = to - from;
 			const float step  = delta / static_cast<float>(frames);
 			float       cur   = from;
@@ -721,12 +758,16 @@ namespace WeaponFOV
 					return;
 				}
 				cur += step;
-				ApplyViewmodelFOV(cur);
+				const float frameFOV = (i + 1 == frames) ? to : cur;
+				taskInterface->AddTask([this, frameFOV, to, myGen, stepIndex = i + 1, frames]() {
+					if (interpGeneration.load() != myGen) return;
+
+					ApplyViewmodelFOV(frameFOV);
+					if (stepIndex == frames) {
+						logger::info("[WeaponFOV] Lerp complete: vm={:.1f} (gen={})", to, myGen);
+					}
+				});
 				std::this_thread::sleep_for(std::chrono::milliseconds(8));
-			}
-			if (interpGeneration.load() == myGen) {
-				ApplyViewmodelFOV(to);
-				logger::info("[WeaponFOV] Lerp complete: vm={:.1f} (gen={})", to, myGen);
 			}
 		}).detach();
 	}
@@ -777,17 +818,24 @@ namespace WeaponFOV
 		}
 		SaveEntry(editorID);
 
-		// Apply immediately if this is the currently equipped weapon.
-		// Update() may not run while the F4SE menu is open (game tick pauses),
-		// so we can't rely on it picking up lastAppliedFOV = -1.
-		if (GetEquippedEditorID() == editorID) {
-			logger::info("[WeaponFOV] SetEntry immediate apply: vm={:.1f} (weapon='{}')", fov, editorID);
-			ApplyViewmodelFOV(fov);
-			lastAppliedFOV = fov;
-			lastApplyTime  = std::chrono::steady_clock::now();
-		} else {
-			lastAppliedFOV = -1.0f;
+		// Menu callbacks can run on the render thread. Defer the equipped
+		// weapon read and engine apply to F4SE's game-thread queue.
+		const auto* taskInterface = F4SE::GetTaskInterface();
+		if (!taskInterface) {
+			logger::error("[WeaponFOV] Cannot apply entry '{}': F4SE task interface unavailable", editorID);
+			return;
 		}
+
+		taskInterface->AddTask([this, editorID, fov]() {
+			if (GetEquippedEditorID() == editorID) {
+				logger::info("[WeaponFOV] SetEntry main-thread apply: vm={:.1f} (weapon='{}')", fov, editorID);
+				ApplyViewmodelFOV(fov);
+				lastAppliedFOV = fov;
+				lastApplyTime = std::chrono::steady_clock::now();
+			} else {
+				lastAppliedFOV = -1.0f;
+			}
+		});
 	}
 
 	void Manager::RemoveEntry(const std::string& editorID)
@@ -800,16 +848,23 @@ namespace WeaponFOV
 		std::error_code ec;
 		std::filesystem::remove(GetEntryPath(editorID), ec);
 
-		// Apply the default immediately if this was the equipped weapon's entry.
-		if (GetEquippedEditorID() == editorID) {
-			const float def = defaultViewmodelFOV.load();
-			logger::info("[WeaponFOV] RemoveEntry immediate revert: vm={:.1f} (weapon='{}')", def, editorID);
-			ApplyViewmodelFOV(def);
-			lastAppliedFOV = def;
-			lastApplyTime  = std::chrono::steady_clock::now();
-		} else {
-			lastAppliedFOV = -1.0f;
+		const auto* taskInterface = F4SE::GetTaskInterface();
+		if (!taskInterface) {
+			logger::error("[WeaponFOV] Cannot apply removed entry '{}': F4SE task interface unavailable", editorID);
+			return;
 		}
+
+		taskInterface->AddTask([this, editorID]() {
+			if (GetEquippedEditorID() == editorID) {
+				const float def = defaultViewmodelFOV.load();
+				logger::info("[WeaponFOV] RemoveEntry main-thread revert: vm={:.1f} (weapon='{}')", def, editorID);
+				ApplyViewmodelFOV(def);
+				lastAppliedFOV = def;
+				lastApplyTime = std::chrono::steady_clock::now();
+			} else {
+				lastAppliedFOV = -1.0f;
+			}
+		});
 	}
 
 	std::vector<WBFOVEntry> Manager::GetEntries() const

@@ -843,6 +843,7 @@ void Settings::Load()
 	// Debug
 	debugLogging       = ini.GetBoolValue("Debug", "bDebugLogging", false);
 	debugOnScreen      = ini.GetBoolValue("Debug", "bDebugOnScreen", false);
+	debugDisableNodeWrites = ini.GetBoolValue("Debug", "bDisableInertiaNodeWrites", false);
 	// Auto-fire sound fade-out (ms applied to all phantom-override exit paths)
 	autoFireSoundFadeEnabled = ini.GetBoolValue("AutoFire", "bSoundFadeEnabled", true);
 	autoFireSoundFadeMs = static_cast<int>(ini.GetLongValue("AutoFire", "iSoundFadeMs", 100));
@@ -991,6 +992,7 @@ void Settings::Save()
 
 	setBool("Debug", "bDebugLogging", debugLogging);
 	setBool("Debug", "bDebugOnScreen", debugOnScreen);
+	setBool("Debug", "bDisableInertiaNodeWrites", debugDisableNodeWrites);
 	ini.SetBoolValue("AutoFire", "bSoundFadeEnabled", autoFireSoundFadeEnabled);
 	ini.SetLongValue("AutoFire", "iSoundFadeMs", autoFireSoundFadeMs);
 

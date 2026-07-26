@@ -51,10 +51,9 @@ namespace WeaponFOV
 		// viewmodel FOV if the player is ready.
 		void RefreshDefaults();
 
-		// After a game load, schedule a short burst of re-applies on a
-		// background thread. The engine's script compiler and FOV state
-		// aren't always ready on the very first frame after load, so
-		// retrying a few times over the first ~1s catches any race.
+		// After a game load, schedule a short burst of re-applies. A timer
+		// thread controls the delays, but every game-state read and write is
+		// queued to F4SE's main-thread task interface.
 		void ScheduleLoadRetry();
 
 		// External-override lock. When set, WBFOV's per-frame Update is a
@@ -71,7 +70,7 @@ namespace WeaponFOV
 
 		// ---- Query API ----
 		float            GetDefaultViewmodelFOV() const { return defaultViewmodelFOV.load(); }
-		FOVDefaultSource GetDefaultSource() const { return defaultSource; }
+		FOVDefaultSource GetDefaultSource() const { return defaultSource.load(); }
 		const char*      GetDefaultSourceName() const;
 
 		bool  HasEntry(const std::string& editorID) const;
@@ -129,13 +128,13 @@ namespace WeaponFOV
 
 		// Tracking
 		std::atomic<float>  defaultViewmodelFOV{ 80.0f };
-		FOVDefaultSource    defaultSource{ FOVDefaultSource::HardcodedDefault };
+		std::atomic<FOVDefaultSource> defaultSource{ FOVDefaultSource::HardcodedDefault };
 
 		// Cached camera (1st-person world) FOV — sourced from FOV slider mods
 		// then the user's INIs. Used as the Y argument of `fov X Y` so we
 		// only ever set the viewmodel and never disturb the camera FOV.
 		std::atomic<float>  cameraFOV{ 90.0f };
-		FOVDefaultSource    cameraSource{ FOVDefaultSource::HardcodedDefault };
+		std::atomic<FOVDefaultSource> cameraSource{ FOVDefaultSource::HardcodedDefault };
 
 		// Cached 3rd-person FOV — re-written to fDefaultWorldFOV:Display
 		// after every `fov X Y` to undo the command's side-effect of
@@ -166,9 +165,11 @@ namespace WeaponFOV
 		bool                prevWeaponDrawn{ false };
 		bool                lastEnabled{ true };
 
-		// Generation counter for ScheduleLoadRetry — incremented each call,
-		// so a prior thread that's still sleeping bails out.
+		// Generation counters for ScheduleLoadRetry. A newer request cancels
+		// older callbacks, and the first successful main-thread callback
+		// suppresses the remaining attempts in the same generation.
 		std::atomic<std::uint32_t> loadRetryGeneration{ 0 };
+		std::atomic<std::uint32_t> loadRetryCompletedGeneration{ 0 };
 
 		// Generation counter for InterpolateViewmodelFOV — a newer
 		// transition supersedes any in-flight one.

@@ -4,6 +4,7 @@
 #include "WeaponFOV.h"
 #include "FireOnEmpty.h"
 #include "ContextualLean.h"
+#include "OpenAnimationReplacerAPI-Clips.h"
 #include <format>
 
 // Pull ImGuiMCP types into scope so we don't need to prefix every ImVec4, ImGuiCol_*, etc.
@@ -2333,6 +2334,12 @@ namespace Menu
 			"Install FOV Slider F4SE for the best experience. It provides automatic "
 			"default FOV detection and coordinates with this plugin to avoid FOV conflicts "
 			"during Pip-Boy, terminal, and aiming contexts.");
+		ImGuiMCP::Spacing();
+		ImGuiMCP::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), "Note:");
+		ImGuiMCP::TextWrapped(
+			"Other FOV slider mods are only lightly supported. Defaults may still be "
+			"read from their INI files, but conflict avoidance and Pip-Boy / terminal / "
+			"aiming coordination are built for FOV Slider F4SE.");
 		ImGuiMCP::Unindent(8.0f);
 		ImGuiMCP::Spacing();
 
@@ -2376,8 +2383,7 @@ namespace Menu
 
 		if (ImGuiMCP::SmallButton("Refresh Defaults##wbfovRefresh")) {
 			mgr->RefreshDefaults();
-			State::saveStatusMsg = std::format("WBFOV defaults refreshed: {:.1f} ({})",
-				mgr->GetDefaultViewmodelFOV(), mgr->GetDefaultSourceName());
+			State::saveStatusMsg = "WBFOV defaults refresh queued";
 			State::saveStatusTimer = 4.0f;
 		}
 		if (ImGuiMCP::IsItemHovered()) {
@@ -2698,7 +2704,7 @@ namespace Menu
 		ImGuiMCP::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "FP Gunplay Overhaul - Extras");
 		ImGuiMCP::Spacing();
 		ImGuiMCP::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
-			"Quality-of-life features that complement the inertia system.");
+			"Quality-of-life features that generally improve gunplay.");
 		ImGuiMCP::Spacing();
 		ImGuiMCP::Separator();
 
@@ -3031,9 +3037,28 @@ namespace Menu
 		}
 
 		// ====== FIRE ON EMPTY ======
+		// Requires Open Animation Replacer: this plugin only forces the fire
+		// action; OAR supplies the dry-fire replacement. Grey the whole Extra
+		// out when OAR.dll is absent so the dependency is obvious in-menu.
 		ImGuiMCP::Spacing();
-		if (ImGuiMCP::CollapsingHeader("Fire on Empty")) {
-			RenderFireOnEmpty();
+		{
+			const bool oarInstalled = OAR::Clips::GetAPI() != nullptr;
+			if (!oarInstalled) {
+				ImGuiMCP::BeginDisabled(true);
+			}
+			if (ImGuiMCP::CollapsingHeader("Fire on Empty")) {
+				if (!oarInstalled) {
+					ImGuiMCP::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+						"Open Animation Replacer not detected — feature disabled.");
+					ImGuiMCP::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+						"Install Open Animation Replacer and reload to enable Fire on Empty.");
+					ImGuiMCP::Spacing();
+				}
+				RenderFireOnEmpty();
+			}
+			if (!oarInstalled) {
+				ImGuiMCP::EndDisabled();
+			}
 		}
 
 		// ====== SUPER SPRINT ======
@@ -3454,14 +3479,19 @@ namespace Menu
 
 		// ====== UNEDUCATED RELOAD: CHAMBER EXCLUSION ======
 		ImGuiMCP::Spacing();
-		if (ImGuiMCP::CollapsingHeader("Uneducated Reload - Chamber Exclusion")) {
+		{
 			auto* chamberMgr = ChamberExclusion::Manager::GetSingleton();
 			const bool urInstalled = chamberMgr->IsInstalled();
-
 			if (!urInstalled) {
-				ImGuiMCP::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
-					"UneducatedReload.esm not detected. Install the mod to use this feature.");
-			} else {
+				ImGuiMCP::BeginDisabled(true);
+			}
+			if (ImGuiMCP::CollapsingHeader("Uneducated Reload - Chamber Exclusion")) {
+				if (!urInstalled) {
+					ImGuiMCP::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+						"UneducatedReload.esm not detected — feature disabled.");
+					ImGuiMCP::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+						"Install Uneducated Reload and reload to enable Chamber Exclusion.");
+				} else {
 				ImGuiMCP::Indent(8.0f);
 				ImGuiMCP::Spacing();
 				ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "What it does:");
@@ -3533,6 +3563,10 @@ namespace Menu
 						s_chamberRemoveIdx = -1;
 					}
 				}
+				} // else urInstalled
+			} // CollapsingHeader
+			if (!urInstalled) {
+				ImGuiMCP::EndDisabled();
 			}
 		}
 

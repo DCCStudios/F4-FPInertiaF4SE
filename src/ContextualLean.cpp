@@ -1,5 +1,6 @@
 #include "ContextualLean.h"
 #include "Settings.h"
+#include "SyntheticInput.h"
 
 #include <nlohmann/json.hpp>
 
@@ -13,20 +14,17 @@
 // bhkPickData ray helper
 // ------------------------------------------------------------
 // Multi-runtime CommonLib supplies bhkPickData and TESObjectCELL::Pick
-// wrappers with OG/NG/AE relocations. The collision-layer setter is not
-// exposed, so that one verified layout write remains local.
+// wrappers with OG/NG/AE relocations. The ray query's typed filter-data
+// member is shared by all supported runtimes.
 // ============================================================
 namespace
 {
-	// The pick's own collision layer lives in the collision-filter word
-	// at +0x0A. bhkPickData is 0xE0 on every supported runtime, and this
-	// offset is the verified CellPick contract used by RainSplashesF4SE.
+	// Set the low collision-layer bits through CommonLib's declared Havok
+	// layout. This is castQuery +0x0C; an older shim used +0x0A, which
+	// straddled hknpMaterialId padding and the real filter word.
 	void SetCollisionLayer(RE::bhkPickData& a_pick, std::uint32_t a_layer)
 	{
-		constexpr std::size_t kCFilterOffset = 0x0A;
-		auto* raw = reinterpret_cast<std::uint32_t*>(
-			reinterpret_cast<std::byte*>(&a_pick) + kCFilterOffset);
-		*raw = a_layer;
+		a_pick.castQuery.m_filterData.m_collisionFilterInfo = a_layer;
 	}
 
 	// kLOS = 41 — the "what blocks line of sight" layer. Semantically the
@@ -143,6 +141,7 @@ namespace
 	void FillButtonEvent(RE::ButtonEvent& a_evt, const DecomposedKey& a_key,
 		float a_value, float a_heldSecs)
 	{
+		SyntheticInput::InitializeButtonEvent(a_evt);
 		a_evt.device       = a_key.device;
 		a_evt.deviceID     = 0;
 		a_evt.eventType    = RE::INPUT_EVENT_TYPE::kButton;
@@ -668,7 +667,9 @@ namespace ContextualLean
 			inFP = (stateID == RE::CameraStates::kFirstPerson ||
 			        stateID == RE::CameraStates::kIronSights);
 		}
-		const auto gunState = static_cast<std::uint32_t>(a_player->gunState);
+		// Mask to 4 bits: Dear-Modding's signed GUN_STATE bitfield
+		// sign-extends kFireSighted (8) to 0xFFFFFFF8 without the mask.
+		const auto gunState = static_cast<std::uint32_t>(a_player->gunState) & 0xFu;
 		const bool inADS = (gunState == 6 || gunState == 8);
 		const bool detectOK = inFP && deviceAllowed && !a_player->IsDead(true);
 
