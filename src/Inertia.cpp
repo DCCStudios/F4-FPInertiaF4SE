@@ -4808,9 +4808,9 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 
 	// ============================================================
 	// SEMI-AUTO phantom shot conversion.
-	// The FIRST weaponFire anim event inside the post-recovery window is
-	// converted into a real shot ON THE SAME FRAME.  The 21:29 session
-	// proved the timing half of this design:
+	// weaponFire anim events inside the post-recovery window that do not
+	// discharge ammo are converted into real shots ON THE SAME FRAME.
+	// The 21:29 session proved the timing half of this design:
 	//   * waiting even ~4 frames before queueing lets the actor leave the
 	//     firing state, and the engine then sits on the queued fire until
 	//     the NEXT attack (the round landed ~300ms late and paired up with
@@ -4825,24 +4825,49 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	// event itself is the proof that a fire attempt is actively playing
 	// THIS frame — which is the condition the same-frame rule needs.
 	// The gunState is still logged so a regression is attributable.
-	// The window closes after one conversion: only the first shot after a
-	// recovery is phantom, and later (healthy) shots must never be
-	// double-fired by us.
+	//
+	// MULTIPLE conversions per window (02:16 session): the engine's
+	// pipeline stays broken for ~1s after recovery — the first converted
+	// shot fired, but rapid follow-up clicks played animation-only until
+	// ~1s passed.  A close-after-one-conversion window left those clicks
+	// dead.  Conversions are paced by the weapon's fire interval, and the
+	// window closes EARLY the moment an ammo decrease arrives that is NOT
+	// attributable to our own forced shot (the engine discharging on its
+	// own = pipeline healthy = healthy shots must not be double-fired).
 	// ============================================================
 	if (semiPhantomWindow > 0.0f) {
 		semiPhantomWindow = std::max(0.0f, semiPhantomWindow - delta);
-		if (!earlyAdsAutoFireWatching && !ammoDecreased
-		    && animEventSink.firedThisFrame.load(std::memory_order_relaxed)) {
-			semiPhantomWindow = 0.0f;  // one conversion per recovery
+		if (semiPhantomPace > 0.0f) semiPhantomPace -= delta;
+		if (semiPhantomOwnShotTimer > 0.0f) semiPhantomOwnShotTimer -= delta;
+
+		if (ammoDecreased) {
+			if (semiPhantomOwnShotTimer > 0.0f) {
+				// Our forced shot landing — consume the attribution so the
+				// NEXT decrease is correctly read as engine-owned.
+				semiPhantomOwnShotTimer = 0.0f;
+			} else {
+				// Engine discharged on its own: the pipeline has healed.
+				// Stop converting immediately so healthy shots can never
+				// pair with a forced duplicate.
+				semiPhantomWindow = 0.0f;
+				semiPhantomPace = 0.0f;
+				logger::info("[Phantom-Fire] Engine-owned discharge observed — semi-auto conversion window closed (pipeline healthy)");
+			}
+		} else if (!earlyAdsAutoFireWatching && semiPhantomPace <= 0.0f
+		           && animEventSink.firedThisFrame.load(std::memory_order_relaxed)) {
 			auto* base = GetEquippedWeaponBase(player);
 			auto* weap = base ? base->As<RE::TESObjectWEAP>() : nullptr;
 			auto* ammo = player->GetCurrentAmmo(RE::BGSEquipIndex{ 0 });
 			auto* tqi  = RE::TaskQueueInterface::GetSingleton();
 			if (weap && tqi) {
 				tqi->QueueWeaponFire(weap, player, RE::BGSEquipIndex{ 0 }, ammo);
-				logger::info("[Phantom-Fire] Semi-auto shot converted same-frame via QueueWeaponFire (gs={}, mag={}, ammo={})",
+				// Pace the next conversion at the weapon's own rate, and
+				// open the attribution window for this shot's ammo drop.
+				semiPhantomPace = std::max(EquippedWeapon::GetWeaponFireInterval(player), 0.1f);
+				semiPhantomOwnShotTimer = 0.25f;
+				logger::info("[Phantom-Fire] Semi-auto shot converted same-frame via QueueWeaponFire (gs={}, mag={}, ammo={}, windowLeft={:.2f}s)",
 					GunStateLocal::Read(player), curMagAmmo,
-					ammo ? ammo->GetFormEditorID() : "null");
+					ammo ? ammo->GetFormEditorID() : "null", semiPhantomWindow);
 				PushEvent("SemiPhantom: forced shot");
 			}
 		}
@@ -6192,6 +6217,8 @@ void Inertia::InertiaManager::Reset()
 	earlyFireCancelTimer   = 0.0f;
 	earlyFireCancelArmSemi = false;
 	semiPhantomWindow = 0.0f;
+	semiPhantomPace = 0.0f;
+	semiPhantomOwnShotTimer = 0.0f;
 
 	// Fire on Empty: if a dry-fire idle is still playing, stop it so it
 	// can't blend through camera switches / game loads.

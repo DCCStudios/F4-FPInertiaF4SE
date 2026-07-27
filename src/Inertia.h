@@ -424,11 +424,23 @@ namespace Inertia
 		float earlyFireCancelTimer{ 0.0f };
 
 		// SEMI-AUTO phantom shot conversion window (seconds).  Opened when a
-		// forced-idle recovery completes on a non-automatic weapon with Early
-		// Fire Cancel enabled.  The FIRST weaponFire anim event inside the
-		// window is converted same-frame into one real QueueWeaponFire
-		// discharge, then the window closes (later shots are healthy).
+		// forced-idle recovery completes on a non-automatic weapon with fire
+		// held (or an explicit fire-cancel request).  EVERY weaponFire anim
+		// event inside the window that does not discharge ammo is converted
+		// same-frame into a real QueueWeaponFire shot, paced by the weapon's
+		// fire interval — the engine's pipeline stays broken for ~1s after
+		// recovery (verified 02:16 session: first shot converted fine, rapid
+		// follow-up clicks played animation-only until ~1s passed), so a
+		// single conversion left the follow-up clicks dead.  The window
+		// closes EARLY when an engine-owned discharge is observed (pipeline
+		// healthy again), or at expiry.
 		float semiPhantomWindow{ 0.0f };
+		// Min time until the next conversion (weapon fire interval pacing).
+		float semiPhantomPace{ 0.0f };
+		// While > 0, the next ammo decrease is attributed to OUR forced shot
+		// (set right after each conversion); an ammo decrease outside this
+		// attribution window is engine-owned and closes the window early.
+		float semiPhantomOwnShotTimer{ 0.0f };
 
 		// Set when an Early Fire Cancel triggers so the phantom-fire override
 		// is armed even for SEMI-AUTO weapons. Early ADS only arms the phantom
