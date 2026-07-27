@@ -66,6 +66,54 @@ namespace ContextualLean
 		int  GetCurrentLeanDir() const { return ourLeanDir; }
 		bool IsLastInputGamepad() const { return lastInputWasGamepad; }
 
+		// ---- Live debug view (read by the menu's Debug View panel) ----
+		// Plain fields written on the game thread each Update and read by
+		// the render thread for display only — benign data races, same
+		// policy as InertiaManager's DebugSnapshot.
+		struct DebugView
+		{
+			// Gating
+			bool  featureAvailable{ false };
+			bool  inFP{ false };
+			bool  inADS{ false };
+			bool  deviceAllowed{ false };
+			bool  menuBlocked{ false };
+			std::uint32_t gunState{ 0 };
+
+			// Last engage evaluation (only meaningful while idle)
+			bool  evalRan{ false };       // pattern evaluation ran this frame
+			bool  pitchGated{ false };    // skipped because aiming steeply down
+			float distC{ 0.0f }, distL{ 0.0f }, distR{ 0.0f };
+			bool  hitC{ false }, hitL{ false }, hitR{ false };
+			bool  blockedC{ false }, blockedL{ false }, blockedR{ false };
+			// Scene-graph name of each hit object (empty when no hit) —
+			// identifies invisible colliders behind mystery engages.
+			char  hitNameC[48]{};
+			char  hitNameL[48]{};
+			char  hitNameR[48]{};
+			bool  usedNarrow{ false };    // thin-obstacle narrow probes ran
+			float distNL{ 0.0f }, distNR{ 0.0f };
+			bool  narrowBlockedL{ false }, narrowBlockedR{ false };
+			int   desired{ 0 };           // pattern verdict: 1 left, -1 right, 0 none
+			float desiredHold{ 0.0f };    // stability timer
+
+			// State machine
+			float leanMagnitude{ 0.0f };  // live readback from US's camera bone
+			float cooldown{ 0.0f };
+			float backoff{ 0.0f };
+
+			// While leaning
+			float moveDist{ 0.0f };       // distance from engage anchor
+			float yawDeltaDeg{ 0.0f };    // aim yaw change since engage
+			bool  anchoredValid{ false }; // anchored cover rays still see the obstacle
+			float minHold{ 0.0f };
+			float patternFail{ 0.0f };
+
+			// Last release reason (string literal, or nullptr when none yet)
+			const char* lastReleaseReason{ nullptr };
+		};
+		const DebugView& GetDebugView() const { return dbg; }
+
 	private:
 		Manager() = default;
 		~Manager() = default;
@@ -164,5 +212,8 @@ namespace ContextualLean
 		float sinceLastEngage{ 999.0f };
 		int   quickEngageCount{ 0 };
 		bool  lastReleaseWasPatternFail{ false };
+
+		// ---- Live debug view (display only) ----
+		DebugView dbg{};
 	};
 }

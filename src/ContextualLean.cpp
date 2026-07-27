@@ -6,6 +6,7 @@
 
 #include <Windows.h>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -28,27 +29,208 @@ namespace
 	}
 
 	// kLOS = 41 — the "what blocks line of sight" layer. Semantically the
-	// right query for "is there cover in front of me worth peeking around",
-	// and it does not register bipeds, so passing NPCs don't trigger leans.
+	// right query for "is there cover in front of me worth peeking around".
+	// NOTE: contrary to the original assumption, LOS picks DO register
+	// actor bodies (verified in-game 2026-07-27: the player's own
+	// "skeleton.nif" blocked the rays at point-blank range). Actor hits
+	// are skipped explicitly in CastLOSRay instead.
 	constexpr std::uint32_t kColLayerLOS = 41;
 
+	// ALLOW-list of collision layers that count as cover: solid, visible
+	// geometry the player can plausibly peek around. Everything else —
+	// trigger volumes, portals, invisible walls, pathing/avoid/collision
+	// boxes, camera helpers, water planes — is exactly the class of
+	// invisible collider that produced "leaned in the middle of an open
+	// room" reports (the RainSplashesF4SE pick work catalogued these
+	// helper layers registering on ray queries). An allow-list is chosen
+	// over a deny-list deliberately: an unknown layer slipping through a
+	// deny-list causes a false lean (annoying, visible), while an unknown
+	// layer missing from the allow-list merely skips a lean (benign, and
+	// consistent with this feature's strict no-guess design).
+	bool IsSolidCoverLayer(RE::COL_LAYER a_layer)
+	{
+		switch (a_layer) {
+		case RE::COL_LAYER::kStatic:
+		case RE::COL_LAYER::kAnimStatic:
+		case RE::COL_LAYER::kTransparent:
+		case RE::COL_LAYER::kClutter:
+		case RE::COL_LAYER::kWeapon:
+		case RE::COL_LAYER::kTrees:
+		case RE::COL_LAYER::kProps:
+		case RE::COL_LAYER::kTerrain:
+		case RE::COL_LAYER::kTrap:
+		case RE::COL_LAYER::kGround:
+		case RE::COL_LAYER::kDebrisLarge:
+		case RE::COL_LAYER::kTransparentSmall:
+		case RE::COL_LAYER::kTransparentSmallAnim:
+		case RE::COL_LAYER::kClutterLarge:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	// Debug-display name for a collision layer (engine layer table).
+	const char* LayerName(RE::COL_LAYER a_layer)
+	{
+		static constexpr const char* kNames[47] = {
+			"Unidentified", "Static", "AnimStatic", "Transparent", "Clutter",
+			"Weapon", "Projectile", "Spell", "Biped", "Trees",
+			"Props", "Water", "Trigger", "Terrain", "Trap",
+			"NonCollidable", "CloudTrap", "Ground", "Portal", "DebrisSmall",
+			"DebrisLarge", "AcousticSpace", "ActorZone", "ProjectileZone", "GasTrap",
+			"ShellCasing", "TransparentSmall", "InvisibleWall", "TransparentSmallAnim", "ClutterLarge",
+			"CharController", "StairHelper", "DeadBip", "BipedNoCC", "AvoidBox",
+			"CollisionBox", "CameraSphere", "DoorDetection", "ConeProjectile", "Camera",
+			"ItemPicker", "LOS", "PathingPick", "Unused0", "Unused1",
+			"SpellExplosion", "DroppingPick"
+		};
+		const auto idx = static_cast<std::int32_t>(a_layer);
+		return (idx >= 0 && idx < 47) ? kNames[idx] : "DataDefined";
+	}
+
+	// Result of one LOS ray, with enough detail for layer filtering and
+	// the debug view.
+	struct LOSHit
+	{
+		float           fraction{ 1.0f };
+		RE::NiAVObject* obj{ nullptr };       // scene-graph object (when known)
+		RE::COL_LAYER   layer{ RE::COL_LAYER::kUnidentified };
+		bool            layerKnown{ false };  // collector supplied the layer
+	};
+
+	// Does this hit belong to the player's own 3D — or to ANY actor's
+	// skeleton? In-game evidence (debug view, 2026-07-27): LOS picks DO
+	// register the player's own third-person body (hit object
+	// "skeleton.nif" at 15-22 units straight down the aim vector), which
+	// was the actual source of the "leans in the middle of an open room"
+	// reports — whichever side ray clipped the body decided the lean
+	// direction, which is why those leans also felt random. Actors are
+	// never valid cover for this feature (the player's own body is not
+	// cover at all, and NPCs move), so both are skipped by re-casting
+	// past the hit.
+	bool IsActorHit(RE::NiAVObject* a_obj, RE::NiAVObject* a_selfRootA, RE::NiAVObject* a_selfRootB)
+	{
+		for (auto* p = a_obj; p; p = p->parent) {
+			if ((a_selfRootA && p == a_selfRootA) || (a_selfRootB && p == a_selfRootB)) {
+				return true;
+			}
+			// Actor skeleton roots carry the mesh filename as node name.
+			if (p->name.c_str() && _stricmp(p->name.c_str(), "skeleton.nif") == 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	// Cast a ray from a_from to a_to against the player's parent cell.
-	// Returns true and writes the hit fraction (0..1 along the segment)
-	// when something LOS-blocking was hit. Per the reference contract,
-	// a pick counts as a hit when HasHit() OR the returned NiAVObject
-	// is non-null.
+	// Returns true and fills a_out when solid, visible cover was hit.
+	//
+	// SELF/ACTOR SKIP: hits belonging to the player's own body or any
+	// actor skeleton advance the ray start just past the hit and re-cast
+	// the remainder (up to 3 attempts), so real cover behind the body
+	// still measures at its true distance.
+	//
+	// LAYER FILTERING: when the pick's collector carries per-hit results
+	// (the RainSplashes contract: enumerate GetAllCollectorRayHitAt and
+	// read filter info from each), the NEAREST hit on an allowed layer
+	// wins and helper-volume hits are skipped entirely. When the
+	// collector is empty (observed on AE: no per-hit results, embedded
+	// closest hit only), fall back to that closest result — no layer
+	// available, but the self/actor skip above still applies.
+	//
+	// FRACTION SANITY (both paths): a reported hit with a fraction at or
+	// below zero would mean a wall exactly at the ray start —
+	// geometrically impossible for a standing player, but exactly what a
+	// stale or garbage result produces. Since fraction*rayLen feeds the
+	// "blocked within engage distance" tests, a bogus 0 reads as
+	// point-blank cover and triggers leans in open rooms. Reject those.
 	bool CastLOSRay(RE::TESObjectCELL* a_cell, const RE::NiPoint3& a_from,
-		const RE::NiPoint3& a_to, float& a_fractionOut)
+		const RE::NiPoint3& a_to, LOSHit& a_out,
+		RE::NiAVObject* a_selfRootA, RE::NiAVObject* a_selfRootB)
 	{
 		if (!a_cell) return false;
-		RE::bhkPickData pick{};
-		SetCollisionLayer(pick, kColLayerLOS);
-		pick.SetStartEnd(a_from, a_to);
-		RE::NiAVObject* hitObj = a_cell->Pick(pick);
-		if (pick.HasHit() || hitObj) {
-			a_fractionOut = pick.GetHitFraction();
+
+		const RE::NiPoint3 seg{ a_to.x - a_from.x, a_to.y - a_from.y, a_to.z - a_from.z };
+		const float segLen = std::sqrt(seg.x * seg.x + seg.y * seg.y + seg.z * seg.z);
+		if (segLen < 1.0f) return false;
+		// Step ~4 units past a skipped actor hit before re-casting.
+		const float epsFrac = 4.0f / segLen;
+
+		float consumed = 0.0f;  // fraction of the ORIGINAL segment already skipped
+		for (int attempt = 0; attempt < 3; ++attempt) {
+			RE::NiPoint3 start{
+				a_from.x + seg.x * consumed,
+				a_from.y + seg.y * consumed,
+				a_from.z + seg.z * consumed
+			};
+			RE::bhkPickData pick{};
+			SetCollisionLayer(pick, kColLayerLOS);
+			pick.SetStartEnd(start, a_to);
+			RE::NiAVObject* hitObj = a_cell->Pick(pick);
+			if (!pick.HasHit() && !hitObj) return false;
+
+			const float embedded = pick.GetHitFraction();
+
+			// Resolve this cast to (segFraction, obj, layer).
+			float           segFraction = -1.0f;
+			RE::NiAVObject* obj = nullptr;
+			RE::COL_LAYER   layer{ RE::COL_LAYER::kUnidentified };
+			bool            layerKnown = false;
+
+			const std::int32_t hitCount = pick.GetAllCollectorRayHitSize();
+			if (hitCount > 0) {
+				float         bestFrac = 2.0f;
+				RE::COL_LAYER bestLayer{ RE::COL_LAYER::kUnidentified };
+				for (std::int32_t i = 0; i < hitCount; ++i) {
+					RE::hknpCollisionResult res{};
+					if (!pick.GetAllCollectorRayHitAt(static_cast<std::uint32_t>(i), res)) {
+						continue;
+					}
+					const float frac = res.fraction.val();
+					if (!std::isfinite(frac) || frac <= 0.001f || frac > 1.0f) continue;
+					const auto hitLayer = res.hitBodyInfo.shapeCollisionFilterInfo.val().GetCollisionLayer();
+					if (!IsSolidCoverLayer(hitLayer)) continue;
+					if (frac < bestFrac) {
+						bestFrac = frac;
+						bestLayer = hitLayer;
+					}
+				}
+				if (bestFrac > 1.0f) {
+					// Every hit along the ray was a non-solid helper volume.
+					return false;
+				}
+				segFraction = bestFrac;
+				layer = bestLayer;
+				layerKnown = true;
+				// The engine's returned NiAVObject names its CLOSEST hit;
+				// it only describes our chosen hit when fractions match.
+				obj = (std::fabs(bestFrac - embedded) < 0.005f) ? hitObj : nullptr;
+			} else {
+				if (!std::isfinite(embedded) || embedded <= 0.001f || embedded > 1.0f) {
+					return false;
+				}
+				segFraction = embedded;
+				obj = hitObj;
+			}
+
+			// Map the segment-local fraction back onto the original ray.
+			const float overallFraction = consumed + (1.0f - consumed) * segFraction;
+
+			if (obj && IsActorHit(obj, a_selfRootA, a_selfRootB)) {
+				consumed = overallFraction + epsFrac;
+				if (consumed >= 1.0f) return false;  // actor filled the rest of the ray
+				continue;
+			}
+
+			a_out.fraction = overallFraction;
+			a_out.obj = obj;
+			a_out.layer = layer;
+			a_out.layerKnown = layerKnown;
 			return true;
 		}
+		// Three actor hits in a row — treat as no cover (a crowd is not
+		// something to lean around).
 		return false;
 	}
 }
@@ -416,6 +598,9 @@ namespace ContextualLean
 			RE::NiPoint3 origin{};
 			RE::NiPoint3 fwd{};
 			RE::NiPoint3 right{};
+			// Player 3D roots (first + third person) for self-hit skipping.
+			RE::NiAVObject* selfRoot1st{ nullptr };
+			RE::NiAVObject* selfRoot3rd{ nullptr };
 			bool valid{ false };
 		};
 
@@ -427,6 +612,8 @@ namespace ContextualLean
 			RayFrame f{};
 			f.cell = a_player->parentCell;
 			if (!f.cell) return f;
+			f.selfRoot1st = a_player->Get3D(true);
+			f.selfRoot3rd = a_player->Get3D(false);
 
 			a_player->GetEyeVector(f.origin, f.fwd, true);
 			const float fwdLen = std::sqrt(f.fwd.x * f.fwd.x + f.fwd.y * f.fwd.y + f.fwd.z * f.fwd.z);
@@ -445,8 +632,10 @@ namespace ContextualLean
 		}
 
 		// Forward ray at a lateral offset. Returns hit distance in
-		// a_distOut (rayLen when nothing was hit).
-		bool CastOffsetRay(const RayFrame& a_frame, float a_lateral, float a_rayLen, float& a_distOut)
+		// a_distOut (rayLen when nothing was hit). a_hitOut optionally
+		// receives the full hit detail (debug identification).
+		bool CastOffsetRay(const RayFrame& a_frame, float a_lateral, float a_rayLen,
+			float& a_distOut, LOSHit* a_hitOut = nullptr)
 		{
 			RE::NiPoint3 from{
 				a_frame.origin.x + a_frame.right.x * a_lateral,
@@ -458,13 +647,37 @@ namespace ContextualLean
 				from.y + a_frame.fwd.y * a_rayLen,
 				from.z + a_frame.fwd.z * a_rayLen
 			};
-			float fraction = 1.0f;
-			if (CastLOSRay(a_frame.cell, from, to, fraction)) {
-				a_distOut = fraction * a_rayLen;
+			LOSHit hit{};
+			if (CastLOSRay(a_frame.cell, from, to, hit,
+					a_frame.selfRoot1st, a_frame.selfRoot3rd)) {
+				a_distOut = hit.fraction * a_rayLen;
+				if (a_hitOut) *a_hitOut = hit;
 				return true;
 			}
 			a_distOut = a_rayLen;
 			return false;
+		}
+
+		// Compose a debug label for a hit: scene-graph object name (when
+		// the engine's closest hit is the one we accepted) plus collision
+		// layer (when the collector supplied it). Copied immediately —
+		// NiAVObject lifetime is not ours to hold.
+		void ComposeHitLabel(char* a_buf, std::size_t a_bufSize, bool a_hit, const LOSHit& a_detail)
+		{
+			if (!a_hit) {
+				a_buf[0] = '\0';
+				return;
+			}
+			const char* objName = (a_detail.obj && a_detail.obj->name.c_str() &&
+			                       a_detail.obj->name.c_str()[0])
+				? a_detail.obj->name.c_str() : "";
+			if (a_detail.layerKnown && objName[0]) {
+				std::snprintf(a_buf, a_bufSize, "%s / %s", objName, LayerName(a_detail.layer));
+			} else if (a_detail.layerKnown) {
+				std::snprintf(a_buf, a_bufSize, "%s", LayerName(a_detail.layer));
+			} else {
+				std::snprintf(a_buf, a_bufSize, "%s", objName[0] ? objName : "(unnamed)");
+			}
 		}
 	}
 
@@ -500,20 +713,46 @@ namespace ContextualLean
 	{
 		auto* gs = Settings::GetSingleton();
 		const RayFrame frame = BuildRayFrame(a_player);
+
+		dbg.evalRan = true;
+		dbg.pitchGated = false;
+		dbg.usedNarrow = false;
+		dbg.narrowBlockedL = dbg.narrowBlockedR = false;
+		dbg.distNL = dbg.distNR = 0.0f;
+
 		if (!frame.valid) return 0;
+
+		// Pitch gate: aiming steeply DOWNWARD makes all three rays hit the
+		// ground/rubble at eye-ray distances, and sloped debris can produce
+		// an asymmetric pattern that reads as "cover with an open side".
+		// Nobody peeks around ground they are staring at — skip evaluation
+		// below ~33 degrees of downward pitch (fwd is normalized, so fwd.z
+		// is sin(pitch)).
+		if (frame.fwd.z < -0.55f) {
+			dbg.pitchGated = true;
+			return 0;
+		}
 
 		const float engageDist = std::max(gs->contextualLeanEngageDistance, 16.0f);
 		const float probeLen = std::max(gs->contextualLeanDisengageDistance, engageDist);
 		const float sideOff = std::clamp(gs->contextualLeanSideOffset, 4.0f, 128.0f);
 
 		float distC = probeLen, distL = probeLen, distR = probeLen;
-		const bool hitC = CastOffsetRay(frame, 0.0f, probeLen, distC);
-		const bool hitL = CastOffsetRay(frame, -sideOff, probeLen, distL);
-		const bool hitR = CastOffsetRay(frame, +sideOff, probeLen, distR);
+		LOSHit detC{}, detL{}, detR{};
+		const bool hitC = CastOffsetRay(frame, 0.0f, probeLen, distC, &detC);
+		const bool hitL = CastOffsetRay(frame, -sideOff, probeLen, distL, &detL);
+		const bool hitR = CastOffsetRay(frame, +sideOff, probeLen, distR, &detR);
 
 		const bool blockedC = hitC && distC <= engageDist;
 		const bool blockedL = hitL && distL <= engageDist;
 		const bool blockedR = hitR && distR <= engageDist;
+
+		dbg.distC = distC; dbg.distL = distL; dbg.distR = distR;
+		dbg.hitC = hitC; dbg.hitL = hitL; dbg.hitR = hitR;
+		dbg.blockedC = blockedC; dbg.blockedL = blockedL; dbg.blockedR = blockedR;
+		ComposeHitLabel(dbg.hitNameC, sizeof(dbg.hitNameC), hitC, detC);
+		ComposeHitLabel(dbg.hitNameL, sizeof(dbg.hitNameL), hitL, detL);
+		ComposeHitLabel(dbg.hitNameR, sizeof(dbg.hitNameR), hitR, detR);
 
 		// Openness is a CONTRAST test, not a full-clearance test: the open
 		// side must see meaningfully deeper than the cover (so a column
@@ -557,6 +796,9 @@ namespace ContextualLean
 			const bool hnr = CastOffsetRay(frame, +sideOff * 0.4f, probeLen, dnr);
 			const bool nBlockedL = hnl && dnl <= engageDist;
 			const bool nBlockedR = hnr && dnr <= engageDist;
+			dbg.usedNarrow = true;
+			dbg.distNL = dnl; dbg.distNR = dnr;
+			dbg.narrowBlockedL = nBlockedL; dbg.narrowBlockedR = nBlockedR;
 			if (nBlockedL && openVs(hnr, dnr, dnl)) return -1;
 			if (nBlockedR && openVs(hnl, dnl, dnr)) return 1;
 		}
@@ -629,12 +871,20 @@ namespace ContextualLean
 			usInstalled && usConfigLoaded &&
 			!usDisableLean && AreKeysUsable();
 
+		dbg.featureAvailable = featureAvailable;
+		dbg.cooldown = std::max(cooldownTimer, 0.0f);
+		dbg.backoff = std::max(backoffTimer, 0.0f);
+		dbg.evalRan = false;  // set again below when the pattern actually runs
+
 		if (!featureAvailable) {
 			// Feature turned off (or US lean unusable) mid-lean: release
 			// once. Injection outside ADS is only processed by US when
 			// !bADSOnly, but in the bADSOnly case US clears the lean on
 			// its own every non-ADS frame, so either way it ends.
-			if (ourLeanDir != 0) Disengage(true);
+			if (ourLeanDir != 0) {
+				dbg.lastReleaseReason = "feature unavailable";
+				Disengage(true);
+			}
 			return;
 		}
 
@@ -644,15 +894,18 @@ namespace ContextualLean
 		const bool deviceAllowed = lastInputWasGamepad
 			? gs->contextualLeanGamepad
 			: gs->contextualLeanKBM;
+		dbg.deviceAllowed = deviceAllowed;
 
 		// Menus: US ignores injected (and real) lean input while
 		// UI->menuMode is set, so we can neither engage nor release —
 		// freeze the state machine until the menu closes.
 		auto* ui = RE::UI::GetSingleton();
+		dbg.menuBlocked = true;
 		if (!ui || ui->menuMode != 0) return;
 		static const RE::BSFixedString kVATSMenu{ "VATSMenu" };
 		static const RE::BSFixedString kPipboyMenu{ "PipboyMenu" };
 		if (ui->GetMenuOpen(kVATSMenu) || ui->GetMenuOpen(kPipboyMenu)) return;
+		dbg.menuBlocked = false;
 
 		// Gameplay gates. Detection (ray pattern + stability timer) runs in
 		// first person even BEFORE aiming, so that a pattern that is
@@ -673,6 +926,11 @@ namespace ContextualLean
 		const bool inADS = (gunState == 6 || gunState == 8);
 		const bool detectOK = inFP && deviceAllowed && !a_player->IsDead(true);
 
+		dbg.inFP = inFP;
+		dbg.inADS = inADS;
+		dbg.gunState = gunState;
+		dbg.leanMagnitude = ReadLeanMagnitude(a_player);
+
 		if (!detectOK) {
 			if (ourLeanDir != 0) {
 				// First person / device / alive lost mid-lean. With
@@ -680,6 +938,7 @@ namespace ContextualLean
 				// frame already — injecting would do nothing (its input
 				// gate also drops the events). Otherwise send the release
 				// so the lean ends naturally.
+				dbg.lastReleaseReason = "gating lost (FP/device/alive)";
 				Disengage(!usADSOnly);
 			}
 			desiredHoldTimer = 0.0f;
@@ -691,6 +950,7 @@ namespace ContextualLean
 			// ADS released mid-lean: user-intent release (short cooldown,
 			// doesn't count toward the rapid-cycle guard — re-ADSing at
 			// the same corner should re-lean promptly).
+			dbg.lastReleaseReason = "ADS released";
 			Disengage(!usADSOnly);
 			desiredHoldTimer = 0.0f;
 			lastDesired = 0;
@@ -706,13 +966,16 @@ namespace ContextualLean
 			// Don't evaluate while a previous lean is still blending out:
 			// the residual camera displacement would skew the rays (this
 			// also naturally spaces out any engage/release cycling).
-			if (cooldownTimer > 0.0f || ReadLeanMagnitude(a_player) > 0.15f) {
+			// (dbg.leanMagnitude was read fresh above this frame.)
+			if (cooldownTimer > 0.0f || dbg.leanMagnitude > 0.15f) {
 				desiredHoldTimer = 0.0f;
 				lastDesired = 0;
 				return;
 			}
 
 			const int desired = EvaluateEngageDirection(a_player);
+			dbg.desired = desired;
+			dbg.desiredHold = desiredHoldTimer;
 			if (desired == lastDesired) {
 				desiredHoldTimer += a_delta;
 			} else {
@@ -777,9 +1040,10 @@ namespace ContextualLean
 		// unverified, and a wrong sign here caused false cancels before.)
 		if (overrideCheckTimer > 0.0f) {
 			overrideCheckTimer -= a_delta;
-			if (overrideCheckTimer <= 0.0f && ReadLeanMagnitude(a_player) < 0.2f) {
+			if (overrideCheckTimer <= 0.0f && dbg.leanMagnitude < 0.2f) {
 				logger::info("[ContextualLean] Lean did not take effect "
 					"(externally cancelled?) — backing off");
+				dbg.lastReleaseReason = "external cancel (lean never appeared)";
 				Disengage(true);
 				backoffTimer = 2.0f;
 				return;
@@ -793,10 +1057,13 @@ namespace ContextualLean
 		// tolerance comfortably absorbs.
 		const float dx = a_player->data.location.x - anchorPlayerPos.x;
 		const float dy = a_player->data.location.y - anchorPlayerPos.y;
-		if (std::sqrt(dx * dx + dy * dy) > gs->contextualLeanMoveTolerance) {
+		const float moveDist = std::sqrt(dx * dx + dy * dy);
+		dbg.moveDist = moveDist;
+		if (moveDist > gs->contextualLeanMoveTolerance) {
 			if (gs->debugLogging) {
 				logger::info("[ContextualLean] Release (moved from engage spot)");
 			}
+			dbg.lastReleaseReason = "moved from engage spot";
 			Disengage(true);
 			return;
 		}
@@ -807,10 +1074,12 @@ namespace ContextualLean
 		constexpr float kPi = 3.14159265f;
 		while (yawDelta > kPi) yawDelta -= 2.0f * kPi;
 		while (yawDelta < -kPi) yawDelta += 2.0f * kPi;
+		dbg.yawDeltaDeg = std::fabs(yawDelta) * 57.29578f;
 		if (std::fabs(yawDelta) > gs->contextualLeanYawTolerance * 0.017453292f) {
 			if (gs->debugLogging) {
 				logger::info("[ContextualLean] Release (turned away from engage direction)");
 			}
+			dbg.lastReleaseReason = "turned away";
 			Disengage(true);
 			return;
 		}
@@ -818,16 +1087,22 @@ namespace ContextualLean
 		// Cover-gone release: anchored rays no longer see the obstacle.
 		// Runs against the ANCHORED origin, so the lean's own camera
 		// displacement cannot feed back into this decision.
+		dbg.minHold = minHoldTimer;
 		if (AnchoredPatternStillValid(a_player)) {
 			patternFailTimer = 0.0f;
+			dbg.anchoredValid = true;
+			dbg.patternFail = 0.0f;
 			return;
 		}
+		dbg.anchoredValid = false;
 		patternFailTimer += a_delta;
+		dbg.patternFail = patternFailTimer;
 		if (minHoldTimer >= gs->contextualLeanMinHold &&
 			patternFailTimer >= gs->contextualLeanDisengageDelay) {
 			if (gs->debugLogging) {
 				logger::info("[ContextualLean] Release (cover gone for {:.2f}s)", patternFailTimer);
 			}
+			dbg.lastReleaseReason = "cover gone";
 			Disengage(true, true);
 		}
 	}

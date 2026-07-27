@@ -6,6 +6,8 @@
 #include "OpenAnimationReplacerAPI-Clips.h"
 #include "SyntheticInput.h"
 
+#include <RE/P/PowerArmor.h>  // RE::PowerArmor::ActorInPowerArmor (engine PA check)
+
 // ============================================================
 // Static members
 // ============================================================
@@ -301,25 +303,45 @@ namespace LocalSound
 		return a_handle.FadeOutAndRelease(a_milliseconds);
 	}
 
-	// Fades out every sound handle owned by the player's currently equipped
-	// weapon AND the player's generic soundHand handle.  Returns the number
-	// of handles that returned `true` from FadeOutAndRelease.
+	// Fade handles that are STILL PLAYING.  Handles whose sound already
+	// finished are skipped, and the dedicated one-shot reverb fields
+	// (reverbSound / prevReverb) are never passed here at all.  We do NOT
+	// require IsEnvelopeLoop(): the 20:59 session log showed exits where the
+	// active SCAR fire loop reported fadedHandles=0 under that gate, leaving
+	// the loop running.  A still-playing one-shot caught by this fade is
+	// harmless — at the default 5000ms fade rate it loses almost no volume
+	// before ending naturally.
+	inline bool FadeOutLoopHandle(RE::BSSoundHandle& a_handle, std::uint16_t a_milliseconds)
+	{
+		if (!a_handle.IsValid()) return false;
+		if (!a_handle.IsPlaying()) return false;
+		return FadeOutAndRelease(a_handle, a_milliseconds);
+	}
+
+	// Fades out stuck LOOP sound handles owned by the player's currently
+	// equipped weapon AND the player's generic soundHand handle.  Returns
+	// the number of handles that returned `true` from FadeOutAndRelease.
 	//
 	// The auto-fire LOOP sound for a weapon is held on
 	// EquippedWeaponData::attackSound (offset 0x78); when our phantom-fire
 	// override drives QueueWeaponFire directly, the engine never emits the
 	// natural attackStateExit cleanup that would normally fade this handle,
-	// so we have to do it ourselves on phantom-override exit.  We also fade
-	// idleSound/reverbSound/prevAttack/prevReverb and player.soundHand as
-	// belt-and-suspenders coverage for any other looping audio the engine
-	// may have started during the phantom run.
+	// so we have to do it ourselves on phantom-override exit.  idleSound
+	// (idle hum loops) and player.soundHand are faded as belt-and-suspenders
+	// coverage for other looping audio started during the phantom run.
+	//
+	// reverbSound / prevReverb are NEVER touched: those hold the one-shot
+	// gunfire reverb tail, which ends on its own and can never get stuck
+	// looping.  attackSound / prevAttack / soundHand are only faded when
+	// IsEnvelopeLoop() reports true, so a one-shot reverb that AttackEnd
+	// just parked on attackSound is also preserved.
 	inline int FadeOutAllPlayerWeaponSounds(RE::PlayerCharacter* a_player, std::uint16_t a_milliseconds)
 	{
 		int faded = 0;
 		if (!a_player) return faded;
 
 		// Player generic sound handle (covers various non-weapon loops).
-		if (FadeOutAndRelease(a_player->soundHand, a_milliseconds)) ++faded;
+		if (FadeOutLoopHandle(a_player->soundHand, a_milliseconds)) ++faded;
 
 		// Equipped weapon sound handles — the actual gunfire loop lives here.
 		if (a_player->currentProcess && a_player->currentProcess->middleHigh) {
@@ -327,11 +349,13 @@ namespace LocalSound
 			for (auto& eq : a_player->currentProcess->middleHigh->equippedItems) {
 				auto* wd = static_cast<RE::EquippedWeaponData*>(eq.data.get());
 				if (!wd) continue;
-				if (FadeOutAndRelease(wd->attackSound, a_milliseconds))  ++faded;
-				if (FadeOutAndRelease(wd->idleSound,   a_milliseconds))  ++faded;
-				if (FadeOutAndRelease(wd->reverbSound, a_milliseconds))  ++faded;
-				if (FadeOutAndRelease(wd->prevAttack,  a_milliseconds))  ++faded;
-				if (FadeOutAndRelease(wd->prevReverb,  a_milliseconds))  ++faded;
+				// If the engine has already flipped attackSound over to the
+				// reverb tail, leave it alone — fading it is the AE reverb bug.
+				if (!wd->reverbSoundIsTail) {
+					if (FadeOutLoopHandle(wd->attackSound, a_milliseconds)) ++faded;
+				}
+				if (FadeOutLoopHandle(wd->idleSound,  a_milliseconds)) ++faded;
+				if (FadeOutLoopHandle(wd->prevAttack, a_milliseconds)) ++faded;
 			}
 		}
 		return faded;
@@ -1914,6 +1938,17 @@ static float EvaluateTransitionEnvelope(const ADSTransitionSettings& cfg, float 
 bool Inertia::InertiaManager::IsInPowerArmor(RE::PlayerCharacter* player) const
 {
 	if (!player) return false;
+
+	// Primary: the engine's own power-armor check. This is the same
+	// function the game uses internally (Actor::ActorInPowerArmor), so it
+	// stays correct regardless of biped-slot layout differences between
+	// runtimes. CommonLibF4 maps its REL::ID for OG/NG/AE, so this resolves
+	// on every supported runtime.
+	if (RE::PowerArmor::ActorInPowerArmor(*player)) return true;
+
+	// Fallback: the previous biped-frame-slot heuristic. Kept so that if the
+	// engine call ever fails to resolve on some runtime, the old detection
+	// still gives a best-effort answer instead of always reporting "false".
 	if (player->biped) {
 		constexpr std::uint32_t kPAFrameSlot = 40;
 		if (player->biped->object[kPAFrameSlot].parent.object != nullptr) return true;
@@ -2430,6 +2465,12 @@ pa_map:
 	case WeaponType::Energy:    return WeaponType::PA_Energy;
 	default:                    return WeaponType::PA_Rifle;
 	}
+}
+
+WeaponType Inertia::InertiaManager::DetectEquippedWeaponType(RE::PlayerCharacter* a_player) const
+{
+	EquippedWeaponSnapshot weap = FetchEquippedWeapon(a_player);
+	return DetectWeaponType(weap, IsInPowerArmor(a_player));
 }
 
 const WeaponInertiaSettings& Inertia::InertiaManager::GetCurrentWeaponSettings(RE::PlayerCharacter* player)
@@ -4486,14 +4527,87 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			atkHandler->inputEventHandlingEnabled = true;
 			logger::info("[EarlyADS-Idle] Released — handler restored");
 
+			// ============================================================
+			// PRIMARY FIX: re-arm the ENGINE's attack pipeline with a
+			// synthetic fire tap (release + fresh press through the real
+			// AttackBlockHandler).  The pipeline is broken after our forced
+			// recovery precisely because the engine never saw a fresh press
+			// — the player pressed fire DURING the reload, so all it gets
+			// afterwards are "held" events (heldSecs > 0), which don't
+			// start an attack.  A fresh press (heldSecs == 0) starts a
+			// genuine engine attack: real discharges, and — critically —
+			// the engine's own attack-stop path on release, which is the
+			// only thing that stops the auto-fire loop sound WITH its tail
+			// (every attempt to stop that loop ourselves either failed to
+			// find the handle or cut the audio instantly).
+			// Same tap machinery as the verified ADS re-entry (SimulateTap).
+			// NOTE: fireInputHeld is trustworthy here — the handler was
+			// suppressed during the idle frames, so s_fireHeld still holds
+			// the value from the reload (true if the player kept holding).
+			// ============================================================
+			bool syntheticTapSent = false;
+			if (ws.earlyAdsAutoFireEnabled && fireInputHeld) {
+				syntheticTapSent = AttackInput::SimulateTap("PrimaryAttack");
+				logger::info("[EarlyADS-AutoFire] Synthetic PrimaryAttack tap {} — re-arming engine attack pipeline",
+					syntheticTapSent ? "dispatched" : "FAILED (handler unavailable)");
+			}
+
+			// FALLBACK: arm the phantom QueueWeaponFire loop for AUTOMATICS
+			// only.  With the tap dispatched this loop should stay a pure
+			// observer — the engine discharges, ammoDecreased suppresses
+			// forcing, and the exit below stays silent.
+			const bool armSemiFromFireCancel = earlyFireCancelArmSemi;
+			earlyFireCancelArmSemi = false;  // consume the one-shot request
 			if (ws.earlyAdsAutoFireEnabled && IsWeaponAutomatic(player)) {
 				earlyAdsAutoFireWatching     = true;
 				earlyAdsAutoFireTimer        = 5.0f;   // safety cap on phantom-override duration
 				earlyAdsAutoFireAttempts     = 0;
-				earlyAdsAutoFireGraceTimer   = 0.0f;   // ready to fire immediately on first anim event
 				earlyAdsAutoFirePhantomGap   = 0.0f;
 				earlyAdsAutoFireSeenGS8      = false;
-				logger::info("[EarlyADS-AutoFire] Phantom override armed (auto weapon) — will drive QueueWeaponFire from anim events");
+				// When the tap was sent, give the ENGINE one fire interval
+				// to prove it's discharging before the fallback forces a
+				// shot — forcing on the very first anim event would double
+				// the engine's own first round.  Without the tap, force
+				// immediately as before.
+				earlyAdsAutoFireGraceTimer = syntheticTapSent
+					? std::max(EquippedWeapon::GetWeaponFireInterval(player), 0.1f)
+					: 0.0f;
+				logger::info("[EarlyADS-AutoFire] Phantom override armed (auto weapon, grace={:.2f}s) — fallback behind engine pipeline",
+					earlyAdsAutoFireGraceTimer);
+			} else if (ws.earlyAdsAutoFireEnabled && (armSemiFromFireCancel || fireInputHeld)) {
+				// SEMI-AUTO: same-frame conversion window, regardless of
+				// whether the tap was sent.
+				//
+				// GATE HISTORY (each narrower gate missed a real case):
+				//   * Grace-gated loop: structurally could never fire — the
+				//     grace is one full fire interval, a semi's ONLY
+				//     weaponFire anim event lands inside it, no second
+				//     event ever comes, and the loop exits 150ms later
+				//     with zero shots ("plays the animation but no round").
+				//   * armSemiFromFireCancel only: missed hip-hold entirely.
+				//     The 01:56 session log proved hip-hold semis never
+				//     reach Early Fire Cancel — holding PRIMARY fire sets
+				//     the handler's heldStateActive ("either attack button
+				//     held"), which arms Early ADS Return and suppresses
+				//     fire cancel.  Recovery then ran with the request
+				//     flag false and armed NOTHING for the semi.
+				//   Hence: any semi-auto with fire held at recovery (or an
+				//   explicit fire-cancel request from the click case) gets
+				//   the window.
+				//
+				// Double-fire safety: ammoDecreased suppresses the
+				// conversion on any frame where the engine discharged; the
+				// window closes after one conversion; and when the ADS
+				// auto-arm probe engages the phantom loop first (the
+				// working ADS+hold case), the window's
+				// !earlyAdsAutoFireWatching gate keeps it inert.  The
+				// engine's tap-shot has never been observed to discharge
+				// for a semi-auto in this broken state (zero rounds across
+				// every test session), so waiting on it is not a real
+				// protection — it was the bug.
+				semiPhantomWindow = 2.0f;
+				logger::info("[Phantom-Fire] Semi-auto conversion window opened (2.0s, tap={}, fireCancel={}, fireHeld={})",
+					syntheticTapSent, armSemiFromFireCancel, fireInputHeld);
 			}
 		}
 	}
@@ -4596,40 +4710,50 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 
 		if (!afIsFiringState && earlyAdsAutoFirePhantomGap > 0.05f) {
 			// Player released trigger — gunState dropped out of the
-			// firing range (kFire/kFireSighted).  Exit immediately and
-			// best-effort silence the loop sound.  Fade duration is
-			// controlled by Settings::autoFireSoundFadeMs (UI slider).
-			RE::BSFixedString evtStop("attackStop");
-			RE::BSFixedString evtAttackEnd("AttackEnd");
-			RE::BSFixedString evtSoundStop("SoundStop");
-			player->NotifyAnimationGraphImpl(evtStop);
-			player->NotifyAnimationGraphImpl(evtAttackEnd);
-			player->NotifyAnimationGraphImpl(evtSoundStop);
+			// firing range (kFire/kFireSighted).  Exit the override.
+			//
+			// AUDIO: if we never forced a shot (attempts == 0), the ENGINE
+			// owned this burst — its own attack-stop path runs on the real
+			// release and handles the loop + tail natively.  Touch NOTHING.
+			// Only when the fallback actually forced shots do we clean up:
+			// the 22:52 session proved attackStop alone does not stop the
+			// forced-shot loop (it played ad infinitum) and the watchdog's
+			// handle enumeration never sees the real loop handle — the only
+			// thing that reliably stops it is the full event set, at the
+			// cost of clipping the tail.
 			HavokVar::SetBool(player, HavokVar::kIsAttacking, false);
-			int faded = 0;
-			const std::uint16_t fadeMs = static_cast<std::uint16_t>(
-				std::clamp(gs->autoFireSoundFadeMs, 0, 5000));
-			if (gs->autoFireSoundFadeEnabled)
-				faded = LocalSound::FadeOutAllPlayerWeaponSounds(player, fadeMs);
-			logger::info("[Phantom-Fire] gunState left firing range (gs={}, shots={}, fadeMs={}, fadedHandles={}) — exit phantom override",
-				afGS, earlyAdsAutoFireAttempts, fadeMs, faded);
+			if (earlyAdsAutoFireAttempts > 0) {
+				RE::BSFixedString evtStop("attackStop");
+				RE::BSFixedString evtAttackEnd("AttackEnd");
+				RE::BSFixedString evtSoundStop("SoundStop");
+				player->NotifyAnimationGraphImpl(evtStop);
+				player->NotifyAnimationGraphImpl(evtAttackEnd);
+				player->NotifyAnimationGraphImpl(evtSoundStop);
+			}
+			logger::info("[Phantom-Fire] gunState left firing range (gs={}, shots={}) — exit phantom override ({})",
+				afGS, earlyAdsAutoFireAttempts,
+				earlyAdsAutoFireAttempts > 0 ? "forced shots -> full stop events" : "engine-owned burst, no cleanup");
 			earlyAdsAutoFireWatching = false;
 			PushEvent("AutoFire: trigger released");
 		} else if (earlyAdsAutoFireTimer <= 0.0f) {
-			// Safety cap (5s) — force stop phantom loop and exit.
-			RE::BSFixedString evtStop("attackStop");
-			RE::BSFixedString evtAttackEnd("AttackEnd");
-			RE::BSFixedString evtSoundStop("SoundStop");
-			player->NotifyAnimationGraphImpl(evtStop);
-			player->NotifyAnimationGraphImpl(evtAttackEnd);
-			player->NotifyAnimationGraphImpl(evtSoundStop);
-			HavokVar::SetBool(player, HavokVar::kIsAttacking, false);
+			// Safety cap (5s) — something is genuinely wedged, so this path
+			// keeps the forced cleanup: fade stuck loops, then reset the SM.
 			int faded = 0;
 			const std::uint16_t fadeMs = static_cast<std::uint16_t>(
 				std::clamp(gs->autoFireSoundFadeMs, 0, 5000));
-			if (gs->autoFireSoundFadeEnabled)
+			if (gs->autoFireSoundFadeEnabled) {
 				faded = LocalSound::FadeOutAllPlayerWeaponSounds(player, fadeMs);
-			logger::warn("[Phantom-Fire] Safety timeout (5s) — force attackStop+AttackEnd+SoundStop+FadeOut, exit (shots={}, fadeMs={}, fadedHandles={})",
+			}
+			RE::BSFixedString evtStop("attackStop");
+			RE::BSFixedString evtAttackEnd("AttackEnd");
+			player->NotifyAnimationGraphImpl(evtStop);
+			player->NotifyAnimationGraphImpl(evtAttackEnd);
+			HavokVar::SetBool(player, HavokVar::kIsAttacking, false);
+			if (!gs->autoFireSoundFadeEnabled) {
+				RE::BSFixedString evtSoundStop("SoundStop");
+				player->NotifyAnimationGraphImpl(evtSoundStop);
+			}
+			logger::warn("[Phantom-Fire] Safety timeout (5s) — force fade+attackStop+AttackEnd, exit (shots={}, fadeMs={}, fadedHandles={})",
 				earlyAdsAutoFireAttempts, fadeMs, faded);
 			earlyAdsAutoFireWatching = false;
 		} else if (gotFireEvent && afIsFiringState && !ammoDecreased) {
@@ -4662,36 +4786,65 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			}
 		} else if (earlyAdsAutoFirePhantomGap > 0.15f) {
 			// No weaponFire anim event for 150ms — player let go of trigger.
-			// Force the phantom loop to end so audio/anim stop cleanly.
-			// We send three events back-to-back:
-			//   attackStop  — clears the attack state machine
-			//   AttackEnd   — known graph event (rootbehavior.xml line 6165),
-			//                 some sound annotations on this end fire-loop
-			//                 sounds via the SoundStop hook
-			//   SoundStop   — generic graph sound-stop event (line 6016) —
-			//                 best-effort stop for any active loop sounds
-			// Plus FadeOutAndRelease on the equipped weapon's attackSound
-			// (offset 0x78 on EquippedWeaponData) — this is the actual loop
-			// sound the engine started directly via BSAudioManager when
-			// QueueWeaponFire fired the weapon, and it doesn't get cleaned
-			// up by attackStop alone because the proper attack state machine
-			// never engaged for our forced shots.
-			RE::BSFixedString evtStop("attackStop");
-			RE::BSFixedString evtAttackEnd("AttackEnd");
-			RE::BSFixedString evtSoundStop("SoundStop");
-			bool r1 = player->NotifyAnimationGraphImpl(evtStop);
-			bool r2 = player->NotifyAnimationGraphImpl(evtAttackEnd);
-			bool r3 = player->NotifyAnimationGraphImpl(evtSoundStop);
+			// Same audio policy as the gunState-left exit: engine-owned
+			// bursts (attempts == 0) get NO cleanup; forced-shot bursts get
+			// the full stop event set (the only reliable loop stop).
 			HavokVar::SetBool(player, HavokVar::kIsAttacking, false);
-			int faded = 0;
-			const std::uint16_t fadeMs = static_cast<std::uint16_t>(
-				std::clamp(gs->autoFireSoundFadeMs, 0, 5000));
-			if (gs->autoFireSoundFadeEnabled)
-				faded = LocalSound::FadeOutAllPlayerWeaponSounds(player, fadeMs);
-			logger::info("[EarlyADS-AutoFire] Trigger released (gap={:.3f}s, shots={}) — attackStop={}, AttackEnd={}, SoundStop={}, fadeMs={}, fadedHandles={}, exit phantom override",
-				earlyAdsAutoFirePhantomGap, earlyAdsAutoFireAttempts, r1, r2, r3, fadeMs, faded);
+			if (earlyAdsAutoFireAttempts > 0) {
+				RE::BSFixedString evtStop("attackStop");
+				RE::BSFixedString evtAttackEnd("AttackEnd");
+				RE::BSFixedString evtSoundStop("SoundStop");
+				player->NotifyAnimationGraphImpl(evtStop);
+				player->NotifyAnimationGraphImpl(evtAttackEnd);
+				player->NotifyAnimationGraphImpl(evtSoundStop);
+			}
+			logger::info("[EarlyADS-AutoFire] Trigger released (gap={:.3f}s, shots={}) — exit phantom override ({})",
+				earlyAdsAutoFirePhantomGap, earlyAdsAutoFireAttempts,
+				earlyAdsAutoFireAttempts > 0 ? "forced shots -> full stop events" : "engine-owned burst, no cleanup");
 			earlyAdsAutoFireWatching = false;
 			PushEvent("AutoFire: trigger released");
+		}
+	}
+
+	// ============================================================
+	// SEMI-AUTO phantom shot conversion.
+	// The FIRST weaponFire anim event inside the post-recovery window is
+	// converted into a real shot ON THE SAME FRAME.  The 21:29 session
+	// proved the timing half of this design:
+	//   * waiting even ~4 frames before queueing lets the actor leave the
+	//     firing state, and the engine then sits on the queued fire until
+	//     the NEXT attack (the round landed ~300ms late and paired up with
+	//     the player's next click as a "double shot");
+	//   * gating on atkState==0/!attacking never fires, because in this
+	//     broken state the engine REPORTS attacking=true while silently
+	//     failing to discharge (same finding as the phantom loop's
+	//     "exit on state machine engaged" removal above).
+	// The firing-gunState gate has been dropped for the same reason the
+	// atkState gate was: in the broken post-recovery state the engine's
+	// state reporting is untrustworthy in BOTH directions, and the anim
+	// event itself is the proof that a fire attempt is actively playing
+	// THIS frame — which is the condition the same-frame rule needs.
+	// The gunState is still logged so a regression is attributable.
+	// The window closes after one conversion: only the first shot after a
+	// recovery is phantom, and later (healthy) shots must never be
+	// double-fired by us.
+	// ============================================================
+	if (semiPhantomWindow > 0.0f) {
+		semiPhantomWindow = std::max(0.0f, semiPhantomWindow - delta);
+		if (!earlyAdsAutoFireWatching && !ammoDecreased
+		    && animEventSink.firedThisFrame.load(std::memory_order_relaxed)) {
+			semiPhantomWindow = 0.0f;  // one conversion per recovery
+			auto* base = GetEquippedWeaponBase(player);
+			auto* weap = base ? base->As<RE::TESObjectWEAP>() : nullptr;
+			auto* ammo = player->GetCurrentAmmo(RE::BGSEquipIndex{ 0 });
+			auto* tqi  = RE::TaskQueueInterface::GetSingleton();
+			if (weap && tqi) {
+				tqi->QueueWeaponFire(weap, player, RE::BGSEquipIndex{ 0 }, ammo);
+				logger::info("[Phantom-Fire] Semi-auto shot converted same-frame via QueueWeaponFire (gs={}, mag={}, ammo={})",
+					GunStateLocal::Read(player), curMagAmmo,
+					ammo ? ammo->GetFormEditorID() : "null");
+				PushEvent("SemiPhantom: forced shot");
+			}
 		}
 	}
 
@@ -4907,7 +5060,10 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	// Suppressed if the EarlyADS path is already active so the two flows
 	// don't race each other on the same reload.
 	// ============================================================
-	if (isCurrentlyReloading && ws.earlyFireCancelEnabled
+	// Early Fire Cancel is gated behind Early ADS Return: it is a sub-feature
+	// that reuses the same recovery pipeline, and the menu greys it out when
+	// Early ADS is off, so keep the runtime consistent with that UI state.
+	if (isCurrentlyReloading && ws.earlyAdsReturnEnabled && ws.earlyFireCancelEnabled
 	    && !earlyFireCancelArmed && !earlyAdsArmed
 	    && fireInputHeld)
 	{
@@ -4929,6 +5085,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		earlyFireCancelArmed   = false;
 		earlyFireCancelPending = false;
 		earlyFireCancelTimer   = 0.0f;
+		earlyFireCancelArmSemi = false;
 	}
 
 	if (earlyFireCancelArmed && earlyFireCancelPending) {
@@ -4946,6 +5103,13 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 				logger::info("[EarlyFireCancel] Skipped force-end — gunState={} (reload already ended)", preGS);
 				earlyFireCancelArmed = false;
 				isCurrentlyReloading = false;
+				// A fire-cancelled reload leaves the first shot playing its
+				// fire animation without discharging.  Automatics get the
+				// phantom override loop; semi-autos get the same-frame
+				// conversion window instead (the loop's force path is gated
+				// on a firing gunState, which the broken post-recovery
+				// state does not reliably report — the semi's single anim
+				// event would be skipped and the loop would exit shotless).
 				if (ws.earlyAdsAutoFireEnabled && IsWeaponAutomatic(player)) {
 					earlyAdsAutoFireWatching   = true;
 					earlyAdsAutoFireTimer      = 5.0f;
@@ -4954,6 +5118,9 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 					earlyAdsAutoFirePhantomGap = 0.0f;
 					earlyAdsAutoFireSeenGS8    = false;
 					logger::info("[EarlyFireCancel] Phantom override armed (auto weapon, natural reload end)");
+				} else if (ws.earlyAdsAutoFireEnabled) {
+					semiPhantomWindow = 2.0f;
+					logger::info("[EarlyFireCancel] Semi-auto conversion window opened (2.0s, natural reload end)");
 				}
 				PushEvent("Early Fire Cancel (natural)");
 			} else {
@@ -4994,6 +5161,10 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 				earlyAdsPostDiagFrames     = 10;
 				earlyAdsForceIdleFrames    = 3;
 				earlyAdsForceIdleCountdown = 3;
+				// Request that the shared force-idle-release arming below also
+				// arms the phantom override for semi-autos (not just autos),
+				// so a semi-auto's cancel-fire shot actually discharges.
+				earlyFireCancelArmSemi     = true;
 				// Note: the existing earlyAdsForceIdleFrames countdown block
 				// (above) re-enables the handler and arms the phantom override
 				// once the idle frames complete — that path is shared so we
@@ -6019,6 +6190,8 @@ void Inertia::InertiaManager::Reset()
 	earlyFireCancelArmed   = false;
 	earlyFireCancelPending = false;
 	earlyFireCancelTimer   = 0.0f;
+	earlyFireCancelArmSemi = false;
+	semiPhantomWindow = 0.0f;
 
 	// Fire on Empty: if a dry-fire idle is still playing, stop it so it
 	// can't blend through camera switches / game loads.

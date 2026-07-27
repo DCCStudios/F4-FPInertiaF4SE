@@ -846,7 +846,7 @@ void Settings::Load()
 	debugDisableNodeWrites = ini.GetBoolValue("Debug", "bDisableInertiaNodeWrites", false);
 	// Auto-fire sound fade-out (ms applied to all phantom-override exit paths)
 	autoFireSoundFadeEnabled = ini.GetBoolValue("AutoFire", "bSoundFadeEnabled", true);
-	autoFireSoundFadeMs = static_cast<int>(ini.GetLongValue("AutoFire", "iSoundFadeMs", 100));
+	autoFireSoundFadeMs = static_cast<int>(ini.GetLongValue("AutoFire", "iSoundFadeMs", 5000));
 	autoFireSoundFadeMs = std::clamp(autoFireSoundFadeMs, 0, 5000);
 
 	// Set built-in defaults before loading per-weapon INI sections

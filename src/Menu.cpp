@@ -105,6 +105,7 @@ namespace Menu
 		F4SEMenuFramework::AddSectionItem("Debug Info", RenderDebugInfo);
 		F4SEMenuFramework::AddSectionItem("Extras", RenderExtras);
 		State::debugPopoutWindow = F4SEMenuFramework::AddWindow(RenderDebugPopout, false);
+		State::ctxLeanDebugWindow = F4SEMenuFramework::AddWindow(RenderCtxLeanDebugPopout, false);
 		registered = true;
 
 		logger::info("[FPGunplayOverhaul] Menu registered with F4SE Menu Framework");
@@ -359,6 +360,118 @@ namespace Menu
 		InertiaManager::GetSingleton()->FillDebugSnapshot(snap);
 		DrawDebugContent(snap);
 
+		ImGuiMCP::End();
+	}
+
+	// ============================================================
+	// Contextual Lean live debug view — shared by the Extras tree
+	// node and the standalone popout window (which stays visible
+	// during gameplay, where the values actually update).
+	// ============================================================
+	static void DrawContextualLeanDebugContent()
+	{
+		auto* settings = Settings::GetSingleton();
+		auto* cl = ContextualLean::Manager::GetSingleton();
+		const auto& d = cl->GetDebugView();
+		const ImVec4 cGood{ 0.45f, 1.0f, 0.55f, 1.0f };
+		const ImVec4 cBad{ 1.0f, 0.45f, 0.45f, 1.0f };
+		const ImVec4 cDim{ 0.6f, 0.6f, 0.6f, 1.0f };
+		const ImVec4 cHead{ 0.9f, 0.8f, 0.3f, 1.0f };
+
+		auto Flag = [&](const char* a_label, bool a_on) {
+			ImGuiMCP::TextColored(a_on ? cGood : cBad, "%s: %s", a_label, a_on ? "yes" : "no");
+		};
+
+		ImGuiMCP::TextColored(cHead, "[ Gates ]");
+		Flag("Feature available", d.featureAvailable);
+		Flag("First person", d.inFP);
+		Flag("Device allowed", d.deviceAllowed);
+		ImGuiMCP::TextColored(d.inADS ? cGood : cDim, "ADS: %s (gunState=%u)",
+			d.inADS ? "yes" : "no", d.gunState);
+		if (d.menuBlocked)
+			ImGuiMCP::TextColored(cBad, "Blocked by open menu");
+		if (d.cooldown > 0.0f)
+			ImGuiMCP::TextColored(cDim, "Cooldown: %.2fs", d.cooldown);
+		if (d.backoff > 0.0f)
+			ImGuiMCP::TextColored(cBad, "Backoff: %.2fs", d.backoff);
+
+		ImGuiMCP::Spacing();
+		const int leanDir = cl->GetCurrentLeanDir();
+		ImGuiMCP::TextColored(cHead, "[ State ]");
+		if (leanDir != 0) {
+			ImGuiMCP::TextColored(cGood, "LEANING %s (magnitude %.2f)",
+				leanDir > 0 ? "LEFT" : "RIGHT", d.leanMagnitude);
+			ImGuiMCP::Text("Moved: %.1f / %.0f units", d.moveDist,
+				settings->contextualLeanMoveTolerance);
+			ImGuiMCP::Text("Turned: %.1f / %.0f deg", d.yawDeltaDeg,
+				settings->contextualLeanYawTolerance);
+			ImGuiMCP::TextColored(d.anchoredValid ? cGood : cBad,
+				"Anchored cover rays: %s", d.anchoredValid ? "still valid" : "GONE");
+			if (!d.anchoredValid)
+				ImGuiMCP::Text("Cover gone for %.2fs (releases at %.2fs, min hold %.2fs)",
+					d.patternFail, settings->contextualLeanDisengageDelay, d.minHold);
+		} else {
+			ImGuiMCP::TextColored(cDim, "Idle (lean magnitude %.2f)", d.leanMagnitude);
+			if (d.lastReleaseReason)
+				ImGuiMCP::TextColored(cDim, "Last release: %s", d.lastReleaseReason);
+		}
+
+		ImGuiMCP::Spacing();
+		ImGuiMCP::TextColored(cHead, "[ Engage Rays ]  (only while idle + un-leaned)");
+		if (!d.evalRan) {
+			ImGuiMCP::TextColored(cDim, "Not evaluating this frame (gated)");
+		} else if (d.pitchGated) {
+			ImGuiMCP::TextColored(cDim, "Skipped: aiming too far downward");
+		} else {
+			auto Ray = [&](const char* a_name, bool a_hit, float a_dist, bool a_blocked,
+			               const char* a_objName) {
+				if (!a_hit) {
+					ImGuiMCP::TextColored(cGood, "%s: clear", a_name);
+					return;
+				}
+				if (a_blocked)
+					ImGuiMCP::TextColored(cBad, "%s: BLOCKED at %.0f", a_name, a_dist);
+				else
+					ImGuiMCP::TextColored(cDim, "%s: hit at %.0f (beyond engage)", a_name, a_dist);
+				if (a_objName && a_objName[0]) {
+					ImGuiMCP::SameLine();
+					ImGuiMCP::TextColored(cDim, " [%s]", a_objName);
+				}
+			};
+			Ray("Center", d.hitC, d.distC, d.blockedC, d.hitNameC);
+			Ray("Left  ", d.hitL, d.distL, d.blockedL, d.hitNameL);
+			Ray("Right ", d.hitR, d.distR, d.blockedR, d.hitNameR);
+			if (d.usedNarrow) {
+				ImGuiMCP::TextColored(cDim, "Thin-obstacle narrow probes:");
+				Ray("  Narrow L", true, d.distNL, d.narrowBlockedL, nullptr);
+				Ray("  Narrow R", true, d.distNR, d.narrowBlockedR, nullptr);
+			}
+			if (d.desired != 0) {
+				ImGuiMCP::TextColored(cGood, "Pattern verdict: lean %s (stable %.2f / %.2fs)",
+					d.desired > 0 ? "LEFT" : "RIGHT", d.desiredHold,
+					settings->contextualLeanEngageDelay);
+			} else {
+				ImGuiMCP::TextColored(cDim, "Pattern verdict: no lean");
+			}
+		}
+	}
+
+	void __stdcall RenderCtxLeanDebugPopout()
+	{
+		auto viewport = ImGuiMCP::GetMainViewport();
+
+		ImGuiMCP::ImVec2 windowSize = ImGuiMCP::ImVec2{
+			viewport->Size.x * 0.22f, viewport->Size.y * 0.45f };
+		ImGuiMCP::ImVec2 windowPos = ImGuiMCP::ImVec2{
+			viewport->Pos.x + 20,
+			viewport->Pos.y + viewport->Size.y * 0.2f };
+
+		ImGuiMCP::SetNextWindowPos(windowPos, ImGuiMCP::ImGuiCond_Appearing, { 0, 0 });
+		ImGuiMCP::SetNextWindowSize(windowSize, ImGuiMCP::ImGuiCond_Appearing);
+
+		ImGuiMCP::Begin("Contextual Lean Debug##FPGunplayOverhaul", nullptr,
+			ImGuiMCP::ImGuiWindowFlags_NoCollapse);
+		DrawContextualLeanDebugContent();
 		ImGuiMCP::End();
 	}
 
@@ -990,42 +1103,32 @@ namespace Menu
 				if (player) {
 					auto* base = GetEquippedWeaponBase(player);
 					if (base) {
-						// Ask the InertiaManager to detect the type (reuses its full detection logic)
-						auto* mgr = Inertia::InertiaManager::GetSingleton();
-						(void)mgr;  // Detection uses internal state; best we can do here is keyword lookup
-
-						// Basic keyword/type detection for menu display
+						// Custom keyword-mapped types first (string-keyed, not
+						// covered by the enum-based runtime detection).
 						auto* weap = base->As<RE::TESObjectWEAP>();
-						WeaponType detected = WeaponType::Rifle;
+						bool matchedCustom = false;
 						if (weap) {
-							// Check custom keyword types first
 							std::string customType = presets->GetBestKeywordMatch(weap);
 							if (!customType.empty()) {
 								for (int i = 0; i < static_cast<int>(types.size()); ++i) {
 									if (types[i].isCustomType && types[i].internalName == customType) {
 										State::selectedWeaponTypeIndex = i;
-										detected = WeaponType::Unarmed; // sentinel to skip standard search
+										matchedCustom = true;
 										break;
 									}
 								}
-							} else {
-								// EditorID override?
-								if (!equippedWeaponID.empty() && presets->HasWeaponTypeOverride(equippedWeaponID)) {
-									detected = presets->GetWeaponTypeOverride(equippedWeaponID);
-								} else {
-									// F4: weaponData.type int8_t: 0=HandToHand, 1-6=Melee, 14=Thrown
-									auto t = static_cast<std::int8_t>(weap->weaponData.type.get());
-									if (t == 0)                      detected = WeaponType::Unarmed;
-									else if (t >= 1 && t <= 6)       detected = WeaponType::Melee;
-									else if (t == 14)                detected = WeaponType::Throwable;
-									else                             detected = WeaponType::Rifle;
-								}
-
-								for (int i = 0; i < static_cast<int>(types.size()); ++i) {
-									if (!types[i].isCustomType && types[i].type == detected) {
-										State::selectedWeaponTypeIndex = i;
-										break;
-									}
+							}
+						}
+						if (!matchedCustom) {
+							// Full runtime detection: weapon keywords, EditorID
+							// overrides, AND the power-armor variant mapping —
+							// in PA this lands on the PA_* type actually in use.
+							const WeaponType detected =
+								Inertia::InertiaManager::GetSingleton()->DetectEquippedWeaponType(player);
+							for (int i = 0; i < static_cast<int>(types.size()); ++i) {
+								if (!types[i].isCustomType && types[i].type == detected) {
+									State::selectedWeaponTypeIndex = i;
+									break;
 								}
 							}
 						}
@@ -1133,6 +1236,108 @@ namespace Menu
 				ImGuiMCP::SameLine();
 				if (ImGuiMCP::Button("Cancel", ImVec2(120, 0))) {
 					State::showCopyToPresetPopup = false;
+					ImGuiMCP::CloseCurrentPopup();
+				}
+				ImGuiMCP::EndPopup();
+			}
+
+			// Copy to another weapon type (within the active preset)
+			ImGuiMCP::SameLine();
+			if (ImGuiMCP::Button("Copy to Type...")) {
+				if (State::selectedWeaponTypeIndex >= 0 && State::selectedWeaponTypeIndex < static_cast<int>(types.size())) {
+					State::copySourceWeaponType = types[State::selectedWeaponTypeIndex].displayName;
+					// Default target: first type that isn't the source
+					State::copyTargetTypeIndex = (State::selectedWeaponTypeIndex == 0) ? 1 : 0;
+					State::showCopyToTypePopup = true;
+				}
+			}
+			if (ImGuiMCP::IsItemHovered()) {
+				ImGuiMCP::SetTooltip("Copy this weapon type's inertia settings to another weapon type");
+			}
+
+			if (State::showCopyToTypePopup) {
+				ImGuiMCP::OpenPopup("Copy to Weapon Type");
+			}
+
+			if (ImGuiMCP::BeginPopupModal("Copy to Weapon Type", &State::showCopyToTypePopup, ImGuiWindowFlags_AlwaysAutoResize)) {
+				ImGuiMCP::Text("Copy Weapon Type Settings");
+				ImGuiMCP::Separator();
+
+				ImGuiMCP::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Source:");
+				ImGuiMCP::BulletText("Weapon Type: %s", State::copySourceWeaponType.c_str());
+
+				ImGuiMCP::Spacing();
+				ImGuiMCP::Separator();
+				ImGuiMCP::Spacing();
+
+				ImGuiMCP::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "Target Weapon Type:");
+
+				if (State::copyTargetTypeIndex >= static_cast<int>(types.size()))
+					State::copyTargetTypeIndex = 0;
+
+				std::string targetPreview = types[State::copyTargetTypeIndex].displayName;
+				if (types[State::copyTargetTypeIndex].isCustomType) targetPreview += " *";
+
+				if (ImGuiMCP::BeginCombo("##CopyTargetType", targetPreview.c_str())) {
+					for (int i = 0; i < static_cast<int>(types.size()); ++i) {
+						const bool isSource = (i == State::selectedWeaponTypeIndex);
+						if (isSource) ImGuiMCP::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
+
+						std::string lbl = types[i].displayName;
+						if (types[i].isCustomType) lbl += " *";
+						if (isSource) lbl += " (source)";
+						bool sel = (State::copyTargetTypeIndex == i);
+						if (ImGuiMCP::Selectable(lbl.c_str(), sel)) State::copyTargetTypeIndex = i;
+
+						if (isSource) ImGuiMCP::PopStyleColor();
+						if (sel) ImGuiMCP::SetItemDefaultFocus();
+					}
+					ImGuiMCP::EndCombo();
+				}
+
+				ImGuiMCP::Spacing();
+
+				const bool canConfirmType =
+					State::copyTargetTypeIndex >= 0 &&
+					State::copyTargetTypeIndex < static_cast<int>(types.size()) &&
+					State::copyTargetTypeIndex != State::selectedWeaponTypeIndex;
+
+				if (canConfirmType) {
+					ImGuiMCP::TextColored(ImVec4(1.0f, 1.0f, 0.4f, 1.0f), "Warning:");
+					ImGuiMCP::TextWrapped("This will OVERWRITE the '%s' settings with the '%s' settings.",
+						types[State::copyTargetTypeIndex].displayName.c_str(),
+						State::copySourceWeaponType.c_str());
+				} else {
+					ImGuiMCP::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Cannot copy a type onto itself!");
+				}
+
+				ImGuiMCP::Spacing();
+				ImGuiMCP::Separator();
+				ImGuiMCP::Spacing();
+
+				if (!canConfirmType) ImGuiMCP::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+				if (ImGuiMCP::Button("Confirm Copy", ImVec2(120, 0)) && canConfirmType) {
+					const auto& sourceEntry = types[State::selectedWeaponTypeIndex];
+					const auto& targetEntry = types[State::copyTargetTypeIndex];
+					const auto sourceSettings = GetWeaponSettingsForEditingByEntry(sourceEntry);  // copy: target ref may realloc
+					auto& targetSettings = GetWeaponSettingsForEditingByEntry(targetEntry);
+					targetSettings = sourceSettings;
+					presets->SaveWeaponTypePresets();
+					presets->IncrementSettingsVersion();
+					presets->MarkDirty();
+					logger::info("[FPGunplayOverhaul] Copied weapon type settings '{}' -> '{}'",
+						sourceEntry.displayName, targetEntry.displayName);
+					State::saveStatusMsg = std::format("Copied {} settings to {}",
+						sourceEntry.displayName, targetEntry.displayName);
+					State::saveStatusTimer = 4.0f;
+					State::showCopyToTypePopup = false;
+					ImGuiMCP::CloseCurrentPopup();
+				}
+				if (!canConfirmType) ImGuiMCP::PopStyleVar();
+
+				ImGuiMCP::SameLine();
+				if (ImGuiMCP::Button("Cancel", ImVec2(120, 0))) {
+					State::showCopyToTypePopup = false;
 					ImGuiMCP::CloseCurrentPopup();
 				}
 				ImGuiMCP::EndPopup();
@@ -2712,7 +2917,7 @@ namespace Menu
 		auto savedPresets = presets->GetSavedSpecificWeaponPresets();
 
 		// ====== EARLY ADS RETURN ======
-		if (ImGuiMCP::CollapsingHeader("Early ADS Return", ImGuiTreeNodeFlags_DefaultOpen)) {
+		if (ImGuiMCP::CollapsingHeader("Early ADS Return")) {
 			ImGuiMCP::Indent(8.0f);
 			ImGuiMCP::Spacing();
 			ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "What it does:");
@@ -2770,6 +2975,67 @@ namespace Menu
 					}
 					ImGuiMCP::EndCombo();
 				}
+			}
+
+			// ---- Select the equipped weapon's preset/category ----
+			// Prefers a weapon-specific preset for the equipped weapon if one
+			// exists; otherwise falls back to the weapon category assigned to
+			// (or detected for) that weapon. Mirrors the main tab's
+			// "Select Equipped Type" but targets the Extras selectors.
+			if (ImGuiMCP::Button("Select Equipped Type##extras")) {
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				if (player) {
+					const std::string eqID = GetEquippedWeaponEditorID(player);
+
+					// 1) Prefer a weapon-specific preset if one is saved for this weapon.
+					int specIdx = -1;
+					if (!eqID.empty()) {
+						for (int i = 0; i < static_cast<int>(savedPresets.size()); ++i) {
+							if (savedPresets[i] == eqID) { specIdx = i; break; }
+						}
+					}
+
+					if (specIdx >= 0) {
+						State::extrasSpecificWeaponIndex = specIdx;
+					} else {
+						// 2) Fall back to the weapon category assigned/detected for it.
+						State::extrasSpecificWeaponIndex = -1;
+						auto* base = GetEquippedWeaponBase(player);
+						auto* weap = base ? base->As<RE::TESObjectWEAP>() : nullptr;
+						bool matchedCustom = false;
+						if (weap) {
+							// Custom keyword-mapped type takes priority (matches main tab).
+							std::string customType = presets->GetBestKeywordMatch(weap);
+							if (!customType.empty()) {
+								for (int i = 0; i < static_cast<int>(types.size()); ++i) {
+									if (types[i].isCustomType && types[i].internalName == customType) {
+										State::extrasWeaponTypeIndex = i;
+										matchedCustom = true;
+										break;
+									}
+								}
+							}
+							if (!matchedCustom) {
+								// Full runtime detection (keywords, overrides,
+								// power-armor variant mapping) — see main tab.
+								const WeaponType detected =
+									Inertia::InertiaManager::GetSingleton()->DetectEquippedWeaponType(player);
+								for (int i = 0; i < static_cast<int>(types.size()); ++i) {
+									if (!types[i].isCustomType && types[i].type == detected) {
+										State::extrasWeaponTypeIndex = i;
+										break;
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			if (ImGuiMCP::IsItemHovered()) {
+				ImGuiMCP::SetTooltip(
+					"Switch these Extras settings to the equipped weapon.\n"
+					"Selects its specific preset if one exists, otherwise its\n"
+					"weapon category.");
 			}
 
 			// Resolve which settings to edit
@@ -2935,30 +3201,21 @@ namespace Menu
 				{
 					auto* gSettings = Settings::GetSingleton();
 					if (CheckboxWithTooltip("Enable Sound Fade-Out##phantomAudio", &gSettings->autoFireSoundFadeEnabled,
-						"When enabled, all equipped weapon loop sound handles are faded\n"
-						"out when the phantom-fire override exits.\n"
-						"Disable if this interferes with other audio mods.")) {
+						"Safety cleanup only: if the phantom-fire override ever hits its\n"
+						"5-second safety timeout, still-playing weapon loop sounds are\n"
+						"faded out over the duration below.\n"
+						"Normal bursts are handled by the engine's own audio lifecycle\n"
+						"and are not affected by this setting.")) {
 						State::hasUnsavedChanges = true;
 					}
 					int fadeMs = gSettings->autoFireSoundFadeMs;
-					if (gSettings->autoFireSoundFadeEnabled && ImGuiMCP::SliderInt("Sound Fade-Out (ms)", &fadeMs, 0, 1000)) {
+					if (gSettings->autoFireSoundFadeEnabled && ImGuiMCP::SliderInt("Sound Fade-Out (ms)", &fadeMs, 0, 5000)) {
 						gSettings->autoFireSoundFadeMs = std::clamp(fadeMs, 0, 5000);
 						State::hasUnsavedChanges = true;
 					}
 					if (ImGuiMCP::IsItemHovered())
 						ImGuiMCP::SetTooltip(
-							"Duration (in milliseconds) over which the equipped weapon's\n"
-							"loop sound handles are faded out when the phantom-fire\n"
-							"override exits.\n"
-							"\n"
-							"This applies to all three exit paths:\n"
-							"  - Player released the trigger (normal release)\n"
-							"  - 5-second safety timeout\n"
-							"  - 150ms gap with no weaponFire anim event\n"
-							"\n"
-							"  0    = instant cut (audible chop)\n"
-							"  100  = perceptually clean spin-down (default)\n"
-							"  300+ = soft tail (may overlap next shot)\n"
+							"Fade duration used by the safety-timeout cleanup.\n"
 							"\n"
 							"Global setting — applies to every weapon. Stored under\n"
 							"[AutoFire] iSoundFadeMs in FPGunplayOverhaul.ini.");
@@ -2970,10 +3227,21 @@ namespace Menu
 				ImGuiMCP::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Early Fire Cancel");
 				ImGuiMCP::Spacing();
 
+				// Early Fire Cancel is a sub-feature of Early ADS Return and
+				// shares its recovery pipeline, so it is greyed out (and does
+				// not run) unless Early ADS Return is enabled for this weapon.
+				ImGuiMCP::BeginDisabled(!ws.earlyAdsReturnEnabled);
 				if (ImGuiMCP::Checkbox("Enable Early Fire Cancel", &ws.earlyFireCancelEnabled)) {
 					s_extrasEditorChanged = true;
 				}
-				if (ImGuiMCP::IsItemHovered())
+				ImGuiMCP::EndDisabled();
+				if (!ws.earlyAdsReturnEnabled &&
+					ImGuiMCP::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+					ImGuiMCP::SetTooltip(
+						"Requires Early ADS Return to be enabled.\n"
+						"Early Fire Cancel reuses the Early ADS recovery pipeline.");
+				}
+				if (ws.earlyAdsReturnEnabled && ImGuiMCP::IsItemHovered())
 					ImGuiMCP::SetTooltip(
 						"Mirrors the Early ADS fix for the case where the player\n"
 						"holds the FIRE input mid-reload to cancel-into-fire.\n"
@@ -3046,7 +3314,13 @@ namespace Menu
 			if (!oarInstalled) {
 				ImGuiMCP::BeginDisabled(true);
 			}
-			if (ImGuiMCP::CollapsingHeader("Fire on Empty")) {
+			const bool foeOpen = ImGuiMCP::CollapsingHeader("Fire on Empty");
+			if (!oarInstalled && ImGuiMCP::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+				ImGuiMCP::SetTooltip(
+					"Requires Open Animation Replacer.\n"
+					"Install Open Animation Replacer and reload to enable Fire on Empty.");
+			}
+			if (foeOpen) {
 				if (!oarInstalled) {
 					ImGuiMCP::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
 						"Open Animation Replacer not detected — feature disabled.");
@@ -3278,12 +3552,37 @@ namespace Menu
 		}
 
 		// ====== CONTEXTUAL LEAN ======
+		// Requires UneducatedShooter.dll — grey the whole Extra out when the
+		// dependency is absent (same pattern as Fire on Empty / Chamber Exclusion).
 		ImGuiMCP::Spacing();
-		if (ImGuiMCP::CollapsingHeader("Contextual Lean")) {
+		{
 			auto* settings = Settings::GetSingleton();
 			auto* cl = ContextualLean::Manager::GetSingleton();
+			const bool usInstalled = cl->IsUSInstalled();
+			if (!usInstalled) {
+				ImGuiMCP::BeginDisabled(true);
+			}
+			const bool ctxLeanOpen = ImGuiMCP::CollapsingHeader("Contextual Lean  (Beta)");
+			if (!usInstalled && ImGuiMCP::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+				ImGuiMCP::SetTooltip(
+					"Requires UneducatedShooter.\n"
+					"Install UneducatedShooter and reload to enable Contextual Lean.");
+			}
+			if (ctxLeanOpen) {
+				if (!usInstalled) {
+					ImGuiMCP::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+						"UneducatedShooter.dll not detected — feature disabled.");
+					ImGuiMCP::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+						"Install UneducatedShooter and reload to enable Contextual Lean.");
+					ImGuiMCP::Spacing();
+				}
 
 			ImGuiMCP::Indent(8.0f);
+			ImGuiMCP::Spacing();
+			ImGuiMCP::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), "[BETA]");
+			ImGuiMCP::SameLine();
+			ImGuiMCP::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+				"This feature is experimental and still being tuned.");
 			ImGuiMCP::Spacing();
 			ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "What it does:");
 			ImGuiMCP::TextWrapped(
@@ -3302,10 +3601,9 @@ namespace Menu
 			ImGuiMCP::Unindent(8.0f);
 			ImGuiMCP::Spacing();
 
-			// ---- Dependency status ----
-			if (!cl->IsUSInstalled()) {
-				ImGuiMCP::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
-					"UneducatedShooter.dll not detected — feature disabled.");
+			// ---- Dependency status (US installed, but lean/keys may still block) ----
+			if (!usInstalled) {
+				// Already reported above; keep the rest of the section greyed.
 			} else if (cl->IsUSLeanDisabled()) {
 				ImGuiMCP::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
 					"Leaning is disabled in UneducatedShooter's settings — feature disabled.");
@@ -3448,33 +3746,70 @@ namespace Menu
 					settings->contextualLeanYawTolerance = std::clamp(settings->contextualLeanYawTolerance, 10.0f, 90.0f);
 					State::hasUnsavedChanges = true;
 				}
+
+				// ---- Live debug view ----
+				ImGuiMCP::Spacing();
+				ImGuiMCP::Separator();
+				ImGuiMCP::Spacing();
+				if (ImGuiMCP::TreeNode("Debug View (Live)##ctxLeanDebug")) {
+					// Popout: a framework-managed non-pausing window. The
+					// values FREEZE while this settings menu is open (the
+					// update loop halts in menuMode), so the popout —
+					// which stays up during gameplay — is where the live
+					// diagnosis actually happens.
+					bool popoutOpen = State::ctxLeanDebugWindow &&
+						State::ctxLeanDebugWindow->IsOpen.load();
+					if (ImGuiMCP::Checkbox("Popout Window##ctxLeanDebugPopout", &popoutOpen)) {
+						if (State::ctxLeanDebugWindow)
+							State::ctxLeanDebugWindow->IsOpen.store(popoutOpen);
+					}
+					if (ImGuiMCP::IsItemHovered())
+						ImGuiMCP::SetTooltip(
+							"Open a floating window that stays visible over the game\n"
+							"(persists when the menu is closed). Values only update during\n"
+							"gameplay — in this menu they show the last gameplay frame.");
+					ImGuiMCP::Spacing();
+					DrawContextualLeanDebugContent();
+					ImGuiMCP::TreePop();
+				}
+			}
+			} // CollapsingHeader
+			if (!usInstalled) {
+				ImGuiMCP::EndDisabled();
 			}
 		}
 
 		// ====== AIR WALK PREVENTION ======
+		// Temporarily greyed out while the feature is being reworked.
 		ImGuiMCP::Spacing();
-		if (ImGuiMCP::CollapsingHeader("Air Walk Prevention")) {
-			ImGuiMCP::Indent(8.0f);
-			ImGuiMCP::Spacing();
-			ImGuiMCP::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
-				"This section is temporarily disabled while it is being reworked.");
-			ImGuiMCP::Spacing();
-			ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "What it does:");
-			ImGuiMCP::TextWrapped(
-				"Prevents walking and running animations from playing while airborne.");
-			ImGuiMCP::Spacing();
-			ImGuiMCP::BulletText("Without this, legs visibly cycle mid-air after jumping while moving");
-			ImGuiMCP::BulletText("Blocks walk/run anims when the player is off the ground");
-			ImGuiMCP::Spacing();
-
+		{
 			ImGuiMCP::BeginDisabled(true);
-			auto* settings = Settings::GetSingleton();
-			bool airWalkDisabled = settings->disableAirWalk;
-			ImGuiMCP::Checkbox("Enable Air Walk Prevention##disableAirWalk", &airWalkDisabled);
+			const bool airWalkOpen = ImGuiMCP::CollapsingHeader("Air Walk Prevention");
+			if (ImGuiMCP::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+				ImGuiMCP::SetTooltip("Temporarily disabled while this feature is being reworked.");
+			}
+			if (airWalkOpen) {
+				ImGuiMCP::Indent(8.0f);
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+					"This section is temporarily disabled while it is being reworked.");
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "What it does:");
+				ImGuiMCP::TextWrapped(
+					"Prevents walking and running animations from playing while airborne.");
+				ImGuiMCP::Spacing();
+				ImGuiMCP::BulletText("Without this, legs visibly cycle mid-air after jumping while moving");
+				ImGuiMCP::BulletText("Blocks walk/run anims when the player is off the ground");
+				ImGuiMCP::Spacing();
+
+				auto* settings = Settings::GetSingleton();
+				bool airWalkDisabled = settings->disableAirWalk;
+				ImGuiMCP::Checkbox("Enable Air Walk Prevention##disableAirWalk", &airWalkDisabled);
+				if (ImGuiMCP::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+					ImGuiMCP::SetTooltip("This feature is temporarily disabled while it is being reworked.");
+				ImGuiMCP::Unindent(8.0f);
+			}
 			ImGuiMCP::EndDisabled();
-			if (ImGuiMCP::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-				ImGuiMCP::SetTooltip("This feature is temporarily disabled while it is being reworked.");
-			ImGuiMCP::Unindent(8.0f);
 		}
 
 		// ====== UNEDUCATED RELOAD: CHAMBER EXCLUSION ======
@@ -3485,7 +3820,13 @@ namespace Menu
 			if (!urInstalled) {
 				ImGuiMCP::BeginDisabled(true);
 			}
-			if (ImGuiMCP::CollapsingHeader("Uneducated Reload - Chamber Exclusion")) {
+			const bool urOpen = ImGuiMCP::CollapsingHeader("Uneducated Reload - Chamber Exclusion");
+			if (!urInstalled && ImGuiMCP::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+				ImGuiMCP::SetTooltip(
+					"Requires Uneducated Reload.\n"
+					"Install UneducatedReload.esm and reload to enable Chamber Exclusion.");
+			}
+			if (urOpen) {
 				if (!urInstalled) {
 					ImGuiMCP::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
 						"UneducatedReload.esm not detected — feature disabled.");

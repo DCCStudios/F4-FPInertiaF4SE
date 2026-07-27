@@ -4,6 +4,10 @@ out/
 .xmake/
 CMakeUserPresets.json
 
+# Nexus page draft + local art (upload images to Nexus, then paste CDN URLs)
+ModDescription.md
+nexus-assets/
+
 # Staged game install (DLL / PDB)
 Compile/
 

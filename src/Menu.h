@@ -18,6 +18,9 @@ namespace Menu
 	// Debug popout window render callback (non-pausing, managed by framework)
 	void __stdcall RenderDebugPopout();
 
+	// Contextual Lean live-debug popout window render callback (non-pausing)
+	void __stdcall RenderCtxLeanDebugPopout();
+
 	// Extras tab render callback
 	void __stdcall RenderExtras();
 
@@ -65,6 +68,10 @@ namespace Menu
 		inline std::string copySourceWeaponType;
 		inline std::string copySourcePreset;
 
+		// Copy weapon-type-to-weapon-type dialog state
+		inline bool showCopyToTypePopup{ false };
+		inline int copyTargetTypeIndex{ 0 };
+
 		// Copy from specific weapon preset
 		inline int copyToTypeIndex{ 3 };                    // target weapon type index
 		inline char copyToEditorBuf[256]{ "" };             // target EditorID for copy-to-specific
@@ -77,6 +84,9 @@ namespace Menu
 
 		// Debug popout window (framework-managed)
 		inline MENU_WINDOW debugPopoutWindow{ nullptr };
+
+		// Contextual Lean debug popout window (framework-managed)
+		inline MENU_WINDOW ctxLeanDebugWindow{ nullptr };
 
 		// Extras tab state
 		inline int extrasWeaponTypeIndex{ 0 };

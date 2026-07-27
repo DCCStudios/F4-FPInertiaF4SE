@@ -238,7 +238,10 @@ namespace ChamberExclusion
 	// ----------------------------------------------------------------
 	std::filesystem::path Manager::GetJSONPath() const
 	{
-		return std::filesystem::current_path() / "Data" / "F4SE" / "Plugins" / "FPGunplayOverhaul" / kJSONFilename;
+		// Lives in its own subfolder: the inertia preset browser lists every
+		// *.json directly under FPGunplayOverhaul\ as a weapon type preset,
+		// so this file must not sit in that folder.
+		return std::filesystem::current_path() / "Data" / "F4SE" / "Plugins" / "FPGunplayOverhaul" / "ChamberExclusion" / kJSONFilename;
 	}
 
 	void Manager::LoadJSON()
@@ -247,6 +250,27 @@ namespace ChamberExclusion
 		excludedWeapons.clear();
 
 		auto path = GetJSONPath();
+
+		// One-time migration: older builds stored the file directly in the
+		// FPGunplayOverhaul folder, where the preset browser picked it up as
+		// a bogus weapon type preset.  Move it to the new location.
+		if (!std::filesystem::exists(path)) {
+			const auto oldPath = path.parent_path().parent_path() / kJSONFilename;
+			if (std::filesystem::exists(oldPath)) {
+				std::error_code ec;
+				std::filesystem::create_directories(path.parent_path(), ec);
+				std::filesystem::rename(oldPath, path, ec);
+				if (ec) {
+					// Rename across weird setups (MO2 overlays etc.) can fail;
+					// fall back to copy + delete.
+					std::filesystem::copy_file(oldPath, path,
+						std::filesystem::copy_options::overwrite_existing, ec);
+					if (!ec) std::filesystem::remove(oldPath, ec);
+				}
+				logger::info("[ChamberExclusion] Migrated {} -> {}", oldPath.string(), path.string());
+			}
+		}
+
 		if (!std::filesystem::exists(path)) return;
 
 		try {

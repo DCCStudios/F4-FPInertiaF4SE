@@ -225,6 +225,13 @@ namespace Inertia
 		// Whether super sprint is currently engaged (read by menu for status display)
 		bool IsSuperSprintActive() const { return superSprintActive; }
 
+		// Menu helper — run the full runtime weapon-type detection for the
+		// currently equipped weapon: keyword-based classification, EditorID
+		// type overrides, and the power-armor variant mapping.  This is the
+		// same result the inertia runtime uses, so menu "select equipped"
+		// buttons stay in sync with what is actually applied in game.
+		WeaponType DetectEquippedWeaponType(RE::PlayerCharacter* a_player) const;
+
 	private:
 		InertiaManager() = default;
 		~InertiaManager() = default;
@@ -415,6 +422,22 @@ namespace Inertia
 		bool  earlyFireCancelArmed{ false };
 		bool  earlyFireCancelPending{ false };
 		float earlyFireCancelTimer{ 0.0f };
+
+		// SEMI-AUTO phantom shot conversion window (seconds).  Opened when a
+		// forced-idle recovery completes on a non-automatic weapon with Early
+		// Fire Cancel enabled.  The FIRST weaponFire anim event inside the
+		// window is converted same-frame into one real QueueWeaponFire
+		// discharge, then the window closes (later shots are healthy).
+		float semiPhantomWindow{ 0.0f };
+
+		// Set when an Early Fire Cancel triggers so the phantom-fire override
+		// is armed even for SEMI-AUTO weapons. Early ADS only arms the phantom
+		// override for automatics (semi-auto works fine there), but a
+		// fire-cancelled reload leaves the attack pipeline in a state where a
+		// semi-auto's shot plays its fire animation yet never discharges ammo.
+		// Arming the override for that single shot converts the phantom fire
+		// into a real QueueWeaponFire discharge. Cleared once consumed.
+		bool  earlyFireCancelArmSemi{ false };
 
 		// Phantom-fire override: drive QueueWeaponFire off each weaponFire
 		// anim event until the engine state machine engages or the player

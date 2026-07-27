@@ -450,11 +450,11 @@ public:
 	// timeout, or "no more anim events" gap), we explicitly fade out the
 	// equipped weapon's loop sound handles via BSSoundHandle::FadeOutAndRelease.
 	// 0 = instant cut, ~100ms = perceptually clean spin-down, larger values
-	// give a softer tail.  Default 100 was chosen by ear: short enough that
-	// the gun feels responsive when you let go of the trigger, but long
-	// enough that the auto-fire loop doesn't get audibly chopped.
+	// give a softer tail.  Default 5000 gives a long, safe tail so the
+	// auto-fire loop is never audibly chopped when the phantom override
+	// exits; lower it if the tail overlaps the next shot on your setup.
 	bool autoFireSoundFadeEnabled{ true };
-	int autoFireSoundFadeMs{ 100 };
+	int autoFireSoundFadeMs{ 5000 };
 
 	// Per-weapon-type settings
 	WeaponInertiaSettings unarmed;
