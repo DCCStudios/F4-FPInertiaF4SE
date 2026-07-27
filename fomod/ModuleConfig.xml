@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">
+
+    <moduleName>FP Gunplay Overhaul</moduleName>
+    <moduleImage path="fomod\images\FP Gunplay Overhaul.png" />
+
+    <installSteps order="Explicit">
+        <installStep name="IMPORTANT: Uneducated Shooter Compatibility">
+            <optionalFileGroups order="Explicit">
+                <group name="Confirm Installation" type="SelectExactlyOne">
+                    <plugins order="Explicit">
+                        <plugin name="I have read and understand the above warnings">
+                            <description><![CDATA[If you use Uneducated Shooter (https://www.nexusmods.com/fallout4/mods/81498), you MUST disable the inertia from that mod or your first person arms WILL BREAK in-game. Files with correct settings are provided in this download, but you must make sure you:
+
+1. Overwrite any settings files from Uneducated Shooter if you have that installed.
+2. Delete any settings files for Uneducated Shooter in your MO2 Overwrite folder. They are provided with this mod.
+
+You may need to redo your lean settings in-game if you changed them from default. Please do NOT post comments about this if you don't read or follow these instructions. Thanks and happy modding!
+
+Selecting this option installs the full FP Gunplay Overhaul package (F4SE plugin, INI, presets, PDB) and safe Uneducated Shooter MCM override settings (inertia disabled).]]></description>
+                            <image path="fomod\images\FP Gunplay Overhaul.png" />
+                            <files>
+                                <folder source="F4SE" destination="F4SE" />
+                                <folder source="MCM" destination="MCM" />
+                            </files>
+                            <typeDescriptor>
+                                <type name="Recommended" />
+                            </typeDescriptor>
+                        </plugin>
+                        <plugin name="Cancel - I do not agree / will not follow these instructions">
+                            <description><![CDATA[Select this if you do not agree to the warnings above or do not intend to follow the Uneducated Shooter instructions.
+
+No files will be installed.]]></description>
+                            <files />
+                            <typeDescriptor>
+                                <type name="Optional" />
+                            </typeDescriptor>
+                        </plugin>
+                    </plugins>
+                </group>
+            </optionalFileGroups>
+        </installStep>
+    </installSteps>
+
+</config>
