@@ -74,6 +74,7 @@ public:
 	void SaveSpecificWeaponPreset(const std::string& a_editorID);
 	void LoadSpecificWeaponPreset(const std::string& a_editorID);
 	void LoadAllPresets();
+	void LoadAllSpecificWeaponPresets();
 	void ResetToINIValues();
 
 	// Preset profile management (multiple named presets)

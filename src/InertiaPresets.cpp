@@ -601,10 +601,34 @@ void InertiaPresets::SaveSpecificWeaponPreset(const std::string& a_editorID)
 		}
 
 		json wrapper;
+		json settingsJson = it->second;
+
 		auto overrideIt = weaponTypeOverrides.find(a_editorID);
-		if (overrideIt != weaponTypeOverrides.end())
+		if (overrideIt != weaponTypeOverrides.end()) {
 			wrapper["weaponType"] = GetWeaponTypeName(overrideIt->second);
-		wrapper["settings"] = it->second;
+
+			// Sparse save: write only the keys that differ from the base
+			// weapon type's current settings. Loading seeds the struct from
+			// the type settings before overlaying the file, so any key
+			// absent here keeps FOLLOWING the weapon type. This lets a
+			// preset created from one feature page (e.g. Early ADS) carry
+			// just that feature while inertia and the other extras stay
+			// inherited until the user actually changes them.
+			auto typeIt = weaponTypeSettings.find(overrideIt->second);
+			if (typeIt != weaponTypeSettings.end()) {
+				const json baseJson = typeIt->second;
+				json sparse = json::object();
+				for (auto& [key, value] : settingsJson.items()) {
+					if (!baseJson.contains(key) || baseJson.at(key) != value)
+						sparse[key] = value;
+				}
+				settingsJson = std::move(sparse);
+			}
+		}
+		// No recorded base type -> keep the legacy full-file format (there
+		// is no stable base to diff against or to seed from at load).
+
+		wrapper["settings"] = settingsJson;
 		file << wrapper.dump(2);
 		file.flush();
 		file.close();
@@ -630,11 +654,21 @@ void InertiaPresets::LoadSpecificWeaponPreset(const std::string& a_editorID)
 		// New format: { "weaponType": "Pistol", "settings": {...} }
 		// Legacy format: { ...WeaponInertiaSettings fields directly... }
 		if (j.contains("settings") && j["settings"].is_object()) {
-			specificWeaponSettings[a_editorID] = j["settings"].get<WeaponInertiaSettings>();
+			// Seed from the base weapon type's CURRENT settings, then overlay
+			// only the keys present in the file (from_json skips missing
+			// keys). Sparse presets therefore fall back to the weapon type
+			// for everything they don't explicitly carry. Full legacy files
+			// overlay every key, so seeding changes nothing for them.
+			WeaponInertiaSettings seeded = defaultSettings;
 			if (j.contains("weaponType") && j["weaponType"].is_string()) {
 				auto wt = ParseWeaponTypeName(j["weaponType"].get<std::string>());
 				weaponTypeOverrides[a_editorID] = wt;
+				auto typeIt = weaponTypeSettings.find(wt);
+				if (typeIt != weaponTypeSettings.end())
+					seeded = typeIt->second;
 			}
+			j.at("settings").get_to(seeded);
+			specificWeaponSettings[a_editorID] = seeded;
 		} else {
 			specificWeaponSettings[a_editorID] = j.get<WeaponInertiaSettings>();
 		}
@@ -667,8 +701,14 @@ void InertiaPresets::SetWeaponTypeOverride(const std::string& a_editorID, Weapon
 void InertiaPresets::LoadAllPresets()
 {
 	LoadWeaponTypePresets();
+	LoadAllSpecificWeaponPresets();
+}
 
-	// Load all specific weapon presets in the Weapons subfolder
+void InertiaPresets::LoadAllSpecificWeaponPresets()
+{
+	// Load all specific weapon presets in the Weapons subfolder.
+	// Must run AFTER the weapon type presets are loaded: sparse presets
+	// seed their unsaved fields from the type settings at load time.
 	auto weaponsDir = GetPresetFolderPath() / "Weapons";
 	if (!std::filesystem::exists(weaponsDir)) return;
 
@@ -718,6 +758,17 @@ void InertiaPresets::SetActivePreset(const std::string& a_name)
 	LoadWeaponTypePresets();
 	if (weaponTypeSettings.empty()) InitializeDefaultSettings();
 	EnsureCustomTypesInPreset();
+
+	// Re-load specific weapon presets so their sparse (inherited) fields
+	// re-seed from the NEW preset's weapon type settings. Without this a
+	// weapon preset would keep values seeded from the previous profile.
+	{
+		std::unique_lock lock(presetMutex);
+		specificWeaponSettings.clear();
+		weaponTypeOverrides.clear();
+	}
+	LoadAllSpecificWeaponPresets();
+
 	SaveActivePresetSetting();
 	IncrementSettingsVersion();
 	logger::info("[FPGunplayOverhaul] Active preset set to '{}'", a_name);

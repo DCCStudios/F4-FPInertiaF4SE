@@ -3038,6 +3038,68 @@ namespace Menu
 					"weapon category.");
 			}
 
+			// ---- Create a weapon-specific preset from this page ----
+			// The preset file is SPARSE: it stores only values that differ
+			// from the weapon's type, so tweaking Early ADS here writes just
+			// those fields while inertia and the other extras keep following
+			// the weapon type until edited (on any page).
+			{
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				const std::string eqID = player ? GetEquippedWeaponEditorID(player) : std::string{};
+				const bool alreadyHas = !eqID.empty() && presets->HasSpecificWeaponSettings(eqID);
+
+				ImGuiMCP::SameLine();
+				ImGuiMCP::BeginDisabled(eqID.empty() || alreadyHas);
+				if (ImGuiMCP::Button("Create Weapon Preset##extras")) {
+					const WeaponType detected =
+						Inertia::InertiaManager::GetSingleton()->DetectEquippedWeaponType(player);
+
+					// Seed from whatever the weapon currently resolves to
+					// (keyword-mapped custom type if one matches, otherwise
+					// the detected standard type) so the new preset starts
+					// with the values that were in effect. Copy BEFORE
+					// creating the entry — GetWeaponSettingsWithKeywords
+					// returns a reference into the preset maps.
+					auto* base = GetEquippedWeaponBase(player);
+					auto* weap = base ? base->As<RE::TESObjectWEAP>() : nullptr;
+					const WeaponInertiaSettings resolved =
+						presets->GetWeaponSettingsWithKeywords(std::string{}, weap, detected);
+
+					auto& spec = presets->GetOrCreateSpecificWeaponSettings(eqID, detected);
+					spec = resolved;
+					presets->SetWeaponTypeOverride(eqID, detected);
+					presets->SaveSpecificWeaponPreset(eqID);
+					presets->IncrementSettingsVersion();
+
+					// Select the new preset in the specific-weapon combo
+					// (fresh, sorted list — savedPresets above is stale now).
+					const auto fresh = presets->GetSavedSpecificWeaponPresets();
+					for (int i = 0; i < static_cast<int>(fresh.size()); ++i) {
+						if (fresh[i] == eqID) { State::extrasSpecificWeaponIndex = i; break; }
+					}
+
+					State::saveStatusMsg = std::format("Created weapon preset for {} ({})",
+						eqID, InertiaPresets::GetWeaponTypeDisplayName(detected));
+					State::saveStatusTimer = 4.0f;
+				}
+				ImGuiMCP::EndDisabled();
+				if (ImGuiMCP::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+					if (eqID.empty()) {
+						ImGuiMCP::SetTooltip("Equip a weapon first.");
+					} else if (alreadyHas) {
+						ImGuiMCP::SetTooltip(
+							"'%s' already has a specific preset.\n"
+							"Use Select Equipped Type to edit it.", eqID.c_str());
+					} else {
+						ImGuiMCP::SetTooltip(
+							"Create a preset for '%s' so these settings apply to\n"
+							"this weapon only. The preset file stores just the values\n"
+							"you change; everything else (inertia, other extras) keeps\n"
+							"following the weapon type until you edit it.", eqID.c_str());
+					}
+				}
+			}
+
 			// Resolve which settings to edit
 			WeaponInertiaSettings* editSettings = nullptr;
 			std::string editLabel;
