@@ -214,6 +214,17 @@ namespace WeaponFOV
 				cameraFOV.load(), SourceName(cameraSource.load()),
 				thirdPersonFOV.load());
 
+			// Feature disabled: re-reading the INI defaults above is harmless
+			// and keeps the menu display fresh, but the plugin must not issue
+			// any `fov` command. bEnabled=0 means FOV-inert on EVERY path —
+			// a save load or FOV Slider refresh must not clobber a FOV the
+			// user set themselves (AE bug report 2026-07-28: console
+			// `fov 100 100` was reset on load/VATS/dialogue with bEnabled=0).
+			if (!Settings::GetSingleton()->wbfovEnabled) {
+				logger::info("[WeaponFOV] WBFOV disabled — skipping apply after refresh");
+				return;
+			}
+
 			auto* player = RE::PlayerCharacter::GetSingleton();
 			if (!player || !player->Get3D()) {
 				// Player 3D is not ready yet. Force the next Update tick or
@@ -235,13 +246,33 @@ namespace WeaponFOV
 				}
 			}
 
-			float targetFOV = defaultViewmodelFOV.load();
+			// Ownership model: WBFOV only owns the FOV while the equipped
+			// weapon has a per-weapon entry. With no entry we must not
+			// write ANYTHING — `fov X Y` clobbers the runtime camera FOV
+			// to X as an engine side effect, and users without FOV Slider
+			// F4SE have no drift watcher to undo it. This was the AE bug
+			// report: no entries configured, console `fov 100 100`, and
+			// every load applied the hardcoded default and reset it.
+			float targetFOV       = 0.0f;
+			bool  haveWeaponEntry = false;
 			if (!curEditorID.empty()) {
 				std::lock_guard lock(entriesMtx);
 				auto it = entries.find(curEditorID);
 				if (it != entries.end()) {
-					targetFOV = it->second.viewmodelFOV;
+					targetFOV       = it->second.viewmodelFOV;
+					haveWeaponEntry = true;
 				}
+			}
+
+			if (!haveWeaponEntry) {
+				// Hand FOV back to the engine/user. Reset ownership state
+				// so a stale pre-load `hadWeaponEntry` can't fire a
+				// spurious entryLost apply on the first Update tick.
+				lastAppliedFOV = -1.0f;
+				hadWeaponEntry = false;
+				logger::info("[WeaponFOV] Refresh: no weapon entry (weapon='{}') — leaving FOV untouched",
+					curEditorID.empty() ? "<none>" : curEditorID.c_str());
+				return;
 			}
 
 			ApplyViewmodelFOV(targetFOV);
@@ -263,7 +294,13 @@ namespace WeaponFOV
 			//      installed, it owns the engine's INI settings live)
 			//   2. Simple FOV Slider (Papyrus / MCM, legacy)
 			//   3. FOV Slider and Player Height (Papyrus / MCM, legacy)
-			//   4. Hardcoded 80
+			//   4. Engine fDefault1stPersonFOV:Display — with no slider mod
+			//      installed, vanilla couples the viewmodel to this setting
+			//      (the engine copies it into PlayerCamera::firstPersonFOV
+			//      on camera transitions). A user who ran `fov 100 100` has
+			//      100 here; reverting to that IS vanilla behavior for them,
+			//      whereas the old hardcoded 80 stomped their choice.
+			//   5. Hardcoded 80
 			if (TryReadFOVFromINI(kFOVSliderF4SE_INI, kFOVSliderF4SE_Section, kFOVSliderF4SE_VMKey, v))
 			{
 				src = FOVDefaultSource::FOVSliderF4SE;
@@ -277,6 +314,10 @@ namespace WeaponFOV
 			         TryReadFOVFromINI(kFOVSlider_DefaultINI, kFOVSlider_Section, kFOVSlider_VMKey, v))
 			{
 				src = FOVDefaultSource::FOVSlider;
+			}
+			else if (TryReadFloatFromGameINI("fDefault1stPersonFOV:Display", v))
+			{
+				src = FOVDefaultSource::UserINI;
 			}
 
 			// Sanity clamp
@@ -384,6 +425,77 @@ namespace WeaponFOV
 	}
 
 	// ============================================================
+	// External FOV change adoption
+	// ------------------------------------------------------------
+	// The user can change their camera FOV at any time with the console
+	// (`fov X Y` writes Y into fDefault1stPersonFOV:Display and updates
+	// fDefaultWorldFOV:Display). Our cameraFOV/thirdPersonFOV caches are
+	// resolved at load, so without this the next timedReapply would pass
+	// the STALE cached Y and erase the user's change within 1.5 s
+	// (bug: "weapon fov was set accordingly but it was not respecting
+	// my camera fov").
+	//
+	// Detection: ApplyViewmodelFOV always writes our caches back into
+	// these INI settings, so an engine value differing from the cache
+	// can only have come from outside (console, another mod).
+	//
+	// Debounce: the engine transiently resets fDefault1stPersonFOV
+	// around load screens (the feedback loop the old "never re-read
+	// per-frame" comment feared). A candidate must stay stable for
+	// kAdoptDebounceSec before adoption. While a candidate is pending
+	// the caller must NOT apply — one apply would overwrite the user's
+	// value with the stale cache and destroy the evidence.
+	// ============================================================
+	bool Manager::AdoptExternalFOVChanges(bool a_force)
+	{
+		using clock = std::chrono::steady_clock;
+		constexpr double kPollSec         = 0.4;
+		constexpr double kAdoptDebounceSec = 0.9;
+		constexpr float  kEps             = 0.05f;
+
+		const auto now = clock::now();
+		const bool anyPending = pendingExternalCam >= 0.0f || pendingExternalWorld >= 0.0f;
+		if (!a_force &&
+			std::chrono::duration<double>(now - lastExternalPollTime).count() < kPollSec) {
+			return anyPending;
+		}
+		lastExternalPollTime = now;
+
+		const auto track = [&](const char* a_key, std::atomic<float>& a_cache,
+		                       float& a_pending, clock::time_point& a_since,
+		                       const char* a_what) {
+			float v = 0.0f;
+			if (!TryReadFloatFromGameINI(a_key, v) || v < 30.0f || v > 160.0f) {
+				a_pending = -1.0f;
+				return;
+			}
+			if (std::fabs(v - a_cache.load()) <= kEps) {
+				// Engine agrees with our cache — nothing external happened
+				// (or a previously pending transient resolved back).
+				a_pending = -1.0f;
+				return;
+			}
+			if (a_pending >= 0.0f && std::fabs(v - a_pending) <= kEps) {
+				if (std::chrono::duration<double>(now - a_since).count() >= kAdoptDebounceSec) {
+					logger::info("[WeaponFOV] Adopting external {} FOV change {:.1f} -> {:.1f} (console or other mod)",
+						a_what, a_cache.load(), v);
+					a_cache.store(v);
+					a_pending = -1.0f;
+				}
+			} else {
+				// New candidate — start (or restart) the stability clock.
+				a_pending = v;
+				a_since   = now;
+			}
+		};
+
+		track("fDefault1stPersonFOV:Display", cameraFOV,      pendingExternalCam,   pendingExternalCamSince,   "camera");
+		track("fDefaultWorldFOV:Display",     thirdPersonFOV, pendingExternalWorld, pendingExternalWorldSince, "3rd-person");
+
+		return pendingExternalCam >= 0.0f || pendingExternalWorld >= 0.0f;
+	}
+
+	// ============================================================
 	// Per-frame update
 	// ============================================================
 	void Manager::SetExternalOverride(bool a_locked)
@@ -401,9 +513,27 @@ namespace WeaponFOV
 
 	void Manager::Update(RE::PlayerCharacter* player, bool weaponDrawn)
 	{
+		// Belt-and-suspenders enabled gate. The per-frame caller already
+		// checks wbfovEnabled, but the flag was historically checked in one
+		// caller and forgotten in others (load refresh, load retry, FSRF) —
+		// centralizing the invariant here makes that regression impossible.
+		if (!Settings::GetSingleton()->wbfovEnabled) {
+			return;
+		}
+
 		// FOV Slider F4SE has the conch — don't touch the viewmodel
 		// while it's running a Pip-Boy / Terminal / Aiming override.
 		if (externalOverride.load()) {
+			return;
+		}
+
+		// Pick up console / external camera FOV changes BEFORE anything
+		// else. While a change is being debounced, do nothing this tick:
+		// an apply now would feed the stale cached Y into `fov X Y` and
+		// erase the user's edit before adoption confirms it. Placed ahead
+		// of the camera-state guard so wasCameraBlocked isn't consumed
+		// (the resume-from-block transition survives the pending window).
+		if (AdoptExternalFOVChanges()) {
 			return;
 		}
 
@@ -432,19 +562,14 @@ namespace WeaponFOV
 			logger::info("[WeaponFOV] Camera returned to first-person — resuming WBFOV applies");
 		}
 
-		// Camera/3rd-person FOV values come ONLY from the FOV mod INIs,
+		// Camera/3rd-person FOV baselines come from the FOV mod INIs,
 		// resolved at Init() and RefreshDefaults() (called on game load and
-		// when FOV Slider F4SE sends an FSRF refresh message).
-		//
-		// We deliberately do NOT call RefreshLiveCameraFOV() per-frame here.
-		// The engine's in-memory fDefault1stPersonFOV:Display is unreliable:
-		//   1. Engine post-load re-init transiently resets it to 75/80/90
-		//   2. Our own `fov X Y` writes Y back into it
-		//   3. Our SetEngineFloatSetting("fDefault1stPersonFOV:Display")
-		//      also writes to it
-		// Reading it back per-frame creates a feedback loop where a transient
-		// engine reset gets locked in by our next `fov X Y`. The INI-sourced
-		// value (set via RefreshDefaults) is the only reliable source.
+		// when FOV Slider F4SE sends an FSRF refresh message). On top of
+		// that, AdoptExternalFOVChanges() (called above) folds in changes
+		// made mid-session via the console or other mods. Raw per-frame
+		// re-reads of fDefault1stPersonFOV:Display would be unreliable
+		// (engine post-load re-init transiently resets it, and our own
+		// writes echo back), which is why adoption is debounced instead.
 
 		// Read FormID and editorID of currently equipped weapon (if any).
 		// Use equipped-items (inventory data) rather than weaponDrawn so
@@ -519,9 +644,25 @@ namespace WeaponFOV
 			            fovDrifted    || timedReapply ||
 			            resumingFromBlock ||
 			            lastAppliedFOV < 0.0f;
-		} else if (entryLost || resumingFromBlock) {
+		} else if (entryLost) {
+			// One-shot revert to default when a per-weapon override goes
+			// away, then hands off. Deliberately NOT `|| resumingFromBlock`:
+			// with no entry we own nothing, and applying the default after
+			// every VATS/dialogue/furniture exit clobbered the runtime
+			// camera FOV (the `fov X Y` side effect) for users who never
+			// configured an entry at all (AE bug report 2026-07-28).
 			targetFOV = defaultViewmodelFOV.load();
 			needApply = true;
+		}
+
+		// Final race guard: force a fresh INI poll right before writing.
+		// A console `fov` typed between the throttled polls above would
+		// otherwise be erased by this apply (our Y re-asserts the stale
+		// cache into the INI, destroying the evidence). If the fresh poll
+		// finds a candidate, bail without touching transition state so
+		// this same apply re-fires once adoption resolves (~1 s).
+		if (needApply && AdoptExternalFOVChanges(true)) {
+			return;
 		}
 
 		if (needApply) {
@@ -597,8 +738,15 @@ namespace WeaponFOV
 		}
 
 		taskInterface->AddTask([this, def]() {
+			// Nothing applied this session -> nothing to restore. Issuing
+			// `fov X Y` anyway would clobber a FOV the user set themselves
+			// (checked on the game thread, where lastAppliedFOV is owned).
+			if (lastAppliedFOV < 0.0f) {
+				logger::info("[WeaponFOV] RestoreDefault skipped — no FOV was applied this session");
+				return;
+			}
 			ApplyViewmodelFOV(def);
-			lastAppliedFOV = def;
+			lastAppliedFOV = -1.0f;
 			lastApplyTime = std::chrono::steady_clock::now();
 			hadWeaponEntry = false;
 		});
@@ -606,6 +754,14 @@ namespace WeaponFOV
 
 	void Manager::ScheduleLoadRetry()
 	{
+		// Feature disabled: no load-time applies at all. The retry loop's
+		// entire purpose is to force WBFOV's value onto a fresh save; when
+		// bEnabled=0 the plugin must stay FOV-inert (see RefreshDefaults).
+		if (!Settings::GetSingleton()->wbfovEnabled) {
+			logger::info("[WeaponFOV] WBFOV disabled — skipping load retries");
+			return;
+		}
+
 		const std::uint32_t gen = ++loadRetryGeneration;
 		loadRetryCompletedGeneration.store(0);
 
@@ -642,6 +798,11 @@ namespace WeaponFOV
 						loadRetryCompletedGeneration.load() == gen) {
 						return;
 					}
+					// User may have disabled WBFOV between scheduling and
+					// this attempt firing (menu toggle) — stay inert.
+					if (!Settings::GetSingleton()->wbfovEnabled) {
+						return;
+					}
 
 					auto* player = RE::PlayerCharacter::GetSingleton();
 					if (!player || !player->Get3D()) return;
@@ -668,13 +829,28 @@ namespace WeaponFOV
 						}
 					}
 
-					float targetFOV = defaultViewmodelFOV.load();
+					// Same ownership rule as RefreshDefaults: only force an
+					// apply when the equipped weapon has a per-weapon entry.
+					// No entry -> complete the generation WITHOUT touching
+					// FOV; if an entry weapon equips later, Update()'s
+					// entryGained transition applies it naturally.
+					float targetFOV       = 0.0f;
+					bool  haveWeaponEntry = false;
 					if (!curEditorID.empty()) {
 						std::lock_guard lock(entriesMtx);
 						auto it = entries.find(curEditorID);
 						if (it != entries.end()) {
-							targetFOV = it->second.viewmodelFOV;
+							targetFOV       = it->second.viewmodelFOV;
+							haveWeaponEntry = true;
 						}
+					}
+
+					if (!haveWeaponEntry) {
+						loadRetryCompletedGeneration.store(gen);
+						logger::info("[WeaponFOV] LoadRetry attempt {}/{}: no weapon entry (weapon='{}') — leaving FOV untouched",
+							attempt, maxAttempts,
+							curEditorID.empty() ? "<none>" : curEditorID.c_str());
+						return;
 					}
 
 					logger::info("[WeaponFOV] LoadRetry attempt {}/{}: vm={:.1f} weapon='{}' cam={:.1f}",

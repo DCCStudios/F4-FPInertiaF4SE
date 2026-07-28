@@ -126,6 +126,16 @@ namespace WeaponFOV
 		// cause a visible camera-FOV jump every time we re-apply.
 		void RefreshLiveCameraFOV();
 
+		// Detect and adopt camera/3rd-person FOV changes made OUTSIDE this
+		// plugin (console `fov X Y`, other mods writing the engine INI
+		// settings). Returns true while a candidate change is still being
+		// debounced — the caller must not apply while that is the case,
+		// because one apply would write the stale cached values back into
+		// the engine INI and erase the user's change. `a_force` bypasses
+		// the poll throttle; used immediately before an apply so a change
+		// made between polls can't be erased.
+		bool AdoptExternalFOVChanges(bool a_force = false);
+
 		// Tracking
 		std::atomic<float>  defaultViewmodelFOV{ 80.0f };
 		std::atomic<FOVDefaultSource> defaultSource{ FOVDefaultSource::HardcodedDefault };
@@ -179,6 +189,17 @@ namespace WeaponFOV
 		// 3rd-person, VATS, etc.). Used to detect the transition back to
 		// first-person so we can smooth-lerp rather than hard-snap.
 		bool wasCameraBlocked{ false };
+
+		// ---- External FOV change adoption (see AdoptExternalFOVChanges) ----
+		// Poll throttle: engine setting lookups walk a list, so only poll a
+		// few times per second, not every frame.
+		std::chrono::steady_clock::time_point lastExternalPollTime{};
+		// Candidate external values being debounced (-1 = none pending).
+		// Game-thread only — no atomics needed.
+		float pendingExternalCam{ -1.0f };
+		std::chrono::steady_clock::time_point pendingExternalCamSince{};
+		float pendingExternalWorld{ -1.0f };
+		std::chrono::steady_clock::time_point pendingExternalWorldSince{};
 
 		// editorID -> entry map (case-sensitive, matches preset system convention)
 		mutable std::mutex                          entriesMtx;
