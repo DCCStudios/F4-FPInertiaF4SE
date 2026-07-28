@@ -256,6 +256,41 @@ namespace Menu
 	}
 
 	// ============================================================
+	// Save button with "unsaved changes" glow
+	// ------------------------------------------------------------
+	// Drop-in Button replacement for the save buttons: while a_dirty
+	// is true, the button fill slowly pulses between the theme's
+	// normal and hovered button colors (~1.6 s period) so pending
+	// changes are visible at a glance. Colors are read from the live
+	// style each frame, so the glow follows whatever HUD-derived
+	// theme the framework applies.
+	// ============================================================
+	static bool GlowSaveButton(const char* a_label, bool a_dirty)
+	{
+		bool pushed = false;
+		if (a_dirty) {
+			const ImVec4* base = ImGuiMCP::GetStyleColorVec4(ImGuiCol_Button);
+			const ImVec4* hot  = ImGuiMCP::GetStyleColorVec4(ImGuiCol_ButtonHovered);
+			if (base && hot) {
+				// 0..1 sine pulse; 4 rad/s ≈ one full glow every 1.6 s
+				const float t = 0.5f + 0.5f * static_cast<float>(
+					std::sin(ImGuiMCP::GetTime() * 4.0));
+				auto lerp = [t](float a, float b) { return a + (b - a) * t; };
+				const ImVec4 glow(
+					lerp(base->x, hot->x), lerp(base->y, hot->y),
+					lerp(base->z, hot->z), lerp(base->w, hot->w));
+				ImGuiMCP::PushStyleColor(ImGuiCol_Button, glow);
+				pushed = true;
+			}
+		}
+		const bool clicked = ImGuiMCP::Button(a_label);
+		if (pushed) {
+			ImGuiMCP::PopStyleColor();
+		}
+		return clicked;
+	}
+
+	// ============================================================
 	// Preset list helpers
 	// ============================================================
 	void RefreshPresetList()
@@ -2423,7 +2458,7 @@ namespace Menu
 					DrawWeaponInertiaEditor(mutableWS, selEID.c_str());
 					ImGuiMCP::PopID();
 
-					if (ImGuiMCP::Button("Save This Preset")) {
+					if (GlowSaveButton("Save This Preset", presets->IsDirty())) {
 						presets->SaveSpecificWeaponPreset(selEID);
 						State::saveStatusMsg = std::format("Saved: {}", selEID);
 						State::saveStatusTimer = 4.0f;
@@ -2568,7 +2603,7 @@ namespace Menu
 
 		ImGuiMCP::Text("INI Configuration (Global Settings):");
 
-		if (ImGuiMCP::Button("Save to INI")) {
+		if (GlowSaveButton("Save to INI", State::hasUnsavedChanges)) {
 			settings->Save();
 			State::hasUnsavedChanges = false;
 			State::saveStatusMsg = "Global settings saved to INI.";
@@ -2611,7 +2646,7 @@ namespace Menu
 		ImGuiMCP::Text("%s", presetLabel.c_str());
 
 		std::string saveLabel = std::format("Save to '{}.json'", presets->GetActivePresetName());
-		if (ImGuiMCP::Button(saveLabel.c_str())) {
+		if (GlowSaveButton(saveLabel.c_str(), presets->IsDirty())) {
 			presets->SaveWeaponTypePresets();
 			presets->ClearDirty();
 			State::hasUnsavedChanges = false;
@@ -2715,7 +2750,7 @@ namespace Menu
 
 		ImGuiMCP::SameLine();
 		auto* presets = InertiaPresets::GetSingleton();
-		if (ImGuiMCP::Button("Save Weapon Types")) {
+		if (GlowSaveButton("Save Weapon Types", presets->IsDirty())) {
 			presets->SaveWeaponTypePresets();
 			presets->ClearDirty();
 			State::hasUnsavedChanges = false;
@@ -3634,6 +3669,41 @@ namespace Menu
 				State::hasUnsavedChanges = true;
 			}
 			} // if (editSettings)
+
+			// ---- Preset save buttons ----
+			// These live here rather than in the page-bottom row: Early ADS
+			// Return is the only Extras section backed by weapon type /
+			// specific weapon presets, so the save belongs next to what it
+			// saves. (Save to INI stays at the bottom — it covers the
+			// global settings used by the other sections.)
+			ImGuiMCP::Spacing();
+			ImGuiMCP::Separator();
+			if (State::saveStatusTimer > 0.0f) {
+				// Display only — the page-bottom status line owns the timer
+				// decrement (decrementing here too would halve the visible
+				// duration).
+				ImGuiMCP::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "%s", State::saveStatusMsg.c_str());
+			}
+			if (GlowSaveButton("Save Weapon Type Presets", presets->IsDirty())) {
+				presets->SaveWeaponTypePresets();
+				presets->ClearDirty();
+				State::saveStatusMsg = "Weapon type presets saved.";
+				State::saveStatusTimer = 4.0f;
+			}
+			if (ImGuiMCP::IsItemHovered())
+				ImGuiMCP::SetTooltip("Save all weapon type settings (including these) to the active preset JSON");
+			if (State::extrasSpecificWeaponIndex >= 0 &&
+				State::extrasSpecificWeaponIndex < static_cast<int>(savedPresets.size())) {
+				ImGuiMCP::SameLine();
+				const auto& eid = savedPresets[State::extrasSpecificWeaponIndex];
+				if (GlowSaveButton("Save Specific Preset", presets->IsDirty())) {
+					presets->SaveSpecificWeaponPreset(eid);
+					State::saveStatusMsg = std::format("Saved: {}", eid);
+					State::saveStatusTimer = 4.0f;
+				}
+				if (ImGuiMCP::IsItemHovered())
+					ImGuiMCP::SetTooltip("Save the selected specific weapon preset ('%s')", eid.c_str());
+			}
 	}
 
 	// ====== WEAPON BASED FOV ======
@@ -4320,27 +4390,13 @@ namespace Menu
 			ImGuiMCP::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "%s", State::saveStatusMsg.c_str());
 		}
 
-		if (ImGuiMCP::Button("Save to INI")) {
+		// Preset save buttons moved into the Early ADS Return section (the
+		// only Extras section that uses weapon type / specific presets).
+		if (GlowSaveButton("Save to INI", State::hasUnsavedChanges)) {
 			Settings::GetSingleton()->Save();
 			State::hasUnsavedChanges = false;
 			State::saveStatusMsg = "Global settings saved to INI.";
 			State::saveStatusTimer = 4.0f;
-		}
-		ImGuiMCP::SameLine();
-		if (ImGuiMCP::Button("Save Weapon Type Presets")) {
-			presets->SaveWeaponTypePresets();
-			State::saveStatusMsg = "Weapon type presets saved.";
-			State::saveStatusTimer = 4.0f;
-		}
-		if (State::extrasSpecificWeaponIndex >= 0 &&
-			State::extrasSpecificWeaponIndex < static_cast<int>(savedPresets.size())) {
-			ImGuiMCP::SameLine();
-			const auto& eid = savedPresets[State::extrasSpecificWeaponIndex];
-			if (ImGuiMCP::Button("Save Specific Preset")) {
-				presets->SaveSpecificWeaponPreset(eid);
-				State::saveStatusMsg = std::format("Saved: {}", eid);
-				State::saveStatusTimer = 4.0f;
-			}
 		}
 	}
 
@@ -4783,8 +4839,9 @@ namespace Menu
 			ImGuiMCP::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "%s", State::saveStatusMsg.c_str());
 		}
 
-		if (ImGuiMCP::Button("Save Weapon Type Presets##adsTrans")) {
+		if (GlowSaveButton("Save Weapon Type Presets##adsTrans", presets->IsDirty())) {
 			presets->SaveWeaponTypePresets();
+			presets->ClearDirty();
 			State::saveStatusMsg = "ADS transition presets saved.";
 			State::saveStatusTimer = 4.0f;
 		}
@@ -4792,7 +4849,7 @@ namespace Menu
 			State::adsTransSpecificWeaponIndex < static_cast<int>(savedPresets.size())) {
 			ImGuiMCP::SameLine();
 			const auto& eid = savedPresets[State::adsTransSpecificWeaponIndex];
-			if (ImGuiMCP::Button("Save Specific Preset##adsTrans")) {
+			if (GlowSaveButton("Save Specific Preset##adsTrans", presets->IsDirty())) {
 				presets->SaveSpecificWeaponPreset(eid);
 				State::saveStatusMsg = std::format("Saved: {}", eid);
 				State::saveStatusTimer = 4.0f;

@@ -4688,18 +4688,27 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	// Fire comes from the AttackInput vtable hook (engine-dispatched
 	// "PrimaryAttack" ButtonEvents). Do not fall back to raw handler bytes:
 	// that field is both unreliable and layout-sensitive across runtimes.
-	// ADS keeps the generic HeldStateHandler::heldStateActive flag for
-	// compatibility with the existing EarlyADS arm behavior (it's a
-	// "either attack button held" flag, which EarlyADS was tuned around).
+	// adsInputHeld is the generic HeldStateHandler::heldStateActive flag —
+	// an "EITHER attack button held" signal, kept for the consumers tuned
+	// around it (Early Equip arms, force-idle bookkeeping).
 	bool adsInputHeld  = false;
 	bool fireInputHeld = false;
+	// Genuine aim state (SecondaryAttack button only). The Early ADS
+	// Return arm MUST use this, not heldStateActive: a fire-to-empty auto
+	// reload by construction starts with the trigger still down, so the
+	// either-button flag armed Early ADS Return on every such reload and
+	// force-ended the animation at reloadComplete — the "auto reload
+	// blends out early" bug. Falls back to the either-button flag only
+	// when the input hook failed to install, so the feature still works
+	// there (with the old quirk).
+	bool adsAimHeld    = false;
 	auto* pc = RE::PlayerControls::GetSingleton();
 	RE::HeldStateHandler* atkHandler = nullptr;
 	if (pc && pc->attackHandler) {
 		atkHandler = reinterpret_cast<RE::HeldStateHandler*>(pc->attackHandler);
-		// Generic flag (kept for compatibility with the existing EarlyADS arm).
 		adsInputHeld = atkHandler->heldStateActive;
 		fireInputHeld = AttackInput::s_installed && AttackInput::s_fireHeld;
+		adsAimHeld = AttackInput::s_installed ? AttackInput::s_adsHeld : adsInputHeld;
 	}
 
 	// Force-idle: keep the ADS/attack handler suppressed for a few frames
@@ -5083,8 +5092,22 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		}
 	}
 
+	// ============================================================
+	// EARLY EQUIP — SHELVED. The menu already shows both toggles as
+	// "coming in a future version", but preset JSONs / INIs written
+	// during earlier testing can still carry earlyEquip*Enabled = true,
+	// which would re-activate these arms. This kill switch keeps the
+	// runtime paths off no matter what stored settings say, without
+	// deleting the implementation. Known issue to fix before re-enabling:
+	// the ADS arm below uses adsInputHeld (the either-attack-button
+	// heldStateActive flag), so holding FIRE during a draw arms the ADS
+	// variant instead of the fire variant — same flaw class as the Early
+	// ADS Return reload arm fixed above (use adsAimHeld there).
+	// ============================================================
+	constexpr bool kEarlyEquipShelved = true;
+
 	// Arm early equip ADS
-	if (isCurrentlyEquipping && ws.earlyEquipAdsEnabled
+	if (!kEarlyEquipShelved && isCurrentlyEquipping && ws.earlyEquipAdsEnabled
 	    && !earlyEquipAdsArmed && !earlyEquipFireArmed && adsInputHeld)
 	{
 		earlyEquipAdsArmed  = true;
@@ -5095,7 +5118,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	}
 
 	// Arm early equip fire (only if ADS not already armed)
-	if (isCurrentlyEquipping && ws.earlyEquipFireEnabled
+	if (!kEarlyEquipShelved && isCurrentlyEquipping && ws.earlyEquipFireEnabled
 	    && !earlyEquipFireArmed && !earlyEquipAdsArmed && fireInputHeld && !adsInputHeld)
 	{
 		earlyEquipFireArmed = true;
@@ -5166,18 +5189,24 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		}
 	}
 
-	// Arm early ADS if we're mid-reload and ADS input is held
-	if (isCurrentlyReloading && ws.earlyAdsReturnEnabled && !earlyAdsArmed && adsInputHeld) {
+	// Arm early ADS if we're mid-reload and the AIM button is genuinely
+	// held (adsAimHeld, not the either-attack-button heldStateActive flag
+	// — see the input-read block for why that armed on every fire-to-empty
+	// auto reload and cut the animation short).
+	if (isCurrentlyReloading && ws.earlyAdsReturnEnabled && !earlyAdsArmed && adsAimHeld) {
 		earlyAdsArmed         = true;
 		earlyAdsReturnPending = false;
 		earlyAdsReturnTimer   = 0.0f;
-		logger::debug("[EarlyADS] Armed — ADS input held during reload (gunState={})",
+		logger::debug("[EarlyADS] Armed — aim held during reload (gunState={})",
 			GunStateLocal::Read(player));
 	}
 
-	// Disarm if reload ended naturally before our timer fired.
-	if (earlyAdsArmed && !isCurrentlyReloading) {
-		logger::debug("[EarlyADS] Disarmed — reload ended naturally (gunState={})",
+	// Disarm if the reload ended naturally before our timer fired, or if
+	// the player released aim (mirrors Early Fire Cancel's release disarm:
+	// no aim held means no early return wanted — let the reload play out).
+	if (earlyAdsArmed && (!isCurrentlyReloading || !adsAimHeld)) {
+		logger::debug("[EarlyADS] Disarmed — {} (gunState={})",
+			!isCurrentlyReloading ? "reload ended naturally" : "aim released",
 			GunStateLocal::Read(player));
 		earlyAdsArmed         = false;
 		earlyAdsReturnPending = false;
@@ -5268,12 +5297,18 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	// Same fix: ReloadEnd → force isReloading=false → force idle frames →
 	// arm phantom override.
 	//
-	// IMPORTANT difference from EarlyADS: we trigger IMMEDIATELY on
-	// (reloading + fire-held) rather than waiting for a trigger event,
-	// because canceling a reload by firing usually skips the natural
-	// reloadComplete event entirely (the engine cuts the reload anim short).
-	// A tiny built-in 50 ms hold-debounce filters out spurious single-frame
-	// fire taps right at reload boundaries.
+	// TRIGGER-EVENT DRIVEN, exactly like EarlyADS: arm while fire is held,
+	// then wait for the shared trigger event (reloadComplete by default)
+	// plus the shared delay before force-ending the reload. An earlier
+	// version triggered immediately (50 ms after fire was held), but that
+	// version was unreachable in practice — the either-button
+	// heldStateActive flag armed Early ADS first and suppressed this path.
+	// Once the Early ADS arm was fixed to require genuine aim, the
+	// immediate trigger became live and let a fire press at the START of a
+	// tactical reload abort the whole reload body, which is not the
+	// feature. The feature is an early fire RETURN: the mechanical reload
+	// completes, and holding fire skips the tail (weapon-raise) portion,
+	// mirroring what Early ADS Return does for aim.
 	//
 	// Suppressed if the EarlyADS path is already active so the two flows
 	// don't race each other on the same reload.
@@ -5281,29 +5316,51 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	// Early Fire Cancel is gated behind Early ADS Return: it is a sub-feature
 	// that reuses the same recovery pipeline, and the menu greys it out when
 	// Early ADS is off, so keep the runtime consistent with that UI state.
+	//
+	// EMPTY-MAG GATE: fire-to-empty auto reloads must never be cut short —
+	// there is nothing to discharge until the reload finishes, and cutting
+	// them recreates the exact early blend-out the Early ADS arm fix
+	// removed. Tactical reloads (rounds still chambered) keep the early
+	// fire return.
 	if (isCurrentlyReloading && ws.earlyAdsReturnEnabled && ws.earlyFireCancelEnabled
 	    && !earlyFireCancelArmed && !earlyAdsArmed
+	    && !lastReloadWasEmpty
 	    && fireInputHeld)
 	{
 		earlyFireCancelArmed   = true;
-		earlyFireCancelPending = true;
-		earlyFireCancelTimer   = 0.05f;  // 50 ms hold-debounce
+		earlyFireCancelPending = false;
+		earlyFireCancelTimer   = 0.0f;
 		logger::info("[EarlyFireCancel] Armed — fire input held during reload (gunState={})",
 			GunStateLocal::Read(player));
 	}
 
-	// Disarm if reload ended naturally before our debounce expired,
-	// or if the player released fire before the debounce expired.
+	// Disarm if the reload ended naturally before our timer fired, or if
+	// the player released fire (a tap during the reload must not commit
+	// them to a forced cut at reloadComplete).
 	if (earlyFireCancelArmed && (!isCurrentlyReloading || !fireInputHeld)) {
-		if (earlyFireCancelPending) {
-			logger::debug("[EarlyFireCancel] Disarmed — {} (gunState={})",
-				!isCurrentlyReloading ? "reload ended naturally" : "fire released before debounce",
-				GunStateLocal::Read(player));
-		}
+		logger::debug("[EarlyFireCancel] Disarmed — {} (gunState={})",
+			!isCurrentlyReloading ? "reload ended naturally" : "fire released",
+			GunStateLocal::Read(player));
 		earlyFireCancelArmed   = false;
 		earlyFireCancelPending = false;
 		earlyFireCancelTimer   = 0.0f;
 		earlyFireCancelArmSemi = false;
+	}
+
+	if (earlyFireCancelArmed) {
+		// Same trigger event selection as EarlyADS (shared setting).
+		bool fireCancelTrigger = false;
+		switch (ws.earlyAdsReturnTrigger) {
+			case 1:  fireCancelTrigger = reloadEnd;      break;
+			case 2:  fireCancelTrigger = initiateStart;  break;
+			default: fireCancelTrigger = reloadComplete; break;
+		}
+		if (fireCancelTrigger && !earlyFireCancelPending) {
+			earlyFireCancelPending = true;
+			earlyFireCancelTimer   = ws.earlyAdsReturnDelay;
+			logger::info("[EarlyFireCancel] Trigger event hit (type={}), delay={:.2f}s",
+				ws.earlyAdsReturnTrigger, ws.earlyAdsReturnDelay);
+		}
 	}
 
 	if (earlyFireCancelArmed && earlyFireCancelPending) {
