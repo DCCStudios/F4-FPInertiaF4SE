@@ -8,6 +8,8 @@
 
 #include <RE/P/PowerArmor.h>  // RE::PowerArmor::ActorInPowerArmor (engine PA check)
 
+#include <Xinput.h>  // XINPUT_STATE for MeleeAndThrowCompat gamepad polling (loaded dynamically)
+
 // ============================================================
 // Static members
 // ============================================================
@@ -3203,6 +3205,141 @@ namespace MeleeInput
 }
 
 // ============================================================
+// Melee and Throw compatibility — poll its melee hotkey.
+// ------------------------------------------------------------
+// Melee and Throw (MeleeAndThrow.dll) moves melee onto its own hotkey:
+// it hooks PerformInputProcessing on PlayerCamera's input receiver,
+// matches raw button ids against its INI key, and on key RELEASE
+// forwards a synthetic event straight to MeleeThrowHandler — but only
+// after PlayerControls::CanPerformAction(kActionMelee) approves.
+// During an active bash that check refuses (the same engine refusal
+// TriggerGunBashAction works around), so mid-bash presses are dropped
+// inside Melee and Throw and never reach the handler our MeleeInput
+// hook watches. Genuine "Melee" user events don't exist either when
+// its ForceUnbind option has unbound the vanilla control. Net effect:
+// Repeatable Gun Bash never sees a queue request with that mod
+// installed.
+//
+// Fix: when MeleeAndThrow.dll is loaded, read MeleeKey from its INI
+// (same file, key, default, and hex parsing as its LoadConfigs()) and
+// poll that key for press edges ourselves. The edge feeds the same
+// meleePressed bool as the MeleeInput hook, so queueing behaves
+// identically to the vanilla-input path. Bash triggering is untouched:
+// kActionMelee / graph reset / SimulateTap all bypass that mod's hook.
+//
+// Id space matches its InputEventReceiverOverride (same author and
+// same convention ContextualLean decomposes for UneducatedShooter):
+//   keyboard  = raw ButtonEvent idCode, which is a Windows virtual-key
+//               code (its default 0xA4 is VK_LMENU — vanilla melee Alt)
+//   mouse     = raw id + 0x100 (0=L 1=R 2=M 3=X1 4=X2; wheel 8/9 not
+//               pollable, treated as unbound)
+//   gamepad   = raw id + 0x10000, raw = XINPUT button mask with the
+//               0x09/0x0A LT/RT convention
+// ============================================================
+namespace MeleeAndThrowCompat
+{
+	static bool          s_present  = false;  // MeleeAndThrow.dll loaded
+	static std::uint32_t s_meleeKey = 0;      // unified id from its INI
+	static bool          s_wasDown  = false;  // previous frame's key state
+
+	// XInputGetState resolved lazily so the DLL gains no import-table
+	// dependency for a path most users (keyboard default) never hit.
+	using FnXInputGetState = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+	static FnXInputGetState GetXInputGetState()
+	{
+		static FnXInputGetState s_fn = []() -> FnXInputGetState {
+			for (const wchar_t* name : { L"XInput1_4.dll", L"xinput9_1_0.dll", L"XInput1_3.dll" }) {
+				if (HMODULE m = ::LoadLibraryW(name)) {
+					if (auto fn = reinterpret_cast<FnXInputGetState>(
+							::GetProcAddress(m, "XInputGetState"))) {
+						return fn;
+					}
+				}
+			}
+			return nullptr;
+		}();
+		return s_fn;
+	}
+
+	// kGameDataReady + game load: detect the DLL and (re-)read its key.
+	// Melee and Throw itself reloads its INI on preload/new game, so a
+	// mid-session rebind is picked up at the same points.
+	static void Detect()
+	{
+		s_present  = ::GetModuleHandleW(L"MeleeAndThrow.dll") != nullptr;
+		s_meleeKey = 0;
+		s_wasDown  = false;
+		if (!s_present) {
+			return;
+		}
+
+		// Mirror of MeleeAndThrow's LoadConfigs(): it ignores the load
+		// result and takes GetValue defaults, and parses values as hex.
+		CSimpleIniA ini(true, false, false);
+		ini.LoadFile("Data\\F4SE\\Plugins\\MeleeAndThrow.ini");
+		try {
+			s_meleeKey = static_cast<std::uint32_t>(
+				std::stoul(ini.GetValue("General", "MeleeKey", "0xA4"), nullptr, 16));
+		} catch (...) {
+			s_meleeKey = 0xA4;
+		}
+		logger::info("[GunBash] Melee and Throw detected — polling its MeleeKey 0x{:X} "
+			"for combo queueing", s_meleeKey);
+	}
+
+	// Is the configured key physically held right now?
+	static bool IsDown()
+	{
+		const std::uint32_t id = s_meleeKey;
+		if (id >= 0x10000) {
+			const std::uint32_t raw = id - 0x10000;
+			auto* xinput = GetXInputGetState();
+			XINPUT_STATE st{};
+			if (!xinput || xinput(0, &st) != ERROR_SUCCESS) {
+				return false;
+			}
+			if (raw == 0x09) return st.Gamepad.bLeftTrigger  >= XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
+			if (raw == 0x0A) return st.Gamepad.bRightTrigger >= XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
+			return (st.Gamepad.wButtons & static_cast<WORD>(raw)) != 0;
+		}
+		if (id >= 0x100) {
+			static constexpr int kMouseVK[] = {
+				VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2
+			};
+			const std::uint32_t raw = id - 0x100;
+			if (raw >= std::size(kMouseVK)) {
+				return false;  // wheel or out-of-range: not pollable
+			}
+			return (::GetAsyncKeyState(kMouseVK[raw]) & 0x8000) != 0;
+		}
+		return (::GetAsyncKeyState(static_cast<int>(id)) & 0x8000) != 0;
+	}
+
+	// Rising-edge poll — call exactly once per frame (Update, main
+	// thread). Returns true on the frame the key goes down during
+	// gameplay. Menu presses are swallowed (state still tracked, so
+	// closing a menu with the key held can't read as a fresh press).
+	static bool PollPressedEdge()
+	{
+		if (!s_present || s_meleeKey == 0) {
+			return false;
+		}
+		const bool down = IsDown();
+		const bool edge = down && !s_wasDown;
+		s_wasDown = down;
+		if (!edge) {
+			return false;
+		}
+		// Same menuMode gate Melee and Throw applies to its own hook.
+		auto* ui = RE::UI::GetSingleton();
+		if (ui && ui->menuMode != 0) {
+			return false;
+		}
+		return true;
+	}
+}
+
+// ============================================================
 // Fire annotation guard — swallow `weaponFire` during dry-fire,
 // and skip the engine's post-special-idle re-equip on IdleStop.
 // ------------------------------------------------------------
@@ -4105,8 +4242,17 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 
 		// Consume the press edge every frame — a stale edge from a menu
 		// or a melee-weapon swing must never count as a queue request.
-		const bool meleePressed = MeleeInput::s_meleePressedEdge;
+		bool meleePressed = MeleeInput::s_meleePressedEdge;
 		MeleeInput::s_meleePressedEdge = false;
+
+		// Melee and Throw drives melee from its own hotkey and swallows
+		// mid-bash presses before they reach MeleeThrowHandler, so the
+		// hook above never fires with that mod installed. Poll its key
+		// directly instead (no-op when the mod isn't loaded). Polled
+		// unconditionally so the edge tracking never goes stale.
+		if (MeleeAndThrowCompat::PollPressedEdge()) {
+			meleePressed = true;
+		}
 
 		if (bashRetriggerCooldown > 0.0f) {
 			bashRetriggerCooldown -= delta;
@@ -5452,35 +5598,75 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	// cancels.  We just manage the window + activation here.
 	{
 		auto* sgs = Settings::GetSingleton();
-		const bool ssEnabled = sgs->superSprintEnabled && superSprintKeyword
-			&& avifSpeedMult && SuperSprintInput::s_installed;
+		// The SprintHandler input hook is only needed by the double-tap
+		// gesture; the hotkey path below works without it.
+		const bool ssEnabled = sgs->superSprintEnabled && superSprintKeyword && avifSpeedMult;
+
+		// Consume the framework hotkey press flag every frame, even while the
+		// feature is disabled, so a press made with Super Sprint off can't
+		// linger and trigger a surprise activation after it is re-enabled.
+		const bool hotkeyPressed = g_superSprintHotkeyPressed.exchange(false);
 
 		if (ssEnabled) {
+			// -----------------------------------------------------------
+			// 0. HOTKEY — direct activation for hold-to-sprint setups.
+			// With hold-to-sprint mods the sprint button is physically held
+			// the whole time, so the double-tap gesture can never happen.
+			// The key is registered through the F4SE Menu Framework hotkey
+			// API (see Menu::Register): the framework dispatches it from
+			// its WndProc/XInput hooks, only during gameplay (never while a
+			// blocking menu is open) and only on the first press of a held
+			// key. Its callback raises g_superSprintHotkeyPressed, consumed
+			// above on the game thread.
+			// -----------------------------------------------------------
+			bool hotkeyActivate = false;
+			bool hotkeyStop     = false;
+			if (hotkeyPressed) {
+				if (superSprintActive)          hotkeyStop = true;
+				else if (currentlySpriniting)   hotkeyActivate = true;
+			}
+
 			// -----------------------------------------------------------
 			// 1. ACTIVATION WINDOW — open on first sprint tap, enable eating
 			// -----------------------------------------------------------
 			if (!superSprintActive) {
-				// Sprint just started (first tap) — open the activation window
-				// and enable the input hook to eat the next sprint press
-				if (currentlySpriniting && !wasSprinting) {
-					superSprintWindowActive = true;
-					superSprintWindowStart  = elapsedTime;
-					SuperSprintInput::s_eatEnabled = true;
+				bool activateRequested = false;
+
+				if (SuperSprintInput::s_installed) {
+					// Sprint just started (first tap) — open the activation window
+					// and enable the input hook to eat the next sprint press
+					if (currentlySpriniting && !wasSprinting) {
+						superSprintWindowActive = true;
+						superSprintWindowStart  = elapsedTime;
+						SuperSprintInput::s_eatEnabled = true;
+					}
+
+					// Expire the window if too much time has passed
+					if (superSprintWindowActive &&
+						(elapsedTime - superSprintWindowStart) > sgs->superSprintDoubleTapWindow) {
+						superSprintWindowActive = false;
+						SuperSprintInput::s_eatEnabled = false;
+					}
+
+					// The input hook ate a sprint press during the window → ACTIVATE
+					if (superSprintWindowActive && SuperSprintInput::s_eatTriggered) {
+						SuperSprintInput::s_eatTriggered = false;
+						SuperSprintInput::s_eatEnabled   = false;
+						superSprintWindowActive = false;
+						activateRequested = true;
+					}
 				}
 
-				// Expire the window if too much time has passed
-				if (superSprintWindowActive &&
-					(elapsedTime - superSprintWindowStart) > sgs->superSprintDoubleTapWindow) {
+				// Hotkey activation — close any pending double-tap state so
+				// the eat hook can't also fire on the next sprint press.
+				if (hotkeyActivate) {
 					superSprintWindowActive = false;
-					SuperSprintInput::s_eatEnabled = false;
-				}
-
-				// The input hook ate a sprint press during the window → ACTIVATE
-				if (superSprintWindowActive && SuperSprintInput::s_eatTriggered) {
-					SuperSprintInput::s_eatTriggered = false;
 					SuperSprintInput::s_eatEnabled   = false;
-					superSprintWindowActive = false;
+					SuperSprintInput::s_eatTriggered = false;
+					activateRequested = true;
+				}
 
+				if (activateRequested) {
 					// Block activation if AP is below the stamina threshold
 					bool allowActivation = true;
 					if (sgs->superSprintStaminaThresholdEnabled && avifActionPoints) {
@@ -5527,18 +5713,19 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 						}
 
 						PushEvent("Super Sprint activated");
-						logger::info("[SuperSprint] Activated — speedBoost={:.1f}, animBoost={:.1f}, window={:.3f}s",
-							superSprintSpeedBoost, superSprintAnimBoost,
-							elapsedTime - superSprintWindowStart);
+						logger::info("[SuperSprint] Activated ({}) — speedBoost={:.1f}, animBoost={:.1f}",
+							hotkeyActivate ? "hotkey" : "double-tap",
+							superSprintSpeedBoost, superSprintAnimBoost);
 					}
 				}
 			}
 
 			// -----------------------------------------------------------
 			// 2. DEACTIVATION — sprint stopped naturally (3rd tap, AP out,
-			//    player stopped moving, etc.)
+			//    player stopped moving, etc.), or the hotkey was pressed
+			//    while active (drop back to normal sprint without stopping).
 			// -----------------------------------------------------------
-			if (superSprintActive && !currentlySpriniting && wasSprinting) {
+			if (superSprintActive && ((!currentlySpriniting && wasSprinting) || hotkeyStop)) {
 				superSprintActive = false;
 
 				if (std::abs(superSprintSpeedBoost) > 0.001f) {
@@ -5563,7 +5750,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 				superSprintPrevAP = -1.0f;
 				SuperSprintInput::s_eatEnabled = false;
 				PushEvent("Super Sprint deactivated");
-				logger::info("[SuperSprint] Deactivated");
+				logger::info("[SuperSprint] Deactivated{}", hotkeyStop ? " (hotkey)" : "");
 			}
 
 			// -----------------------------------------------------------
@@ -6352,6 +6539,10 @@ void Inertia::InertiaManager::OnGameLoaded()
 	hasLoggedSkeleton = false;
 	pivotWarmupTimer = 0.5f;
 	RegisterAnimEventSink();
+
+	// Melee and Throw reloads its own INI on preload/new game; re-read
+	// its melee key at the same points so a rebind is picked up.
+	MeleeAndThrowCompat::Detect();
 }
 
 // ============================================================
@@ -6418,6 +6609,11 @@ void Inertia::InertiaManager::InitSuperSprint()
 	if (!MeleeInput::s_installed) {
 		MeleeInput::Install();
 	}
+
+	// Detect Melee and Throw and read its melee hotkey — with that mod
+	// installed, bash presses never reach MeleeThrowHandler mid-bash, so
+	// Repeatable Gun Bash polls its key instead (see MeleeAndThrowCompat).
+	MeleeAndThrowCompat::Detect();
 
 	// Install the player graph-event hook that lets Fire on Empty swallow
 	// weaponFire annotations (prevents real discharge during a dry-fire

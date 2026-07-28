@@ -85,6 +85,17 @@ namespace Menu
 		inline std::string saveStatusMsg;
 		inline float saveStatusTimer{ 0.0f };
 
+		// Sticky weapon-type toolbar (Inertia Configs page): window-local Y
+		// of the real selector row, and where the per-type settings end
+		// (the Specific Weapon Presets section starts there). Both refreshed
+		// every frame while the Per-Weapon Type Settings header is open.
+		inline float weaponTypeBarNaturalY{ 0.0f };
+		inline float weaponTypeBarEndY{ 0.0f };
+
+		// Delete-specific-weapon-preset confirmation dialog
+		inline bool showDeletePresetPopup{ false };
+		inline std::string deletePresetEID;
+
 		// Debug popout window (framework-managed)
 		inline MENU_WINDOW debugPopoutWindow{ nullptr };
 
@@ -94,6 +105,9 @@ namespace Menu
 		// Extras tab state
 		inline int extrasWeaponTypeIndex{ 0 };
 		inline int extrasSpecificWeaponIndex{ -1 };
+
+		// Super Sprint hotkey binding: true while waiting for a key press
+		inline bool ssHotkeyCapturing{ false };
 
 		// ADS Transitions tab state
 		inline int adsTransWeaponTypeIndex{ 3 };   // default to Rifle
@@ -135,6 +149,8 @@ namespace Menu
 	void DrawSpecificWeaponSettings();
 	void DrawWeaponInertiaEditor(WeaponInertiaSettings& settings, const char* label);
 	void DrawSaveLoadButtons();
+	void DrawStickyWeaponTypeBar();
+	void DrawDeletePresetConfirmModal();
 
 	// Refresh cached preset list
 	void RefreshPresetList();

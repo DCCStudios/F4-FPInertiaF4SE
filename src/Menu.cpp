@@ -21,6 +21,110 @@ static std::string GetEquippedWeaponEditorID(RE::PlayerCharacter* player)
 	return Inertia::InertiaManager::GetEquippedWeaponEditorIDStatic(player);
 }
 
+// Equipped-weapon status line: shows what is currently in the player's
+// hands and whether a specific (by-EditorID) preset overrides its weapon
+// type settings. Drawn next to every weapon type / specific weapon
+// selector so the user always knows which settings actually apply to the
+// gun they are holding. Pass a_sameLine = true to continue the current
+// row (matches the Inertia page's combo-row layout).
+static void DrawEquippedWeaponStatus(bool a_sameLine)
+{
+	auto* player = RE::PlayerCharacter::GetSingleton();
+	if (!player) return;
+	auto* base = GetEquippedWeaponBase(player);
+	if (!base) return;
+
+	const std::string eqID = GetEquippedWeaponEditorID(player);
+	std::string name;
+	if (auto* fn = base->As<RE::TESFullName>()) {
+		if (const char* n = fn->GetFullName()) name = n;
+	}
+	if (name.empty()) name = eqID;
+
+	const bool hasSpecific = !eqID.empty() &&
+		InertiaPresets::GetSingleton()->HasSpecificWeaponSettings(eqID);
+
+	if (a_sameLine) ImGuiMCP::SameLine();
+	if (hasSpecific) {
+		ImGuiMCP::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f),
+			"(Equipped: %s - SPECIFIC PRESET ACTIVE)", name.c_str());
+	} else {
+		ImGuiMCP::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f),
+			"(Equipped: %s)", name.c_str());
+	}
+}
+
+// ============================================================
+// Super Sprint hotkey (F4SE Menu Framework hotkey API)
+// ============================================================
+// The Super Sprint activation key is registered through the framework's
+// hotkey API (Menu::Register below), which handles dispatch from its
+// WndProc/XInput hooks, persistence under [Hotkeys] in
+// F4SEMenuFramework/PluginHotkeys.ini (user data, survives framework
+// updates), and conflict warnings. Bindings are DirectInput scan codes
+// (extended keys carry bit 0x80) plus the F4SE mouse-button codes 256-260.
+static constexpr const char* kSuperSprintHotkeyId    = "FPGunplayOverhaul.SuperSprint";
+static constexpr const char* kSuperSprintHotkeyPadId = "FPGunplayOverhaul.SuperSprint.Pad";
+
+// Framework hotkey callback. Runs on the game window's WndProc thread (or
+// the framework's XInput poll for gamepad), so it only raises an atomic
+// flag that InertiaManager::Update consumes on the game thread.
+static void __stdcall OnSuperSprintHotkey()
+{
+	Inertia::g_superSprintHotkeyPressed.store(true);
+}
+
+// Human-readable name for a framework hotkey binding. GetKeyNameText wants
+// the scan code in lParam bits 16-23 with the extended flag in bit 24;
+// without the extended flag it returns the numpad twin ("Num 4" for "Left").
+static std::string GetHotkeyKeyName(unsigned int code)
+{
+	if (code == 0) return "Unbound";
+	switch (code) {
+	case 256: return "Left Mouse";
+	case 257: return "Right Mouse";
+	case 258: return "Middle Mouse";
+	case 259: return "Mouse X1";
+	case 260: return "Mouse X2";
+	default:  break;
+	}
+	LONG lparam = static_cast<LONG>((code & 0x7F) << 16);
+	if (code & 0x80) lparam |= (1 << 24);
+	char name[64]{};
+	if (::GetKeyNameTextA(lparam, name, sizeof(name)) > 0)
+		return name;
+	return std::format("Key 0x{:02X}", code);
+}
+
+// Convert a Windows virtual-key code (from the GetAsyncKeyState capture
+// loop) to the code the framework's hotkey dispatch matches on: DIK scan
+// codes for keyboard keys, 258-260 for the extra mouse buttons. Extended
+// keys (arrows, nav cluster, numpad divide, right ctrl/alt) live at
+// base|0x80 in DIK space. Returns 0 if the key can't be represented.
+static unsigned int VKToHotkeyCode(int vk)
+{
+	switch (vk) {
+	case VK_MBUTTON:  return 258;
+	case VK_XBUTTON1: return 259;
+	case VK_XBUTTON2: return 260;
+	default:          break;
+	}
+
+	UINT scan = ::MapVirtualKeyA(static_cast<UINT>(vk), MAPVK_VK_TO_VSC);
+	if (scan == 0) return 0;
+	switch (vk) {
+	case VK_LEFT: case VK_UP: case VK_RIGHT: case VK_DOWN:
+	case VK_PRIOR: case VK_NEXT: case VK_END: case VK_HOME:
+	case VK_INSERT: case VK_DELETE: case VK_DIVIDE: case VK_NUMLOCK:
+	case VK_RCONTROL: case VK_RMENU:
+		scan |= 0x80;
+		break;
+	default:
+		break;
+	}
+	return scan;
+}
+
 namespace Menu
 {
 	// Static weapon types array
@@ -106,6 +210,13 @@ namespace Menu
 		F4SEMenuFramework::AddSectionItem("Extras", RenderExtras);
 		State::debugPopoutWindow = F4SEMenuFramework::AddWindow(RenderDebugPopout, false);
 		State::ctxLeanDebugWindow = F4SEMenuFramework::AddWindow(RenderCtxLeanDebugPopout, false);
+
+		// Super Sprint activation hotkey, unbound by default (the Extras page
+		// offers a Bind/Clear UI). A gamepad slot is registered alongside it
+		// so controller users can bind a button via PluginHotkeys.ini.
+		F4SEMenuFramework::Hotkeys::Register(kSuperSprintHotkeyId, 0, OnSuperSprintHotkey);
+		F4SEMenuFramework::Hotkeys::RegisterGamepad(kSuperSprintHotkeyPadId, 0, OnSuperSprintHotkey);
+
 		registered = true;
 
 		logger::info("[FPGunplayOverhaul] Menu registered with F4SE Menu Framework");
@@ -194,6 +305,13 @@ namespace Menu
 
 		ImGuiMCP::Separator();
 		DrawSaveLoadButtons();
+
+		// Shared delete-preset confirmation (opened by buttons above).
+		DrawDeletePresetConfirmModal();
+
+		// Last on purpose: pinned widgets must win mouse interaction over
+		// the scrolled content beneath them.
+		DrawStickyWeaponTypeBar();
 	}
 
 	// ============================================================
@@ -974,6 +1092,55 @@ namespace Menu
 	// ============================================================
 	// Per-Weapon Type Settings
 	// ============================================================
+	// Weapon type dropdown, shared by the real selector row and the sticky
+	// toolbar (both operate on State::selectedWeaponTypeIndex). Returns true
+	// when the selection changed.
+	static bool DrawWeaponTypeCombo(const char* comboLabel, float width)
+	{
+		const auto& types = GetWeaponTypes();
+		if (State::selectedWeaponTypeIndex >= static_cast<int>(types.size())) {
+			State::selectedWeaponTypeIndex = 0;
+		}
+
+		std::string preview = types[State::selectedWeaponTypeIndex].displayName;
+		if (types[State::selectedWeaponTypeIndex].isCustomType) preview += " *";
+
+		bool changed = false;
+		ImGuiMCP::SetNextItemWidth(width);
+		if (ImGuiMCP::BeginCombo(comboLabel, preview.c_str())) {
+			bool shownCustomSep = false;
+			bool shownPASep = false;
+
+			for (int i = 0; i < static_cast<int>(types.size()); ++i) {
+				// Separator before PA types
+				if (!shownPASep && !types[i].isCustomType &&
+					(types[i].type == WeaponType::PA_Unarmed)) {
+					ImGuiMCP::Separator();
+					ImGuiMCP::TextDisabled("-- Power Armor Variants --");
+					shownPASep = true;
+				}
+				// Separator before custom types
+				if (types[i].isCustomType && !shownCustomSep) {
+					ImGuiMCP::Separator();
+					ImGuiMCP::TextDisabled("-- Custom Types --");
+					shownCustomSep = true;
+				}
+
+				bool isSelected = (State::selectedWeaponTypeIndex == i);
+				std::string label = types[i].displayName;
+				if (types[i].isCustomType) label += " *";
+
+				if (ImGuiMCP::Selectable(label.c_str(), isSelected)) {
+					State::selectedWeaponTypeIndex = i;
+					changed = true;
+				}
+				if (isSelected) ImGuiMCP::SetItemDefaultFocus();
+			}
+			ImGuiMCP::EndCombo();
+		}
+		return changed;
+	}
+
 	void DrawWeaponTypeSettings()
 	{
 		auto* presets = InertiaPresets::GetSingleton();
@@ -992,40 +1159,11 @@ namespace Menu
 				State::selectedWeaponTypeIndex = 0;
 			}
 
-			std::string comboLabel = types[State::selectedWeaponTypeIndex].displayName;
-			if (types[State::selectedWeaponTypeIndex].isCustomType) comboLabel += " *";
+			// Record where the real selector row sits so the sticky toolbar
+			// (DrawStickyWeaponTypeBar) knows when it has scrolled off-screen.
+			State::weaponTypeBarNaturalY = ImGuiMCP::GetCursorPosY();
 
-			ImGuiMCP::SetNextItemWidth(220.0f);
-			if (ImGuiMCP::BeginCombo("Weapon Type", comboLabel.c_str())) {
-				bool shownCustomSep = false;
-				bool shownPASep = false;
-
-				for (int i = 0; i < static_cast<int>(types.size()); ++i) {
-					// Separator before PA types
-					if (!shownPASep && !types[i].isCustomType &&
-						(types[i].type == WeaponType::PA_Unarmed)) {
-						ImGuiMCP::Separator();
-						ImGuiMCP::TextDisabled("-- Power Armor Variants --");
-						shownPASep = true;
-					}
-					// Separator before custom types
-					if (types[i].isCustomType && !shownCustomSep) {
-						ImGuiMCP::Separator();
-						ImGuiMCP::TextDisabled("-- Custom Types --");
-						shownCustomSep = true;
-					}
-
-					bool isSelected = (State::selectedWeaponTypeIndex == i);
-					std::string label = types[i].displayName;
-					if (types[i].isCustomType) label += " *";
-
-					if (ImGuiMCP::Selectable(label.c_str(), isSelected)) {
-						State::selectedWeaponTypeIndex = i;
-					}
-					if (isSelected) ImGuiMCP::SetItemDefaultFocus();
-				}
-				ImGuiMCP::EndCombo();
-			}
+			DrawWeaponTypeCombo("Weapon Type", 220.0f);
 			if (ImGuiMCP::IsItemHovered()) {
 				ImGuiMCP::SetTooltip("Select weapon type to edit.\n* = Custom keyword-based type from mapping files");
 			}
@@ -1074,9 +1212,8 @@ namespace Menu
 					}
 					ImGuiMCP::SameLine();
 					if (ImGuiMCP::Button("Delete Specific Preset")) {
-						presets->RemoveSpecificWeaponSettings(equippedWeaponID);
-						State::saveStatusMsg = std::format("Deleted preset for {}", equippedWeaponID);
-						State::saveStatusTimer = 4.0f;
+						State::deletePresetEID = equippedWeaponID;
+						State::showDeletePresetPopup = true;
 					}
 					if (ImGuiMCP::IsItemHovered()) {
 						ImGuiMCP::SetTooltip("Delete the specific preset - weapon will use type settings instead");
@@ -1354,6 +1491,11 @@ namespace Menu
 				}
 				DrawWeaponInertiaEditor(weaponSettings, entry.displayName.c_str());
 			}
+
+			// End of the per-type settings: the sticky toolbar retires here
+			// (everything below is the Specific Weapon Presets section, which
+			// is not per-type).
+			State::weaponTypeBarEndY = ImGuiMCP::GetCursorPosY();
 		} else {
 			State::weaponSettingsExpanded = false;
 		}
@@ -1388,7 +1530,7 @@ namespace Menu
 		if (!settings.enabled) ImGuiMCP::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
 
 		// ---- Camera Inertia ----
-		if (ImGuiMCP::TreeNodeEx("Camera Inertia", ImGuiTreeNodeFlags_DefaultOpen)) {
+		if (ImGuiMCP::TreeNodeEx("Camera Inertia", ImGuiTreeNodeFlags_None)) {
 			ImGuiMCP::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Responds to looking around (camera rotation)");
 
 			if (SliderFloatWithTooltip("Stiffness##cam", &settings.stiffness, 10.0f, 1000.0f, "%.0f",
@@ -1426,7 +1568,7 @@ namespace Menu
 		}
 
 		// ---- ADS Inertia Multipliers ----
-		if (ImGuiMCP::TreeNodeEx("ADS Inertia Multipliers", ImGuiTreeNodeFlags_DefaultOpen)) {
+		if (ImGuiMCP::TreeNodeEx("ADS Inertia Multipliers", ImGuiTreeNodeFlags_None)) {
 			ImGuiMCP::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Scale inertia when aiming down sights");
 
 			if (CheckboxWithTooltip("Enable ADS Inertia##ads", &settings.adsInertiaEnabled,
@@ -1446,7 +1588,7 @@ namespace Menu
 		}
 
 		// ---- Movement Inertia ----
-		if (ImGuiMCP::TreeNodeEx("Movement Inertia", ImGuiTreeNodeFlags_DefaultOpen)) {
+		if (ImGuiMCP::TreeNodeEx("Movement Inertia", ImGuiTreeNodeFlags_None)) {
 			ImGuiMCP::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Responds to player movement (strafing, forward/back)");
 
 			if (CheckboxWithTooltip("Enable##mov", &settings.movementInertiaEnabled,
@@ -1554,7 +1696,7 @@ namespace Menu
 		}
 
 		// ---- Sprint Inertia ----
-		if (ImGuiMCP::TreeNodeEx("Sprint Transition Inertia", ImGuiTreeNodeFlags_DefaultOpen)) {
+		if (ImGuiMCP::TreeNodeEx("Sprint Transition Inertia", ImGuiTreeNodeFlags_None)) {
 			ImGuiMCP::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Momentum on sprint start/stop");
 
 			if (CheckboxWithTooltip("Enable##sprint", &settings.sprintInertiaEnabled,
@@ -1606,7 +1748,7 @@ namespace Menu
 		}
 
 		// ---- Jump/Land Inertia ----
-		if (ImGuiMCP::TreeNodeEx("Jump/Landing Inertia", ImGuiTreeNodeFlags_DefaultOpen)) {
+		if (ImGuiMCP::TreeNodeEx("Jump/Landing Inertia", ImGuiTreeNodeFlags_None)) {
 			ImGuiMCP::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Momentum on jump and landing, scaled by air time");
 
 			if (CheckboxWithTooltip("Enable##jump", &settings.jumpInertiaEnabled,
@@ -2029,7 +2171,7 @@ namespace Menu
 		}
 
 		// ---- Pivot Point ----
-		if (ImGuiMCP::TreeNodeEx("Pivot Point", ImGuiTreeNodeFlags_DefaultOpen)) {
+		if (ImGuiMCP::TreeNodeEx("Pivot Point", ImGuiTreeNodeFlags_None)) {
 			ImGuiMCP::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Where rotation appears to pivot from");
 
 			const char* pivotNames[] = { "Spine2 / Chest", "Right Hand", "Weapon Node" };
@@ -2292,14 +2434,11 @@ namespace Menu
 				ImGuiMCP::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.2f, 0.2f, 1.0f));
 				ImGuiMCP::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.3f, 0.3f, 1.0f));
 				if (ImGuiMCP::Button("Delete Preset")) {
-					presets->RemoveSpecificWeaponSettings(selEID);
-					presets->IncrementSettingsVersion();
-					State::selectedSpecificWeaponIndex = -1;
-					State::saveStatusMsg = std::format("Deleted preset for {}", selEID);
-					State::saveStatusTimer = 4.0f;
+					State::deletePresetEID = selEID;
+					State::showDeletePresetPopup = true;
 				}
 				ImGuiMCP::PopStyleColor(2);
-				if (ImGuiMCP::IsItemHovered()) ImGuiMCP::SetTooltip("Delete this specific weapon preset file");
+				if (ImGuiMCP::IsItemHovered()) ImGuiMCP::SetTooltip("Delete this specific weapon preset file (asks for confirmation)");
 
 				// ---- Copy To ----
 				ImGuiMCP::Spacing();
@@ -2511,6 +2650,142 @@ namespace Menu
 		ImGuiMCP::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "INI: Data\\F4SE\\Plugins\\FPGunplayOverhaul.ini");
 		ImGuiMCP::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Preset: Data\\F4SE\\Plugins\\FPGunplayOverhaul\\%s.json",
 			presets->GetActivePresetName().c_str());
+	}
+
+	// ============================================================
+	// Sticky weapon-type toolbar
+	// ------------------------------------------------------------
+	// The per-weapon-type settings block is long; once the real selector
+	// row scrolls off the top, re-draw the weapon type dropdown and a save
+	// button pinned to the top of the visible region so they follow the
+	// user. The bar retires when the view reaches the Specific Weapon
+	// Presets section (that content is not per-type, so a pinned type
+	// selector there would mislead).
+	//
+	// Drawn LAST in Render(): ImGui gives later-submitted items priority
+	// for mouse interaction, so the bar wins hover/clicks over whatever
+	// widgets happen to be scrolled underneath it.
+	// ============================================================
+	void DrawStickyWeaponTypeBar()
+	{
+		if (!State::weaponSettingsExpanded) {
+			return;
+		}
+		// Stale or degenerate bounds (e.g. first frame): nothing to pin.
+		if (State::weaponTypeBarEndY <= State::weaponTypeBarNaturalY) {
+			return;
+		}
+
+		const float scrollY = ImGuiMCP::GetScrollY();
+		const float barH = ImGuiMCP::GetFrameHeight() + 10.0f;
+
+		// Real selector row still visible, or already past the per-type block.
+		if (scrollY <= State::weaponTypeBarNaturalY) {
+			return;
+		}
+		if (scrollY + barH >= State::weaponTypeBarEndY) {
+			return;
+		}
+
+		ImVec2 savedCursor;
+		ImGuiMCP::GetCursorPos(&savedCursor);
+
+		// Window-local Y == scrollY is the first visible line, so this pins
+		// the bar to the top of the viewport.
+		ImGuiMCP::SetCursorPos(ImVec2(0.0f, scrollY));
+
+		// Opaque backdrop + bottom edge so scrolled content doesn't bleed
+		// through the pinned widgets.
+		ImVec2 barMin;
+		ImGuiMCP::GetCursorScreenPos(&barMin);
+		const ImVec2 barMax(barMin.x + ImGuiMCP::GetWindowWidth(), barMin.y + barH);
+		ImDrawList* drawList = ImGuiMCP::GetWindowDrawList();
+		ImDrawListManager::AddRectFilled(drawList, barMin, barMax,
+			ImGuiMCP::GetColorU32(ImGuiCol_WindowBg, 1.0f), 0.0f, 0);
+		ImDrawListManager::AddLine(drawList, ImVec2(barMin.x, barMax.y), barMax,
+			ImGuiMCP::GetColorU32(ImGuiCol_Separator, 1.0f), 1.0f);
+
+		ImGuiMCP::SetCursorPos(ImVec2(8.0f, scrollY + 5.0f));
+		ImGuiMCP::PushID("StickyWeaponTypeBar");
+
+		DrawWeaponTypeCombo("##StickyWeaponType", 220.0f);
+		if (ImGuiMCP::IsItemHovered()) {
+			ImGuiMCP::SetTooltip("Weapon type being edited.\n* = Custom keyword-based type from mapping files");
+		}
+
+		ImGuiMCP::SameLine();
+		auto* presets = InertiaPresets::GetSingleton();
+		if (ImGuiMCP::Button("Save Weapon Types")) {
+			presets->SaveWeaponTypePresets();
+			presets->ClearDirty();
+			State::hasUnsavedChanges = false;
+			State::saveStatusMsg = std::format("Preset '{}' saved.", presets->GetActivePresetName());
+			State::saveStatusTimer = 4.0f;
+		}
+		if (ImGuiMCP::IsItemHovered()) {
+			ImGuiMCP::SetTooltip("Save all weapon type settings to '%s.json'",
+				presets->GetActivePresetName().c_str());
+		}
+
+		DrawEquippedWeaponStatus(true);
+
+		ImGuiMCP::PopID();
+		ImGuiMCP::SetCursorPos(savedCursor);
+	}
+
+	// ============================================================
+	// Delete specific weapon preset - confirmation dialog
+	// ------------------------------------------------------------
+	// Opened from either delete button (the equipped-weapon row in
+	// Per-Weapon Type Settings, or the Specific Weapon Presets list).
+	// Drawn once per frame at Render() root so both buttons share one
+	// modal.
+	// ============================================================
+	void DrawDeletePresetConfirmModal()
+	{
+		if (State::showDeletePresetPopup) {
+			ImGuiMCP::OpenPopup("Delete Weapon Preset");
+		}
+
+		if (ImGuiMCP::BeginPopupModal("Delete Weapon Preset", &State::showDeletePresetPopup, ImGuiWindowFlags_AlwaysAutoResize)) {
+			auto* presets = InertiaPresets::GetSingleton();
+
+			ImGuiMCP::Text("Delete the preset for this weapon?");
+			ImGuiMCP::Spacing();
+			ImGuiMCP::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%s", State::deletePresetEID.c_str());
+			auto path = presets->GetSpecificWeaponPresetPath(State::deletePresetEID);
+			ImGuiMCP::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s", path.string().c_str());
+
+			ImGuiMCP::Spacing();
+			ImGuiMCP::TextWrapped(
+				"The preset file is removed from disk and the weapon falls back "
+				"to its weapon type settings. This cannot be undone.");
+			ImGuiMCP::Spacing();
+			ImGuiMCP::Separator();
+			ImGuiMCP::Spacing();
+
+			ImGuiMCP::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.2f, 0.2f, 1.0f));
+			ImGuiMCP::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.3f, 0.3f, 1.0f));
+			if (ImGuiMCP::Button("Delete", ImVec2(120, 0))) {
+				presets->RemoveSpecificWeaponSettings(State::deletePresetEID);
+				presets->IncrementSettingsVersion();
+				State::selectedSpecificWeaponIndex = -1;
+				State::saveStatusMsg = std::format("Deleted preset for {}", State::deletePresetEID);
+				State::saveStatusTimer = 4.0f;
+				State::deletePresetEID.clear();
+				State::showDeletePresetPopup = false;
+				ImGuiMCP::CloseCurrentPopup();
+			}
+			ImGuiMCP::PopStyleColor(2);
+
+			ImGuiMCP::SameLine();
+			if (ImGuiMCP::Button("Cancel", ImVec2(120, 0))) {
+				State::deletePresetEID.clear();
+				State::showDeletePresetPopup = false;
+				ImGuiMCP::CloseCurrentPopup();
+			}
+			ImGuiMCP::EndPopup();
+		}
 	}
 
 	// ============================================================
@@ -2951,6 +3226,7 @@ namespace Menu
 					ImGuiMCP::EndCombo();
 				}
 			}
+			DrawEquippedWeaponStatus(true);
 
 			if (!savedPresets.empty()) {
 				ImGuiMCP::Text("Or Specific Weapon:");
@@ -3412,6 +3688,7 @@ namespace Menu
 			ImGuiMCP::Spacing();
 			ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "Details:");
 			ImGuiMCP::BulletText("Release and re-press sprint within the tap window to activate");
+			ImGuiMCP::BulletText("Or bind a hotkey below — recommended if you use a hold-to-sprint mod");
 			ImGuiMCP::BulletText("Movement speed, AP drain, and animation speed are all configurable");
 			ImGuiMCP::BulletText("Adds AnimSuperSprintKeyword to the player for OAR animation replacements");
 			ImGuiMCP::Unindent(8.0f);
@@ -3442,6 +3719,66 @@ namespace Menu
 					"Default: 0.30s")) {
 					settings->superSprintDoubleTapWindow = std::clamp(settings->superSprintDoubleTapWindow, 0.1f, 1.0f);
 					State::hasUnsavedChanges = true;
+				}
+
+				// ---- Optional activation hotkey (unbound by default) ----
+				// Stored and dispatched by the F4SE Menu Framework hotkey API;
+				// SetBinding persists to PluginHotkeys.ini immediately, so
+				// no hasUnsavedChanges handling here.
+				{
+					const unsigned int binding =
+						F4SEMenuFramework::Hotkeys::GetBinding(kSuperSprintHotkeyId);
+					ImGuiMCP::Text("Hotkey: %s", GetHotkeyKeyName(binding).c_str());
+					ImGuiMCP::SameLine();
+
+					if (State::ssHotkeyCapturing) {
+						ImGuiMCP::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+							"Press a key... (Esc cancels)");
+						// Poll for the first pressed key. Start at VK_MBUTTON
+						// (0x04) so left/right mouse can't bind — the click on
+						// "Bind" itself would instantly bind Left Mouse.
+						for (int vk = 0x04; vk <= 0xFE; ++vk) {
+							if (!(::GetAsyncKeyState(vk) & 0x8000)) continue;
+							if (vk == VK_ESCAPE) {
+								State::ssHotkeyCapturing = false;
+								break;
+							}
+							const unsigned int code = VKToHotkeyCode(vk);
+							if (code == 0) continue;  // no DIK representation
+							// Shows an on-screen warning if the key is already
+							// bound by another registered hotkey.
+							F4SEMenuFramework::Hotkeys::SetBinding(kSuperSprintHotkeyId, code);
+							State::ssHotkeyCapturing = false;
+							break;
+						}
+					} else {
+						if (ImGuiMCP::Button("Bind##ssHotkey")) {
+							State::ssHotkeyCapturing = true;
+						}
+						if (ImGuiMCP::IsItemHovered()) {
+							ImGuiMCP::SetTooltip(
+								"Bind a key that triggers Super Sprint while sprinting\n"
+								"(press again to drop back to normal sprint).\n"
+								"\n"
+								"Primarily for players using hold-to-sprint mods: with the\n"
+								"sprint button physically held, the double-tap gesture\n"
+								"can't be performed, so use this instead.\n"
+								"\n"
+								"Unbound by default. Keyboard keys and extra mouse buttons\n"
+								"(middle / X1 / X2) can be bound here; a gamepad button can\n"
+								"be set under [Hotkeys] in F4SE Menu Framework's\n"
+								"PluginHotkeys.ini.");
+						}
+						if (binding != 0) {
+							ImGuiMCP::SameLine();
+							if (ImGuiMCP::Button("Clear##ssHotkey")) {
+								F4SEMenuFramework::Hotkeys::SetBinding(kSuperSprintHotkeyId, 0);
+							}
+							if (ImGuiMCP::IsItemHovered()) {
+								ImGuiMCP::SetTooltip("Unbind the Super Sprint hotkey.");
+							}
+						}
+					}
 				}
 
 				if (SliderFloatWithTooltip("Speed Multiplier##ssSpeed", &settings->superSprintSpeedMult,
@@ -4137,6 +4474,7 @@ namespace Menu
 				ImGuiMCP::EndCombo();
 			}
 		}
+		DrawEquippedWeaponStatus(true);
 
 		// Specific weapon override
 		auto savedPresets = presets->GetSavedSpecificWeaponPresets();

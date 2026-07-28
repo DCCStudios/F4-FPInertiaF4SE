@@ -3,8 +3,16 @@
 #include "Settings.h"
 #include "InertiaPresets.h"
 
+#include <atomic>
+
 namespace Inertia
 {
+	// Raised by the F4SE Menu Framework hotkey callback (see Menu::Register)
+	// when the Super Sprint activation key is pressed; consumed once per frame
+	// by InertiaManager::Update on the game thread. Atomic because the
+	// framework dispatches hotkeys from the game window's WndProc.
+	inline std::atomic<bool> g_superSprintHotkeyPressed{ false };
+
 	// Ring buffer entry for impulse trigger events
 	struct DebugEvent
 	{

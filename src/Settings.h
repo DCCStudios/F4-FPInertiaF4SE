@@ -405,6 +405,8 @@ public:
 	float superSprintAnimSpeedMult{ 1.25f };   // behavior graph Speed variable multiplier (animation playback rate)
 	bool  superSprintStaminaThresholdEnabled{ false }; // disengage super sprint when AP% drops below threshold
 	float superSprintStaminaThreshold{ 20.0f };        // AP percentage (0-100) below which super sprint is cancelled
+	// The optional activation hotkey (for hold-to-sprint setups) is stored by
+	// the F4SE Menu Framework hotkey API, not here — see Menu::Register.
 
 	// === REPEATABLE GUN BASH ===
 	// Gun bashes can combo: a Melee press during an active bash queues a

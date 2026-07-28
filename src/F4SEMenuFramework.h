@@ -5,15 +5,14 @@
 #include <locale>
 #include <string>
 
-// F4SE loads plugins in plugins.txt order. Resolve the framework module on
-// every use so this consumer still works when our DLL loads first.
+// F4SE may load plugins in any order; resolve the host module on each use (not once at DLL load).
 [[nodiscard]] inline HMODULE F4SEMenuFramework_GetHostModule() noexcept
 {
-	HMODULE module = ::GetModuleHandleW(L"F4SEMenuFramework.dll");
-	if (!module) {
-		module = ::GetModuleHandleW(L"F4SEMenuFramework");
+	HMODULE m = ::GetModuleHandleW(L"F4SEMenuFramework.dll");
+	if (!m) {
+		m = ::GetModuleHandleW(L"F4SEMenuFramework");
 	}
-	return module;
+	return m;
 }
 #define menuFramework (F4SEMenuFramework_GetHostModule())
 
@@ -29,8 +28,7 @@ namespace ImGuiMCP {
 namespace F4SEMenuFramework {
     using namespace ImGuiMCP;
     inline bool IsInstalled() {
-        // A file check is insufficient under mod managers because the process
-        // working directory can differ from the game directory.
+        // Do not use std::filesystem::exists("Data/..."): process CWD is often NOT the game root (MO2, etc.).
         return F4SEMenuFramework_GetHostModule() != nullptr;
     }
 
@@ -42,6 +40,32 @@ namespace F4SEMenuFramework {
             }
 
             inline std::string key;
+
+            // This plugin's own DLL file name without extension ("MyPlugin"
+            // from MyPlugin.dll). Because this header is compiled INTO the
+            // consumer plugin, the address of a local static lives inside the
+            // plugin's image, so resolving the module from that address yields
+            // the plugin DLL, not the framework. This is the canonical
+            // translation folder name (Data/F4SE/Plugins/<DllName>/Languages);
+            // unlike the SetSection() display name it is verifiable from disk.
+            inline const char* PluginModuleName() {
+                static const std::string name = [] {
+                    static int anchor = 0;
+                    HMODULE mod{};
+                    ::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                         reinterpret_cast<LPCSTR>(&anchor), &mod);
+                    char buf[MAX_PATH]{};
+                    ::GetModuleFileNameA(mod, buf, MAX_PATH);
+                    std::string s(buf);
+                    const size_t slash = s.find_last_of("\\/");
+                    if (slash != std::string::npos) s.erase(0, slash + 1);
+                    const size_t dot = s.find_last_of('.');
+                    if (dot != std::string::npos) s.erase(dot);
+                    return s;
+                }();
+                return name.c_str();
+            }
         }
 
         class WindowInterface {
@@ -154,6 +178,199 @@ namespace F4SEMenuFramework {
     }
 
     inline void SetSection(std::string key) { Model::Internal::key = key; }
+
+    // =========================================================================
+    //  Plugin Hotkey API
+    //
+    //  Register named hotkeys that the framework dispatches via its WndProc hook.
+    //  Bindings are persisted to the [Hotkeys] section of
+    //  Data/F4SE/Plugins/F4SEMenuFramework/PluginHotkeys.ini (user data
+    //  created at runtime, so framework updates never overwrite a player's
+    //  rebinds).
+    //  Plugins handle their own rebind UI if desired; the framework provides
+    //  query/set helpers for the current binding.
+    // =========================================================================
+
+    namespace Hotkeys {
+        typedef void(__stdcall* HotkeyCallback)();
+        using RegisterFunction = int64_t(*)(const char*, unsigned int, HotkeyCallback);
+        using UnregisterFunction = void(*)(int64_t);
+        using GetBindingFunction = unsigned int(*)(const char*);
+        using SetBindingFunction = void(*)(const char*, unsigned int);
+
+        // Register a hotkey with a unique string id (e.g. "MyMod.ToggleOverlay"),
+        // a default DIK scan code, and a callback to invoke on key press.
+        // Returns a handle for later unregister. If the user has already rebound
+        // this id in the INI, the persisted binding takes precedence.
+        inline int64_t Register(const char* id, unsigned int defaultScanCode, HotkeyCallback callback) {
+            static auto func = Model::Internal::GetFunction<RegisterFunction>("RegisterHotkey");
+            if (func) {
+                return func(id, defaultScanCode, callback);
+            }
+            return -1;
+        }
+
+        inline void Unregister(int64_t handle) {
+            static auto func = Model::Internal::GetFunction<UnregisterFunction>("UnregisterHotkey");
+            if (func) {
+                func(handle);
+            }
+        }
+
+        // Get the current scan code binding for a hotkey id.
+        inline unsigned int GetBinding(const char* id) {
+            static auto func = Model::Internal::GetFunction<GetBindingFunction>("GetHotkeyBinding");
+            if (func) {
+                return func(id);
+            }
+            return 0;
+        }
+
+        // Change the binding for a hotkey id. Automatically persists to INI.
+        // If the new scan code conflicts with another registered hotkey,
+        // a warning notification is shown on-screen.
+        inline void SetBinding(const char* id, unsigned int scanCode) {
+            static auto func = Model::Internal::GetFunction<SetBindingFunction>("SetHotkeyBinding");
+            if (func) {
+                func(id, scanCode);
+            }
+        }
+
+        // Check if a scan code is already bound by another hotkey (excluding excludeId).
+        // Call this before SetBinding to proactively warn users in your own rebind UI.
+        using HasConflictFunction = bool(*)(unsigned int, const char*);
+        inline bool HasConflict(unsigned int scanCode, const char* excludeId) {
+            static auto func = Model::Internal::GetFunction<HasConflictFunction>("HasHotkeyConflict");
+            if (func) {
+                return func(scanCode, excludeId);
+            }
+            return false;
+        }
+
+        // Register a gamepad hotkey. defaultConfigCode uses the same button codes as the
+        // framework's gamepad toggle setting (e.g. 4096=A, 8192=B, 256=LB, 9=LT, 10=RT).
+        // Persisted under [Hotkeys] in F4SEMenuFramework/PluginHotkeys.ini
+        // with gamepad names (A, LB, ...).
+        inline int64_t RegisterGamepad(const char* id, unsigned int defaultConfigCode, HotkeyCallback callback) {
+            static auto func = Model::Internal::GetFunction<RegisterFunction>("RegisterGamepadHotkey");
+            if (func) {
+                return func(id, defaultConfigCode, callback);
+            }
+            return -1;
+        }
+    }
+
+    // True when an XInput controller is currently connected.
+    inline bool IsControllerConnected() {
+        using Fn = bool(*)();
+        static auto func = Model::Internal::GetFunction<Fn>("IsControllerConnected");
+        return func ? func() : false;
+    }
+
+    inline void DisposeTexture(std::string texturePath) {
+        using Fn = void(*)(const char*);
+        static auto func = Model::Internal::GetFunction<Fn>("DisposeTexture");
+        if (func) {
+            func(texturePath.c_str());
+        }
+    }
+
+    // Menu open/close / per-frame events from the framework.
+    // Type values match the framework's Event::EventType (same ABI as RegisterEvent).
+    namespace Events {
+        enum Type {
+            kNone = 0,
+            kOpenMenu = 1,
+            kCloseMenu = 2,
+            kBeforeRender = 3,
+            kAfterRender = 4
+        };
+        typedef void(__stdcall* Callback)(Type type);
+
+        inline int64_t Register(Callback callback) {
+            using Fn = int64_t(*)(Callback);
+            static auto func = Model::Internal::GetFunction<Fn>("RegisterEvent");
+            return func ? func(callback) : -1;
+        }
+
+        inline int64_t RegisterPriority(Callback callback, float priority) {
+            using Fn = int64_t(*)(Callback, float);
+            static auto func = Model::Internal::GetFunction<Fn>("RegisterEventPriority");
+            return func ? func(callback, priority) : -1;
+        }
+
+        inline void Unregister(int64_t id) {
+            using Fn = void(*)(int64_t);
+            static auto func = Model::Internal::GetFunction<Fn>("UnregisterEvent");
+            if (func) {
+                func(id);
+            }
+        }
+    }
+
+    // =========================================================================
+    //  Plugin Localization API (framework 3.9+)
+    //
+    //  Ship flat key/value JSON files at
+    //      Data/F4SE/Plugins/<PluginName>/Languages/<lang>.json
+    //  (en.json, es.json, de.json, ...) and call Translate() when drawing.
+    //  The framework picks the player's game language (sLanguage from
+    //  Fallout4Custom.ini / Fallout4.ini), merges it over the en.json base,
+    //  and falls back to the key itself when no value exists.
+    //
+    //  That last fallback means en.json is OPTIONAL: you may simply use your
+    //  English text as the key (Translate("Enable feature")) and ship no
+    //  files at all; translators can later add es.json etc. mapping those
+    //  English strings.
+    //
+    //  Returned pointers are stable for the session (until Reload), so they
+    //  are safe to hand straight to ImGui every frame.
+    //
+    //  The single-argument overloads use this plugin's DLL file name (without
+    //  .dll) as the folder name; the framework's automatic backend translation
+    //  resolves the same name from the module, so both mechanisms share one
+    //  folder. Use the explicit pluginName overloads only to deviate.
+    //
+    //  On an older framework DLL without this API, Translate() returns the
+    //  key itself, so plugins degrade to English instead of crashing.
+    // =========================================================================
+
+    inline const char* Translate(const char* pluginName, const char* key) {
+        using Fn = const char* (*)(const char*, const char*);
+        static auto func = Model::Internal::GetFunction<Fn>("GetPluginTranslation");
+        return func ? func(pluginName, key) : key;
+    }
+
+    inline const char* Translate(const char* key) {
+        return Translate(Model::Internal::PluginModuleName(), key);
+    }
+
+    // Optional eager load (Translate lazy-loads on first use). Returns the
+    // merged key count, or -1 when the plugin ships no Languages files
+    // (which is fine for the English-text-as-key convention).
+    inline int LoadTranslations(const char* pluginName = nullptr) {
+        using Fn = int (*)(const char*);
+        static auto func = Model::Internal::GetFunction<Fn>("LoadPluginTranslations");
+        if (!func) return -1;
+        return func(pluginName && *pluginName ? pluginName : Model::Internal::PluginModuleName());
+    }
+
+    // Drops the cached table so the next Translate() re-reads from disk.
+    // Invalidates previously returned pointers for that plugin.
+    inline void ReloadTranslations(const char* pluginName = nullptr) {
+        using Fn = void (*)(const char*);
+        static auto func = Model::Internal::GetFunction<Fn>("ReloadPluginTranslations");
+        if (func) {
+            func(pluginName && *pluginName ? pluginName : Model::Internal::PluginModuleName());
+        }
+    }
+
+    // The resolved game language code ("en", "es", "de", ...).
+    inline const char* GetGameLanguage() {
+        using Fn = const char* (*)();
+        static auto func = Model::Internal::GetFunction<Fn>("GetGameLanguage");
+        return func ? func() : "en";
+    }
 }
 namespace FontAwesome {
     inline void PushSolid() {
