@@ -15,19 +15,36 @@ bool Inertia::InertiaManager::hasLoggedSkeleton = false;
 bool Inertia::InertiaManager::hasLoggedGraphVars = false;
 
 // ============================================================
-// Fallout 4 keyword editor IDs for weapon type detection
-// These are the standard F4 weapon keywords from vanilla
+// Fallout 4 keyword editor IDs for weapon type detection.
+//
+// VERIFIED against Fallout4.esm (2026-07-27, byte-scan of KYWD EDID
+// strings via tools/kw_scan.py): the vanilla naming is "WeaponType*",
+// NOT Skyrim's "WeapType*".  The previous Skyrim-style spellings
+// ("WeapTypePistol"/"WeapTypeRifle"/"WeapTypeMG") resolved to no form,
+// so EVERY gun silently fell through to the Rifle default — pistols
+// were never detected as pistols.  "WeaponTypeMelee",
+// "WeaponTypeLauncher", "WeaponTypeMissile" and "WeaponTypeNonAutomatic"
+// do not exist in the master either; the real forms are
+// WeaponTypeMelee1H/2H, WeaponTypeMissileLauncher, and heavy weapons
+// carry WeaponTypeHeavyGun (plus per-weapon ids like WeaponTypeMinigun).
 // ============================================================
-static constexpr const char* kKW_WeapTypePistol    = "WeapTypePistol";
-static constexpr const char* kKW_WeapTypeRifle     = "WeapTypeRifle";
-static constexpr const char* kKW_WeapTypeMG        = "WeapTypeMG";
-static constexpr const char* kKW_WeapTypeNonAutomatic = "WeaponTypeNonAutomatic";
-static constexpr const char* kKW_WeapTypeLauncher  = "WeaponTypeLauncher";
-static constexpr const char* kKW_WeapTypeMissile   = "WeaponTypeMissile";
+static constexpr const char* kKW_WeapTypePistol    = "WeaponTypePistol";
+static constexpr const char* kKW_WeapTypeRifle     = "WeaponTypeRifle";
+static constexpr const char* kKW_WeapTypeHeavyGun  = "WeaponTypeHeavyGun";
+static constexpr const char* kKW_WeapTypeMinigun   = "WeaponTypeMinigun";
+static constexpr const char* kKW_WeapTypeLauncher  = "WeaponTypeMissileLauncher";
+static constexpr const char* kKW_WeapTypeFatman    = "WeaponTypeFatman";
 static constexpr const char* kKW_WeapTypeFlamer    = "WeaponTypeFlamer";
-static constexpr const char* kKW_WeapTypeGun       = "WeaponTypeGun";
-static constexpr const char* kKW_IsMelee           = "WeaponTypeMelee";
+static constexpr const char* kKW_IsMelee1H         = "WeaponTypeMelee1H";
+static constexpr const char* kKW_IsMelee2H         = "WeaponTypeMelee2H";
 static constexpr const char* kKW_IsUnarmed         = "WeaponTypeUnarmed";
+// Energy weapon families (all verified present in Fallout4.esm)
+static constexpr const char* kKW_WeapTypeLaser        = "WeaponTypeLaser";
+static constexpr const char* kKW_WeapTypePlasma       = "WeaponTypePlasma";
+static constexpr const char* kKW_WeapTypeGammaGun     = "WeaponTypeGammaGun";
+static constexpr const char* kKW_WeapTypeGatlingLaser = "WeaponTypeGatlingLaser";
+static constexpr const char* kKW_WeapTypeAlienBlaster = "WeaponTypeAlienBlaster";
+static constexpr const char* kKW_WeapTypeLaserMusket  = "WeaponTypeLaserMusket";
 
 // Global time multiplier set by the `sgtm` console command. CommonLib
 // supplies the correct global relocation for each runtime.
@@ -2415,19 +2432,38 @@ WeaponType Inertia::InertiaManager::DetectWeaponType(
 		return WeaponHasKeyword(base, idata, editorID);
 	};
 
+	// One-time runtime proof that the vanilla keyword forms resolve.  A
+	// "MISSING" line means the editor-ID map has no such keyword and that
+	// category silently falls back (this is exactly how the Skyrim-style
+	// "WeapTypePistol" spelling failed for months).
+	static bool s_loggedKwResolution = false;
+	if (!s_loggedKwResolution) {
+		s_loggedKwResolution = true;
+		for (const char* id : { kKW_WeapTypePistol, kKW_WeapTypeRifle,
+		         kKW_WeapTypeHeavyGun, kKW_IsMelee1H, kKW_IsMelee2H, kKW_IsUnarmed }) {
+			auto* kw = RE::TESForm::GetFormByEditorID<RE::BGSKeyword>(id);
+			logger::info("[WeaponType] Keyword '{}' -> {}", id,
+				kw ? "resolved" : "MISSING");
+		}
+	}
+
 	// Melee / unarmed first (these rarely have gun keywords)
 	if (hasKW(kKW_IsUnarmed))          { baseType = WeaponType::Unarmed;  goto pa_map; }
-	if (hasKW(kKW_IsMelee))            { baseType = WeaponType::Melee;    goto pa_map; }
+	if (hasKW(kKW_IsMelee1H)
+	    || hasKW(kKW_IsMelee2H))       { baseType = WeaponType::Melee;    goto pa_map; }
 
-	// Gun subtypes (order matters: more specific first)
-	if (hasKW(kKW_WeapTypePistol))     { baseType = WeaponType::Pistol;   goto pa_map; }
-	if (hasKW(kKW_WeapTypeMG))         { baseType = WeaponType::Heavy;    goto pa_map; }
-	if (hasKW(kKW_WeapTypeFlamer))     { baseType = WeaponType::Heavy;    goto pa_map; }
-	if (hasKW(kKW_WeapTypeLauncher))   { baseType = WeaponType::Heavy;    goto pa_map; }
-	if (hasKW(kKW_WeapTypeMissile))    { baseType = WeaponType::Heavy;    goto pa_map; }
-	if (hasKW(kKW_WeapTypeRifle))      { baseType = WeaponType::Rifle;    goto pa_map; }
-
-	// For weapons without clear keyword, check ammo type to detect energy weapons
+	// ENERGY takes priority over grip-based pistol/rifle and over heavy:
+	// a laser gun with a pistol grip still carries WeaponTypePistol on its
+	// instance, and a Gatling laser carries WeaponTypeHeavyGun, but both
+	// should use the Energy profile.  Family keywords first (verified in
+	// Fallout4.esm), then the ammo fallback for modded energy weapons that
+	// lack the vanilla family keywords.
+	if (hasKW(kKW_WeapTypeLaser)
+	    || hasKW(kKW_WeapTypePlasma)
+	    || hasKW(kKW_WeapTypeGammaGun)
+	    || hasKW(kKW_WeapTypeGatlingLaser)
+	    || hasKW(kKW_WeapTypeAlienBlaster)
+	    || hasKW(kKW_WeapTypeLaserMusket)) { baseType = WeaponType::Energy; goto pa_map; }
 	if (weapObj && weapObj->weaponData.ammo) {
 		const char* ammoEID = weapObj->weaponData.ammo->GetFormEditorID();
 		if (ammoEID) {
@@ -2441,6 +2477,17 @@ WeaponType Inertia::InertiaManager::DetectWeaponType(
 			}
 		}
 	}
+
+	// Gun subtypes (order matters: more specific first).  Pistol / rifle
+	// grip keywords live on the INSTANCE for modded weapons (grip/stock
+	// object mods attach them), which WeaponHasKeyword already covers.
+	if (hasKW(kKW_WeapTypePistol))     { baseType = WeaponType::Pistol;   goto pa_map; }
+	if (hasKW(kKW_WeapTypeHeavyGun))   { baseType = WeaponType::Heavy;    goto pa_map; }
+	if (hasKW(kKW_WeapTypeMinigun))    { baseType = WeaponType::Heavy;    goto pa_map; }
+	if (hasKW(kKW_WeapTypeFlamer))     { baseType = WeaponType::Heavy;    goto pa_map; }
+	if (hasKW(kKW_WeapTypeLauncher))   { baseType = WeaponType::Heavy;    goto pa_map; }
+	if (hasKW(kKW_WeapTypeFatman))     { baseType = WeaponType::Heavy;    goto pa_map; }
+	if (hasKW(kKW_WeapTypeRifle))      { baseType = WeaponType::Rifle;    goto pa_map; }
 
 	// Check primitive type for melee/unarmed without keywords
 	// weaponData.type is std::int8_t: 0=HandToHand, 1-6=Melee varieties, 14=Thrown

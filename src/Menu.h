@@ -71,6 +71,9 @@ namespace Menu
 		// Copy weapon-type-to-weapon-type dialog state
 		inline bool showCopyToTypePopup{ false };
 		inline int copyTargetTypeIndex{ 0 };
+		// ADS Transitions page: copy ADS settings between weapon types
+		inline bool showCopyAdsToTypePopup{ false };
+		inline int copyAdsTargetTypeIndex{ 0 };
 
 		// Copy from specific weapon preset
 		inline int copyToTypeIndex{ 3 };                    // target weapon type index

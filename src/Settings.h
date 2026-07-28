@@ -49,10 +49,10 @@ struct WalkDirectionOffset
 enum class WeaponType : int
 {
 	Unarmed = 0,
-	Melee = 1,       // WeapTypeSword, WeapTypeBlunt, etc. (non-unarmed melee)
-	Pistol = 2,      // WeapTypePistol / grip keyword
-	Rifle = 3,       // WeapTypeRifle / grip keyword (+ shotguns)
-	Heavy = 4,       // WeapTypeHeavyGun
+	Melee = 1,       // WeaponTypeMelee1H / WeaponTypeMelee2H (non-unarmed melee)
+	Pistol = 2,      // WeaponTypePistol (base or grip-mod instance keyword)
+	Rifle = 3,       // WeaponTypeRifle (base or stock-mod instance keyword; + shotguns)
+	Heavy = 4,       // WeaponTypeHeavyGun (+ Minigun/Flamer/MissileLauncher/Fatman)
 	Energy = 5,      // Energy-based weapons (laser, plasma, etc.)
 	Throwable = 6,   // Grenades / mines
 	// Power Armor variants - same weapon type logic but separate profiles

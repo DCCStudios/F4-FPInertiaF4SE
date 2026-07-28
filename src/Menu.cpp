@@ -4103,6 +4103,67 @@ namespace Menu
 			}
 		}
 
+		// ---- Select the equipped weapon's preset/category ----
+		// Prefers a weapon-specific preset for the equipped weapon if one
+		// exists; otherwise falls back to the weapon category assigned to
+		// (or detected for) it. Mirrors the Extras page button but targets
+		// the ADS Transitions selectors.
+		if (ImGuiMCP::Button("Select Equipped Type##adsTrans")) {
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (player) {
+				const std::string eqID = GetEquippedWeaponEditorID(player);
+
+				// 1) Prefer a weapon-specific preset if one is saved for this weapon.
+				int specIdx = -1;
+				if (!eqID.empty()) {
+					for (int i = 0; i < static_cast<int>(savedPresets.size()); ++i) {
+						if (savedPresets[i] == eqID) { specIdx = i; break; }
+					}
+				}
+
+				if (specIdx >= 0) {
+					State::adsTransSpecificWeaponIndex = specIdx;
+				} else {
+					// 2) Fall back to the weapon category assigned/detected for it.
+					State::adsTransSpecificWeaponIndex = -1;
+					auto* base = GetEquippedWeaponBase(player);
+					auto* weap = base ? base->As<RE::TESObjectWEAP>() : nullptr;
+					bool matchedCustom = false;
+					if (weap) {
+						// Custom keyword-mapped type takes priority (matches main tab).
+						std::string customType = presets->GetBestKeywordMatch(weap);
+						if (!customType.empty()) {
+							for (int i = 0; i < static_cast<int>(types.size()); ++i) {
+								if (types[i].isCustomType && types[i].internalName == customType) {
+									State::adsTransWeaponTypeIndex = i;
+									matchedCustom = true;
+									break;
+								}
+							}
+						}
+						if (!matchedCustom) {
+							// Full runtime detection (keywords, overrides,
+							// power-armor variant mapping) — see main tab.
+							const WeaponType detected =
+								Inertia::InertiaManager::GetSingleton()->DetectEquippedWeaponType(player);
+							for (int i = 0; i < static_cast<int>(types.size()); ++i) {
+								if (!types[i].isCustomType && types[i].type == detected) {
+									State::adsTransWeaponTypeIndex = i;
+									break;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		if (ImGuiMCP::IsItemHovered()) {
+			ImGuiMCP::SetTooltip(
+				"Switch these ADS settings to the equipped weapon.\n"
+				"Selects its specific preset if one exists, otherwise its\n"
+				"weapon category.");
+		}
+
 		// Resolve which settings to edit
 		WeaponInertiaSettings* editSettings = nullptr;
 		std::string editLabel;
@@ -4149,6 +4210,131 @@ namespace Menu
 				}
 			}
 		}
+		ImGuiMCP::Spacing();
+
+		// ---- Copy ADS transition settings to another weapon type ----
+		// Copies ONLY the ADS-related fields (dampening + enter/exit
+		// transitions) from whatever is being edited (type or specific
+		// preset) onto a target weapon type. Other inertia settings on the
+		// target are left untouched.
+		if (ImGuiMCP::Button("Copy ADS to Type...")) {
+			// Default target: first type that isn't the current source type.
+			State::copyAdsTargetTypeIndex = (State::adsTransWeaponTypeIndex == 0) ? 1 : 0;
+			State::showCopyAdsToTypePopup = true;
+		}
+		if (ImGuiMCP::IsItemHovered()) {
+			ImGuiMCP::SetTooltip("Copy these ADS transition settings to another weapon type");
+		}
+
+		if (State::showCopyAdsToTypePopup) {
+			ImGuiMCP::OpenPopup("Copy ADS Settings to Weapon Type");
+		}
+
+		// Set when a copy is confirmed this frame: fetching the target
+		// settings reference may realloc the settings storage and leave
+		// `ws` dangling, so the rest of the page must not draw this frame.
+		bool adsCopyPerformed = false;
+
+		if (ImGuiMCP::BeginPopupModal("Copy ADS Settings to Weapon Type", &State::showCopyAdsToTypePopup, ImGuiWindowFlags_AlwaysAutoResize)) {
+			ImGuiMCP::Text("Copy ADS Transition Settings");
+			ImGuiMCP::Separator();
+
+			ImGuiMCP::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Source:");
+			ImGuiMCP::BulletText("%s", editLabel.c_str());
+
+			ImGuiMCP::Spacing();
+			ImGuiMCP::Separator();
+			ImGuiMCP::Spacing();
+
+			ImGuiMCP::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "Target Weapon Type:");
+
+			if (State::copyAdsTargetTypeIndex >= static_cast<int>(types.size()))
+				State::copyAdsTargetTypeIndex = 0;
+
+			// The source is a type only when no specific preset is selected;
+			// a specific-preset source can copy onto any type.
+			const bool sourceIsType = (State::adsTransSpecificWeaponIndex < 0);
+
+			std::string targetPreview = types[State::copyAdsTargetTypeIndex].displayName;
+			if (types[State::copyAdsTargetTypeIndex].isCustomType) targetPreview += " *";
+
+			if (ImGuiMCP::BeginCombo("##CopyAdsTargetType", targetPreview.c_str())) {
+				for (int i = 0; i < static_cast<int>(types.size()); ++i) {
+					const bool isSource = sourceIsType && (i == State::adsTransWeaponTypeIndex);
+					if (isSource) ImGuiMCP::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
+
+					std::string lbl = types[i].displayName;
+					if (types[i].isCustomType) lbl += " *";
+					if (isSource) lbl += " (source)";
+					bool sel = (State::copyAdsTargetTypeIndex == i);
+					if (ImGuiMCP::Selectable(lbl.c_str(), sel)) State::copyAdsTargetTypeIndex = i;
+
+					if (isSource) ImGuiMCP::PopStyleColor();
+					if (sel) ImGuiMCP::SetItemDefaultFocus();
+				}
+				ImGuiMCP::EndCombo();
+			}
+
+			ImGuiMCP::Spacing();
+
+			const bool canConfirmAds =
+				State::copyAdsTargetTypeIndex >= 0 &&
+				State::copyAdsTargetTypeIndex < static_cast<int>(types.size()) &&
+				!(sourceIsType && State::copyAdsTargetTypeIndex == State::adsTransWeaponTypeIndex);
+
+			if (canConfirmAds) {
+				ImGuiMCP::TextColored(ImVec4(1.0f, 1.0f, 0.4f, 1.0f), "Warning:");
+				ImGuiMCP::TextWrapped("This will OVERWRITE the ADS transition settings on '%s' with the '%s' settings. Other inertia settings are not affected.",
+					types[State::copyAdsTargetTypeIndex].displayName.c_str(),
+					editLabel.c_str());
+			} else {
+				ImGuiMCP::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Cannot copy a type onto itself!");
+			}
+
+			ImGuiMCP::Spacing();
+			ImGuiMCP::Separator();
+			ImGuiMCP::Spacing();
+
+			if (!canConfirmAds) ImGuiMCP::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+			if (ImGuiMCP::Button("Confirm Copy", ImVec2(120, 0)) && canConfirmAds) {
+				const auto& targetEntry = types[State::copyAdsTargetTypeIndex];
+				// Copy the source's ADS fields BY VALUE first: fetching the
+				// target reference may realloc the settings storage and
+				// invalidate editSettings (same hazard as the inertia copy).
+				const bool  srcDampenEnabled = ws.adsTransitionDampenEnabled;
+				const float srcDampenFactor  = ws.adsTransitionDampenFactor;
+				const auto  srcEnter         = ws.adsEnterTransition;
+				const auto  srcExit          = ws.adsExitTransition;
+				auto& targetSettings = GetWeaponSettingsForEditingByEntry(targetEntry);
+				targetSettings.adsTransitionDampenEnabled = srcDampenEnabled;
+				targetSettings.adsTransitionDampenFactor  = srcDampenFactor;
+				targetSettings.adsEnterTransition         = srcEnter;
+				targetSettings.adsExitTransition          = srcExit;
+				presets->SaveWeaponTypePresets();
+				presets->IncrementSettingsVersion();
+				presets->MarkDirty();
+				logger::info("[FPGunplayOverhaul] Copied ADS transition settings '{}' -> '{}'",
+					editLabel, targetEntry.displayName);
+				State::saveStatusMsg = std::format("Copied ADS settings from {} to {}",
+					editLabel, targetEntry.displayName);
+				State::saveStatusTimer = 4.0f;
+				State::showCopyAdsToTypePopup = false;
+				adsCopyPerformed = true;
+				ImGuiMCP::CloseCurrentPopup();
+			}
+			if (!canConfirmAds) ImGuiMCP::PopStyleVar();
+
+			ImGuiMCP::SameLine();
+			if (ImGuiMCP::Button("Cancel", ImVec2(120, 0))) {
+				State::showCopyAdsToTypePopup = false;
+				ImGuiMCP::CloseCurrentPopup();
+			}
+			ImGuiMCP::EndPopup();
+		}
+
+		// `ws` may dangle after a copy (storage realloc); resume next frame.
+		if (adsCopyPerformed) return;
+
 		ImGuiMCP::Spacing();
 
 		bool changed = false;
