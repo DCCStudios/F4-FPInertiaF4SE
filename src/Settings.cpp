@@ -806,6 +806,29 @@ void Settings::Load()
 	superSprintAnimSpeedMult   = std::clamp(superSprintAnimSpeedMult, 1.0f, 3.0f);
 	superSprintStaminaThreshold = std::clamp(superSprintStaminaThreshold, 0.0f, 100.0f);
 
+	// Crouch Slide
+	crouchSlideEnabled          = ini.GetBoolValue("Extras", "bCrouchSlideEnabled", true);
+	crouchSlideUseCrouchKey     = ini.GetBoolValue("Extras", "bCrouchSlideUseCrouchKey", true);
+	crouchSlideDuration         = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideDuration", 1.6));
+	crouchSlideDistance         = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideDistance", 450.0));
+	crouchSlideMaxSteerDegrees  = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideMaxSteerDegrees", 15.0));
+	crouchSlideAPCost           = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideAPCost", 20.0));
+	crouchSlideRampUpTime       = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideRampUpTime", 1.0));
+	crouchSlideOmnidirectional  = ini.GetBoolValue("Extras", "bCrouchSlideOmnidirectional", false);
+	crouchSlideLandingEnabled   = ini.GetBoolValue("Extras", "bCrouchSlideLandingEnabled", false);
+	crouchSlideLandingMomentum  = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideLandingMomentum", 350.0));
+	crouchSlideIFramesEnabled   = ini.GetBoolValue("Extras", "bCrouchSlideIFramesEnabled", false);
+	crouchSlideIFramesDuration  = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideIFramesDuration", 0.5));
+	crouchSlideVolume           = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideVolume", 1.0));
+	crouchSlideDuration         = std::clamp(crouchSlideDuration, 0.3f, 5.0f);
+	crouchSlideDistance         = std::clamp(crouchSlideDistance, 100.0f, 2000.0f);
+	crouchSlideMaxSteerDegrees  = std::clamp(crouchSlideMaxSteerDegrees, 0.0f, 90.0f);
+	crouchSlideAPCost           = std::clamp(crouchSlideAPCost, 0.0f, 200.0f);
+	crouchSlideRampUpTime       = std::clamp(crouchSlideRampUpTime, 0.0f, 3.0f);
+	crouchSlideLandingMomentum  = std::clamp(crouchSlideLandingMomentum, 50.0f, 1000.0f);
+	crouchSlideIFramesDuration  = std::clamp(crouchSlideIFramesDuration, 0.0f, 5.0f);
+	crouchSlideVolume           = std::clamp(crouchSlideVolume, 0.0f, 1.0f);
+
 	// Repeatable Gun Bash
 	bashComboEnabled = ini.GetBoolValue("Extras", "bBashComboEnabled", true);
 	bashComboDelay   = static_cast<float>(ini.GetDoubleValue("Extras", "fBashComboDelay", 0.2));
@@ -966,6 +989,21 @@ void Settings::Save()
 	ini.SetDoubleValue("Extras", "fSuperSprintAnimSpeedMult", superSprintAnimSpeedMult);
 	setBool("Extras", "bSuperSprintStaminaThresholdEnabled", superSprintStaminaThresholdEnabled);
 	ini.SetDoubleValue("Extras", "fSuperSprintStaminaThreshold", superSprintStaminaThreshold);
+
+	// Crouch Slide
+	setBool("Extras", "bCrouchSlideEnabled", crouchSlideEnabled);
+	setBool("Extras", "bCrouchSlideUseCrouchKey", crouchSlideUseCrouchKey);
+	ini.SetDoubleValue("Extras", "fCrouchSlideDuration", crouchSlideDuration);
+	ini.SetDoubleValue("Extras", "fCrouchSlideDistance", crouchSlideDistance);
+	ini.SetDoubleValue("Extras", "fCrouchSlideMaxSteerDegrees", crouchSlideMaxSteerDegrees);
+	ini.SetDoubleValue("Extras", "fCrouchSlideAPCost", crouchSlideAPCost);
+	ini.SetDoubleValue("Extras", "fCrouchSlideRampUpTime", crouchSlideRampUpTime);
+	setBool("Extras", "bCrouchSlideOmnidirectional", crouchSlideOmnidirectional);
+	setBool("Extras", "bCrouchSlideLandingEnabled", crouchSlideLandingEnabled);
+	ini.SetDoubleValue("Extras", "fCrouchSlideLandingMomentum", crouchSlideLandingMomentum);
+	setBool("Extras", "bCrouchSlideIFramesEnabled", crouchSlideIFramesEnabled);
+	ini.SetDoubleValue("Extras", "fCrouchSlideIFramesDuration", crouchSlideIFramesDuration);
+	ini.SetDoubleValue("Extras", "fCrouchSlideVolume", crouchSlideVolume);
 
 	setBool("Extras", "bBashComboEnabled", bashComboEnabled);
 	ini.SetDoubleValue("Extras", "fBashComboDelay", bashComboDelay);

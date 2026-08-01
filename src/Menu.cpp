@@ -4,6 +4,7 @@
 #include "WeaponFOV.h"
 #include "FireOnEmpty.h"
 #include "ContextualLean.h"
+#include "CrouchSlide.h"
 #include "OpenAnimationReplacerAPI-Clips.h"
 #include <format>
 
@@ -72,6 +73,17 @@ static constexpr const char* kSuperSprintHotkeyPadId = "FPGunplayOverhaul.SuperS
 static void __stdcall OnSuperSprintHotkey()
 {
 	Inertia::g_superSprintHotkeyPressed.store(true);
+}
+
+// Crouch Slide activation hotkey (same framework hotkey API / dispatch
+// model as Super Sprint). Only raises an atomic flag consumed on the game
+// thread by CrouchSlide::Manager::Update.
+static constexpr const char* kCrouchSlideHotkeyId    = "FPGunplayOverhaul.CrouchSlide";
+static constexpr const char* kCrouchSlideHotkeyPadId = "FPGunplayOverhaul.CrouchSlide.Pad";
+
+static void __stdcall OnCrouchSlideHotkey()
+{
+	CrouchSlide::g_hotkeyPressed.store(true);
 }
 
 // Human-readable name for a framework hotkey binding. GetKeyNameText wants
@@ -216,6 +228,11 @@ namespace Menu
 		// so controller users can bind a button via PluginHotkeys.ini.
 		F4SEMenuFramework::Hotkeys::Register(kSuperSprintHotkeyId, 0, OnSuperSprintHotkey);
 		F4SEMenuFramework::Hotkeys::RegisterGamepad(kSuperSprintHotkeyPadId, 0, OnSuperSprintHotkey);
+
+		// Crouch Slide activation hotkey, unbound by default (the Extras page
+		// offers a Bind/Clear UI). A gamepad slot is registered alongside it.
+		F4SEMenuFramework::Hotkeys::Register(kCrouchSlideHotkeyId, 0, OnCrouchSlideHotkey);
+		F4SEMenuFramework::Hotkeys::RegisterGamepad(kCrouchSlideHotkeyPadId, 0, OnCrouchSlideHotkey);
 
 		registered = true;
 
@@ -3914,6 +3931,231 @@ namespace Menu
 				ImGuiMCP::Indent(8.0f);
 				ImGuiMCP::BulletText("Keyword 'AnimSuperSprintKeyword' is added to the player while active");
 				ImGuiMCP::BulletText("Use OAR's HasKeyword condition to trigger custom sprint animations");
+				ImGuiMCP::Unindent(8.0f);
+			}
+		}
+
+		// ====== CROUCH SLIDE ======
+		ImGuiMCP::Spacing();
+		if (ImGuiMCP::CollapsingHeader("Crouch Slide")) {
+			auto* settings = Settings::GetSingleton();
+			auto* csMgr = CrouchSlide::Manager::GetSingleton();
+
+			ImGuiMCP::Indent(8.0f);
+			ImGuiMCP::Spacing();
+			ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "What it does:");
+			ImGuiMCP::TextWrapped(
+				"Press crouch (or a bound hotkey) while sprinting to commit to a fast, "
+				"eased ground slide. You end crouched and can shoot the whole time.");
+			ImGuiMCP::Spacing();
+			ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "Details:");
+			ImGuiMCP::BulletText("Distance and duration are configurable; movement eases in and out");
+			ImGuiMCP::BulletText("You keep slight camera-based steering, clamped so you can't slide in a circle");
+			ImGuiMCP::BulletText("Adds AnimsCrouchSlideKeyword to the player for OAR animation replacements");
+			ImGuiMCP::BulletText("Costs Action Points; optional i-frames and a landing-slide trigger");
+			ImGuiMCP::Unindent(8.0f);
+			ImGuiMCP::Spacing();
+
+			// Current status indicator
+			if (csMgr->IsSliding()) {
+				ImGuiMCP::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "Status: SLIDING");
+			} else {
+				ImGuiMCP::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Status: Idle");
+			}
+			ImGuiMCP::Spacing();
+
+			if (CheckboxWithTooltip("Enable Crouch Slide##crouchSlide", &settings->crouchSlideEnabled,
+				"Master toggle for the Crouch Slide feature.")) {
+				State::hasUnsavedChanges = true;
+			}
+
+			if (settings->crouchSlideEnabled) {
+				ImGuiMCP::Spacing();
+
+				if (CheckboxWithTooltip("Trigger with Crouch Key##csCrouchKey", &settings->crouchSlideUseCrouchKey,
+					"When on, pressing the crouch/sneak key while sprinting starts a slide.\n"
+					"Turn this off to only use the bound hotkey below.")) {
+					State::hasUnsavedChanges = true;
+				}
+
+				// ---- Optional activation hotkey (unbound by default) ----
+				{
+					const unsigned int binding =
+						F4SEMenuFramework::Hotkeys::GetBinding(kCrouchSlideHotkeyId);
+					ImGuiMCP::Text("Hotkey: %s", GetHotkeyKeyName(binding).c_str());
+					ImGuiMCP::SameLine();
+
+					if (State::csHotkeyCapturing) {
+						ImGuiMCP::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+							"Press a key... (Esc cancels)");
+						for (int vk = 0x04; vk <= 0xFE; ++vk) {
+							if (!(::GetAsyncKeyState(vk) & 0x8000)) continue;
+							if (vk == VK_ESCAPE) {
+								State::csHotkeyCapturing = false;
+								break;
+							}
+							const unsigned int code = VKToHotkeyCode(vk);
+							if (code == 0) continue;
+							F4SEMenuFramework::Hotkeys::SetBinding(kCrouchSlideHotkeyId, code);
+							State::csHotkeyCapturing = false;
+							break;
+						}
+					} else {
+						if (ImGuiMCP::Button("Bind##csHotkey")) {
+							State::csHotkeyCapturing = true;
+						}
+						if (ImGuiMCP::IsItemHovered()) {
+							ImGuiMCP::SetTooltip(
+								"Bind a key that starts a crouch slide while sprinting.\n"
+								"Useful with hold-to-sprint mods where the crouch-key gesture\n"
+								"is awkward. A gamepad button can be set under [Hotkeys] in\n"
+								"F4SE Menu Framework's PluginHotkeys.ini.");
+						}
+						if (binding != 0) {
+							ImGuiMCP::SameLine();
+							if (ImGuiMCP::Button("Clear##csHotkey")) {
+								F4SEMenuFramework::Hotkeys::SetBinding(kCrouchSlideHotkeyId, 0);
+							}
+							if (ImGuiMCP::IsItemHovered()) {
+								ImGuiMCP::SetTooltip("Unbind the Crouch Slide hotkey.");
+							}
+						}
+					}
+				}
+
+				ImGuiMCP::Spacing();
+				ImGuiMCP::Separator();
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Motion");
+				ImGuiMCP::Spacing();
+
+				if (SliderFloatWithTooltip("Distance##csDist", &settings->crouchSlideDistance,
+					100.0f, 2000.0f, "%.0f units",
+					"Total ground distance covered by the slide. Default: 450")) {
+					settings->crouchSlideDistance = std::clamp(settings->crouchSlideDistance, 100.0f, 2000.0f);
+					State::hasUnsavedChanges = true;
+				}
+
+				if (SliderFloatWithTooltip("Duration##csDur", &settings->crouchSlideDuration,
+					0.3f, 5.0f, "%.2f sec",
+					"How long the slide lasts. Shorter = faster (higher peak speed),\n"
+					"since distance stays the same. Default: 1.60")) {
+					settings->crouchSlideDuration = std::clamp(settings->crouchSlideDuration, 0.3f, 5.0f);
+					State::hasUnsavedChanges = true;
+				}
+
+				// Derived peak/average speed hint. Must match the runtime
+				// envelope in CrouchSlide.cpp: punchy launch (kEaseInFrac 0.06)
+				// plus a convex (1 - t)^1.3 friction decay. Its area is
+				// 0.5*0.06 + 0.94/2.3 ~= 0.4387, so peak = distance /
+				// (duration * 0.4387).
+				{
+					constexpr float kEnvelopeIntegral = 0.5f * 0.06f + (1.0f - 0.06f) / (1.3f + 1.0f);
+					const float dur = std::max(settings->crouchSlideDuration, 0.0001f);
+					const float peak = settings->crouchSlideDistance / (dur * kEnvelopeIntegral);
+					const float avg = settings->crouchSlideDistance / dur;
+					ImGuiMCP::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+						"   ~%.0f u/s average, ~%.0f u/s peak", avg, peak);
+				}
+
+				if (SliderFloatWithTooltip("Max Steer Angle##csSteer", &settings->crouchSlideMaxSteerDegrees,
+					0.0f, 90.0f, "%.0f deg",
+					"How far the camera can bend the slide from its starting heading.\n"
+					"The camera itself is never restricted; only how much it steers the\n"
+					"slide. 0 = perfectly straight. Default: 15")) {
+					settings->crouchSlideMaxSteerDegrees = std::clamp(settings->crouchSlideMaxSteerDegrees, 0.0f, 90.0f);
+					State::hasUnsavedChanges = true;
+				}
+
+				if (SliderFloatWithTooltip("AP Cost##csAP", &settings->crouchSlideAPCost,
+					0.0f, 200.0f, "%.0f",
+					"Action Points consumed when a slide starts. If AP is below this,\n"
+					"the slide will not trigger. Default: 20")) {
+					settings->crouchSlideAPCost = std::clamp(settings->crouchSlideAPCost, 0.0f, 200.0f);
+					State::hasUnsavedChanges = true;
+				}
+
+				if (SliderFloatWithTooltip("Crouch-Walk Ramp##csRamp", &settings->crouchSlideRampUpTime,
+					0.0f, 3.0f, "%.2f sec",
+					"After the slide, if you stay crouched, your speed eases back up to\n"
+					"crouch-walk over this time. If you stand up, this is skipped.\n"
+					"0 = no ramp. Default: 1.00")) {
+					settings->crouchSlideRampUpTime = std::clamp(settings->crouchSlideRampUpTime, 0.0f, 3.0f);
+					State::hasUnsavedChanges = true;
+				}
+
+				if (CheckboxWithTooltip("Omnidirectional##csOmni", &settings->crouchSlideOmnidirectional,
+					"When on, the slide follows the direction you are actually moving\n"
+					"(supports omnidirectional-sprint mods). When off, the slide always\n"
+					"goes straight ahead where the camera faces.")) {
+					State::hasUnsavedChanges = true;
+				}
+
+				ImGuiMCP::Spacing();
+				ImGuiMCP::Separator();
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Landing Slide");
+				ImGuiMCP::Spacing();
+
+				if (CheckboxWithTooltip("Slide on Landing##csLand", &settings->crouchSlideLandingEnabled,
+					"Trigger a slide automatically when you land with enough forward\n"
+					"momentum. Default: off")) {
+					State::hasUnsavedChanges = true;
+				}
+				if (settings->crouchSlideLandingEnabled) {
+					if (SliderFloatWithTooltip("Min Landing Momentum##csLandMom", &settings->crouchSlideLandingMomentum,
+						50.0f, 1000.0f, "%.0f u/s",
+						"Minimum horizontal speed on landing required to start a slide.\n"
+						"Default: 350")) {
+						settings->crouchSlideLandingMomentum = std::clamp(settings->crouchSlideLandingMomentum, 50.0f, 1000.0f);
+						State::hasUnsavedChanges = true;
+					}
+				}
+
+				ImGuiMCP::Spacing();
+				ImGuiMCP::Separator();
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Invulnerability (i-frames)");
+				ImGuiMCP::Spacing();
+
+				if (CheckboxWithTooltip("Enable I-Frames##csIframes", &settings->crouchSlideIFramesEnabled,
+					"Make the player invulnerable for the first part of the slide.\n"
+					"Default: off (experimental - verify it takes effect in your setup).")) {
+					State::hasUnsavedChanges = true;
+				}
+				if (settings->crouchSlideIFramesEnabled) {
+					if (SliderFloatWithTooltip("I-Frame Duration##csIframeDur", &settings->crouchSlideIFramesDuration,
+						0.0f, 5.0f, "%.2f sec",
+						"How long invulnerability lasts from the start of the slide.\n"
+						"Default: 0.50")) {
+						settings->crouchSlideIFramesDuration = std::clamp(settings->crouchSlideIFramesDuration, 0.0f, 5.0f);
+						State::hasUnsavedChanges = true;
+					}
+				}
+
+				ImGuiMCP::Spacing();
+				ImGuiMCP::Separator();
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Sound");
+				ImGuiMCP::Spacing();
+
+				if (SliderFloatWithTooltip("Slide Volume##csVol", &settings->crouchSlideVolume,
+					0.0f, 1.0f, "%.2f",
+					"Volume of crouchslide.wav (from\n"
+					"Data/F4SE/Plugins/FPGunplayOverhaul/CrouchSlide/).\n"
+					"0 = silent. Default: 1.00")) {
+					settings->crouchSlideVolume = std::clamp(settings->crouchSlideVolume, 0.0f, 1.0f);
+					State::hasUnsavedChanges = true;
+				}
+
+				ImGuiMCP::Spacing();
+				ImGuiMCP::Separator();
+				ImGuiMCP::Spacing();
+				ImGuiMCP::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "OAR Integration");
+				ImGuiMCP::Spacing();
+				ImGuiMCP::Indent(8.0f);
+				ImGuiMCP::BulletText("Keyword 'AnimsCrouchSlideKeyword' is added to the player during the slide");
+				ImGuiMCP::BulletText("Use OAR's HasKeyword condition to trigger a custom slide animation");
 				ImGuiMCP::Unindent(8.0f);
 			}
 		}

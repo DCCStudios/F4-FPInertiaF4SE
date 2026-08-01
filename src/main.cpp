@@ -6,6 +6,7 @@
 #include "WeaponFOV.h"
 #include "FireOnEmpty.h"
 #include "ContextualLean.h"
+#include "CrouchSlide.h"
 
 // ============================================================
 // Plugin Info
@@ -102,6 +103,7 @@ namespace
 			FireOnEmpty::Manager::GetSingleton()->Init();
 			ContextualLean::Manager::GetSingleton()->Init();
 			Inertia::InertiaManager::GetSingleton()->InitSuperSprint();
+			CrouchSlide::Manager::GetSingleton()->Init();
 			Inertia::Install();
 			break;
 		}

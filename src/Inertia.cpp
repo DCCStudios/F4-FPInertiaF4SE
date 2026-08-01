@@ -3,6 +3,7 @@
 #include "WeaponFOV.h"
 #include "FireOnEmpty.h"
 #include "ContextualLean.h"
+#include "CrouchSlide.h"
 #include "OpenAnimationReplacerAPI-Clips.h"
 #include "SyntheticInput.h"
 
@@ -6012,6 +6013,33 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	if (currentlyInAir) airTime += delta;
 	else airTime = 0.0f;
 
+	// ---- CROUCH SLIDE ----
+	// Driven here so it can reuse the already-resolved sprint state and the
+	// filtered landing edge. First-person is required (this is a FP gunplay
+	// mod); the manager handles all gating, effects, and cleanup itself.
+	{
+		bool csFirstPerson = false;
+		if (auto* cam = RE::PlayerCamera::GetSingleton(); cam && cam->currentState) {
+			const auto camState = cam->currentState->id.get();
+			csFirstPerson = (camState == RE::CameraStates::kFirstPerson ||
+			                 camState == RE::CameraStates::kIronSights);
+		}
+		CrouchSlide::Manager::FrameState csState{};
+		csState.player           = player;
+		csState.delta            = delta;
+		csState.sprinting        = currentlySpriniting;
+		csState.confirmedLanding = confirmedLanding;
+		csState.inAir            = currentlyInAir;
+		csState.firstPerson      = csFirstPerson;
+		// Anim-event latched crouch pose (sneakStateEnter/Exit). One frame
+		// stale here (wasSneaking is refreshed later in this Update), which is
+		// fine: it is the reliable "actually in the crouch pose" signal the
+		// slide waits on before driving velocity, unlike the input flag which
+		// flips the instant crouch is pressed.
+		csState.sneaking         = wasSneaking;
+		CrouchSlide::Manager::GetSingleton()->Update(csState);
+	}
+
 	jumpSpring.positionOffset = SpringStep3(jumpSpring.positionOffset, jumpSpring.positionVelocity,
 		{ 0, 0, 0 }, currentJumpStiffness, currentJumpDamping, 1.0f, delta);
 	jumpSpring.rotationOffset = SpringStep3(jumpSpring.rotationOffset, jumpSpring.rotationVelocity,
@@ -6587,6 +6615,9 @@ void Inertia::InertiaManager::Reset()
 	superSprintPrevAP      = -1.0f;
 	SuperSprintInput::s_eatEnabled  = false;
 	SuperSprintInput::s_eatTriggered = false;
+
+	// Cancel any active crouch slide and restore its borrowed state.
+	CrouchSlide::Manager::GetSingleton()->Reset();
 }
 
 void Inertia::InertiaManager::OnGameLoaded()

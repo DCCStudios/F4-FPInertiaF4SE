@@ -109,6 +109,9 @@ namespace Menu
 		// Super Sprint hotkey binding: true while waiting for a key press
 		inline bool ssHotkeyCapturing{ false };
 
+		// Crouch Slide hotkey binding: true while waiting for a key press
+		inline bool csHotkeyCapturing{ false };
+
 		// ADS Transitions tab state
 		inline int adsTransWeaponTypeIndex{ 3 };   // default to Rifle
 		inline int adsTransSpecificWeaponIndex{ -1 };
