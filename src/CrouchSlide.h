@@ -97,7 +97,12 @@ namespace CrouchSlide
 		// Abort a slide (jump, ragdoll, feature disabled, etc.) with full cleanup.
 		void CancelSlide(RE::PlayerCharacter* a_player, const char* a_reason);
 		// Remove the OAR keyword + i-frames + any live velocity ownership.
-		void ClearSlideEffects(RE::PlayerCharacter* a_player);
+		// a_releaseForceSneak: cancels release the pin immediately; a normal
+		// EndSlide passes false and defers the release to the aligned-state
+		// handler in Update (see m_pinReleasePending).
+		void ClearSlideEffects(RE::PlayerCharacter* a_player, bool a_releaseForceSneak = true);
+		// Restore ActorState::forceSneak to its pre-slide value.
+		void ReleaseForceSneakPin(RE::PlayerCharacter* a_player);
 
 		// One-shot slide sound (best-effort; failure is logged, slide continues).
 		void PlaySound(RE::PlayerCharacter* a_player);
@@ -140,24 +145,29 @@ namespace CrouchSlide
 		// timeout (whichever comes first).
 		float m_crouchWaitTime{ 0.0f };
 
-		// Whether this slide owns the player's crouch (all trigger paths do
-		// now). While pending and sliding we re-issue the synthetic Sneak press
-		// whenever the crouch is not engaged, so the jump-land recovery cannot
-		// stand the player back up. The press is a toggle, so re-issues are
-		// throttled by m_forceCrouchRetryTimer to give each one time to
-		// register before deciding it was swallowed.
-		bool  m_needsForceCrouch{ false };
-		float m_forceCrouchRetryTimer{ 0.0f };
-
-		// While sliding we pin ActorState::forceSneak (the engine bit behind
-		// the SetForceSneak console/script function) so the crouch cannot be
-		// broken by ANY input scheme - toggle sneak, hold-to-crouch mods
-		// releasing on key-up, or jump-land recovery. Pinned at
-		// BeginSlideMotion (not during pending, so the toggle-retry guard is
-		// not masked), restored in ClearSlideEffects. Previous value saved so
-		// we never clobber a force-sneak someone else (e.g. a quest) set.
+		// The ActorState::forceSneak pin (the engine bit behind the
+		// SetForceSneak console/script function) is the SOLE in-slide crouch
+		// enforcement: pinned at StartSlide (so the pending wait is covered
+		// too), it holds the pose against ANY input scheme - toggle sneak,
+		// hold-to-crouch mods releasing on key-up, jump-land recovery.
+		// Deliberately NO synthetic-toggle re-issues while pinned: each press
+		// takes several frames to reflect in IsSneaking(), so a retry loop
+		// keyed on that bool double-fires and visibly bobs the player up and
+		// down mid-slide (observed in-game). Previous value saved so we never
+		// clobber a force-sneak someone else (e.g. a quest) set.
 		bool          m_forceSneakPinned{ false };
 		std::uint32_t m_forceSneakPrev{ 0 };
+
+		// Deferred pin release after a normal slide end. The pose is held by
+		// forceSneak, but the persistent sneak TOGGLE state may still read
+		// standing (e.g. a hotkey/landing slide where the initial press was
+		// swallowed). Releasing the pin in that state would stand the player
+		// up, so EndSlide sends one aligning synthetic press if needed and the
+		// pin is released from Update once IsSneaking() reads true (or a short
+		// timeout passes). Cancels release immediately instead - standing is
+		// the correct outcome for an aborted slide.
+		bool  m_pinReleasePending{ false };
+		float m_pinReleaseTimer{ 0.0f };
 
 		// Gun-down (weapon-lowered) visual. PerformAction is refused while the
 		// animation graph is mid-transition (the sprint -> crouch change at

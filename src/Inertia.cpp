@@ -1018,6 +1018,45 @@ namespace MeleeInput
 // All state is main-thread only (poked from Update and from
 // TriggerGunBashAction, which Update calls).
 // ============================================================
+
+// ============================================================
+// Keep-alive registry for plugin-constructed scene-graph nodes.
+//
+// WHY THIS EXISTS (fixes the power-armor CTD, 2026-08-01): NiNodes built in
+// plugin code get their NiTObjectArray children buffer from the PLUGIN's CRT
+// heap (CommonLibF4's NiTNewInterface::allocate is plain `new[]`). The
+// vendored NiNode ctor swaps in the GAME's vtables, so if such a node's
+// refcount ever reaches zero, the ENGINE's ~NiNode runs and frees that
+// buffer through the GAME's allocator (tbbmalloc under Buffout4). That
+// cross-heap free corrupts the heap and crashes in
+// rml::internal::Block::freeOwnObject.
+//
+// That is exactly the crash users hit in power armor: entering/exiting PA
+// swaps the first-person rig, ModelLoader::ClearUnusedModels later destroys
+// the old tree on a job thread, and the teardown takes our inserted bone
+// (FPInertia_Node / the bash blend bone) to refcount zero. Without PA the
+// rig only dies at process exit, where Buffout's SafeExit masks it - which
+// is why only PA users reported it.
+//
+// Holding one strong NiPointer per node we ever create means tree teardown
+// only DETACHES our nodes; the engine-side destructor never runs and the
+// engine never frees plugin-heap memory. Entries are deliberately never
+// released (releasing one would run the same engine dtor and re-create the
+// bug). The cost is a bounded leak of ~350 bytes per first-person rig swap.
+// Main-thread only (all node creation happens inside UpdateAnimation).
+// ============================================================
+namespace PluginNodeKeepAlive
+{
+	static std::vector<RE::NiPointer<RE::NiNode>> s_nodes;
+
+	static void Hold(RE::NiNode* a_node)
+	{
+		if (a_node) {
+			s_nodes.emplace_back(a_node);  // NiPointer ctor AddRefs
+		}
+	}
+}
+
 namespace BashBlend
 {
 	// -- phase machine --
@@ -1329,6 +1368,10 @@ namespace BashBlend
 
 		auto* inserted = new RE::NiNode(1);
 		if (!inserted) return nullptr;
+		// Pin the node for the lifetime of the process BEFORE it enters the
+		// scene graph: the engine must never run this node's destructor (its
+		// children buffer is plugin-heap; see PluginNodeKeepAlive).
+		PluginNodeKeepAlive::Hold(inserted);
 		inserted->name = kName;
 		inserted->local.MakeIdentity();
 		// Seed the world transform (identity local => parent's world).
@@ -2702,6 +2745,13 @@ RE::NiNode* Inertia::InertiaManager::GetOrInsertInertiaBone(
 	auto* inserted = new RE::NiNode(1);
 	if (!inserted) return nullptr;
 
+	// Pin the node for the lifetime of the process BEFORE it enters the
+	// scene graph: the engine must never run this node's destructor (its
+	// children buffer is plugin-heap; see PluginNodeKeepAlive). This is the
+	// power-armor CTD fix - rig teardown after a PA swap used to free this
+	// node engine-side and cross-heap-free the children buffer.
+	PluginNodeKeepAlive::Hold(inserted);
+
 	inserted->name = kInsertedBoneName;
 	inserted->local.translate = RE::NiPoint3{ 0.0f, 0.0f, 0.0f };
 	inserted->local.rotate.MakeIdentity();
@@ -3118,11 +3168,24 @@ namespace MeleeInput
 	// the main thread (same reasoning as AttackInput's plain bools).
 	static bool s_meleePressedEdge = false;
 
+	// Any-activity flag (press, held-repeat, release frames all set it),
+	// consumed by Update to refresh throwSuppressTimer. The Melee key
+	// drives BOTH gun bash and grenade throw (vanilla maps them to the
+	// same "Melee" user event via MeleeThrowHandler), and a grenade
+	// throw's release annotation is a "weaponFire" anim event — which
+	// the phantom-fire override must never convert into a real gun shot.
+	// Deliberately NOT set by SimulateTap (it bypasses this hook), so
+	// synthetic combo bashes don't suppress anything.
+	static bool s_meleeActivitySeen = false;
+
 	static void HookedMeleeHandleButton(void* self, const RE::ButtonEvent* event)
 	{
-		if (event && event->QUserEvent() == "Melee"sv && event->QJustPressed()) {
-			s_meleePressedEdge = true;
-			logger::trace("[MeleeInput] Melee pressed");
+		if (event && event->QUserEvent() == "Melee"sv) {
+			s_meleeActivitySeen = true;
+			if (event->QJustPressed()) {
+				s_meleePressedEdge = true;
+				logger::trace("[MeleeInput] Melee pressed");
+			}
 		}
 		// Always pass through to the engine's handler unchanged.
 		if (s_originalHandleButton) {
@@ -4685,6 +4748,22 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		reloadElapsedTime += delta;
 	if (recentlyReloadedTimer > 0.0f) recentlyReloadedTimer -= delta;
 
+	// Melee/grenade-throw suppression window for phantom-fire forcing.
+	// Refreshed on EVERY frame the Melee button produces an event (press,
+	// held, release), so the window measures time since the last input
+	// frame. 3.0s covers the whole throw animation through its release
+	// annotation — the "weaponFire" event that must not be converted into
+	// a forced gun shot (grenade-fires-my-gun bug) — including throws the
+	// engine queues briefly behind a reload. Cost of a false positive
+	// (window set by a bash tap): the phantom-fire assist stays quiet for
+	// 3s after the bash, which only matters in the rare
+	// reload+bash+trigger-held-within-2s combo.
+	if (MeleeInput::s_meleeActivitySeen) {
+		MeleeInput::s_meleeActivitySeen = false;
+		throwSuppressTimer = 3.0f;
+	}
+	if (throwSuppressTimer > 0.0f) throwSuppressTimer -= delta;
+
 	// Read ADS / Fire input state.
 	// Fire comes from the AttackInput vtable hook (engine-dispatched
 	// "PrimaryAttack" ButtonEvents). Do not fall back to raw handler bytes:
@@ -4843,14 +4922,25 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			HavokVar::GetBool(player, HavokVar::kIsAttacking, probeAttacking);
 			HavokVar::GetInt(player, HavokVar::kIAttackState, probeAtkState);
 			if (probeAtkState == 0 && !probeAttacking) {
-				earlyAdsAutoFireWatching   = true;
-				earlyAdsAutoFireTimer      = 5.0f;
-				earlyAdsAutoFireAttempts   = 0;
-				earlyAdsAutoFireGraceTimer = 0.0f;
-				earlyAdsAutoFirePhantomGap = 0.0f;
-				logger::info("[Phantom-Fire] Auto-armed (gs={}, atkState=0, attacking=false, mag={}) — recently reloaded, will drive QueueWeaponFire from anim events",
-					probeGS, curMagAmmo);
-				PushEvent("Phantom override: auto-armed");
+				if (throwSuppressTimer > 0.0f) {
+					// This weaponFire is (or may be) a grenade throw's release
+					// annotation: the Melee button was active within the last
+					// 3s. Arming here force-fires the GUN on a grenade throw
+					// (verified user bug, 2026-08-01 log: "Auto-armed" +
+					// "Forced shot 1" ~30ms after each throw that landed in
+					// the recentlyReloaded window, plus a stuck fire loop).
+					logger::info("[Phantom-Fire] Auto-arm suppressed (gs={}, mag={}) — Melee/throw input {:.2f}s ago; weaponFire likely a grenade release",
+						probeGS, curMagAmmo, 3.0f - throwSuppressTimer);
+				} else {
+					earlyAdsAutoFireWatching   = true;
+					earlyAdsAutoFireTimer      = 5.0f;
+					earlyAdsAutoFireAttempts   = 0;
+					earlyAdsAutoFireGraceTimer = 0.0f;
+					earlyAdsAutoFirePhantomGap = 0.0f;
+					logger::info("[Phantom-Fire] Auto-armed (gs={}, atkState=0, attacking=false, mag={}) — recently reloaded, will drive QueueWeaponFire from anim events",
+						probeGS, curMagAmmo);
+					PushEvent("Phantom override: auto-armed");
+				}
 			}
 		}
 	}
@@ -4959,10 +5049,15 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 			logger::warn("[Phantom-Fire] Safety timeout (5s) — force fade+attackStop+AttackEnd, exit (shots={}, fadeMs={}, fadedHandles={})",
 				earlyAdsAutoFireAttempts, fadeMs, faded);
 			earlyAdsAutoFireWatching = false;
-		} else if (gotFireEvent && afIsFiringState && !ammoDecreased) {
+		} else if (gotFireEvent && afIsFiringState && !ammoDecreased
+		           && throwSuppressTimer <= 0.0f) {
 			// Real anim fire event in a real firing state, and the
 			// engine did NOT just discharge a shot — convert into a
 			// real discharge, paced by the weapon's own fire interval.
+			// throwSuppressTimer gate: a grenade throw's release is also a
+			// weaponFire event; forcing here would discharge the gun on the
+			// throw. When gated, phantomGap keeps growing and the
+			// trigger-released exit below cleans up within 0.15s.
 			earlyAdsAutoFirePhantomGap = 0.0f;
 			if (earlyAdsAutoFireGraceTimer <= 0.0f) {
 				auto* base = GetEquippedWeaponBase(player);
@@ -5057,6 +5152,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 				logger::info("[Phantom-Fire] Engine-owned discharge observed — semi-auto conversion window closed (pipeline healthy)");
 			}
 		} else if (!earlyAdsAutoFireWatching && semiPhantomPace <= 0.0f
+		           && throwSuppressTimer <= 0.0f  // never convert a grenade throw's weaponFire into a gun shot
 		           && animEventSink.firedThisFrame.load(std::memory_order_relaxed)) {
 			auto* base = GetEquippedWeaponBase(player);
 			auto* weap = base ? base->As<RE::TESObjectWEAP>() : nullptr;
@@ -6527,6 +6623,7 @@ void Inertia::InertiaManager::Reset()
 	earlyAdsAutoFirePhantomGap = 0.0f;
 	earlyAdsAutoFireSeenGS8 = false;
 	recentlyReloadedTimer = 0.0f;
+	throwSuppressTimer = 0.0f;
 
 	lastEquippedAmmoCount = 0;
 	ammoCountInitialized  = false;

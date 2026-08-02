@@ -471,6 +471,22 @@ namespace Inertia
 		bool  earlyAdsAutoFireSeenGS8{ false };      // true if we've seen gunState reach 8 (attacking)
 		float recentlyReloadedTimer{ 0.0f };         // ticks down from 2.0s after isReloading transitions to false; used to auto-arm phantom override
 
+		// Grenade-throw / gun-bash suppression for ALL phantom-fire forcing.
+		// A grenade throw with a gun equipped releases the grenade via a
+		// "weaponFire" anim event while the gun's iGunState reads a firing
+		// value and the attack SM is idle — indistinguishable, from anim
+		// events alone, from the broken post-reload state the phantom
+		// override exists to fix.  If the throw lands inside the 2s
+		// recentlyReloaded window the override auto-arms and QueueWeaponFire
+		// discharges the player's GUN (user bug report 2026-08-01: "throwing
+		// grenades causes the weapon to fire" + stuck fire-loop sound,
+		// because no real trigger is held so the loop never gets its stop).
+		// Melee/throw input is ground truth we already observe via the
+		// MeleeThrowHandler vtable hook; while this timer is running, no
+		// phantom shot may be forced.  Refreshed every frame the Melee
+		// button is down, so it measures time since the LAST input frame.
+		float throwSuppressTimer{ 0.0f };
+
 		// Engine-discharge detection.  Tracks EquippedWeaponData::ammoCount
 		// (offset 0x18) between frames.  When the engine actually fires a
 		// shot the magazine count decrements; when our phantom override

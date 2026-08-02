@@ -809,17 +809,17 @@ void Settings::Load()
 	// Crouch Slide
 	crouchSlideEnabled          = ini.GetBoolValue("Extras", "bCrouchSlideEnabled", true);
 	crouchSlideUseCrouchKey     = ini.GetBoolValue("Extras", "bCrouchSlideUseCrouchKey", true);
-	crouchSlideDuration         = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideDuration", 1.6));
-	crouchSlideDistance         = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideDistance", 450.0));
+	crouchSlideDuration         = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideDuration", 0.85));
+	crouchSlideDistance         = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideDistance", 240.0));
 	crouchSlideMaxSteerDegrees  = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideMaxSteerDegrees", 15.0));
-	crouchSlideAPCost           = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideAPCost", 20.0));
+	crouchSlideAPCost           = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideAPCost", 15.0));
 	crouchSlideRampUpTime       = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideRampUpTime", 1.0));
-	crouchSlideOmnidirectional  = ini.GetBoolValue("Extras", "bCrouchSlideOmnidirectional", false);
-	crouchSlideLandingEnabled   = ini.GetBoolValue("Extras", "bCrouchSlideLandingEnabled", false);
+	crouchSlideOmnidirectional  = ini.GetBoolValue("Extras", "bCrouchSlideOmnidirectional", true);
+	crouchSlideLandingEnabled   = ini.GetBoolValue("Extras", "bCrouchSlideLandingEnabled", true);
 	crouchSlideLandingMomentum  = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideLandingMomentum", 350.0));
 	crouchSlideIFramesEnabled   = ini.GetBoolValue("Extras", "bCrouchSlideIFramesEnabled", false);
 	crouchSlideIFramesDuration  = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideIFramesDuration", 0.5));
-	crouchSlideVolume           = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideVolume", 1.0));
+	crouchSlideVolume           = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideVolume", 0.5));
 	crouchSlideDuration         = std::clamp(crouchSlideDuration, 0.3f, 5.0f);
 	crouchSlideDistance         = std::clamp(crouchSlideDistance, 100.0f, 2000.0f);
 	crouchSlideMaxSteerDegrees  = std::clamp(crouchSlideMaxSteerDegrees, 0.0f, 90.0f);

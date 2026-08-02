@@ -59,8 +59,18 @@ namespace
 
 		if (msg->type == kFOVSliderRefreshMsg) {
 			if (g_pluginEnabled) {
+				auto* mgr = WeaponFOV::Manager::GetSingleton();
+				// Newer FOV Slider builds ship their live slider values in
+				// the message payload — adopt them directly so our
+				// baselines can never lag its sliders. Older builds send
+				// no payload; RefreshDefaults then falls back to the
+				// disk-INI detection as before.
+				if (msg->data && msg->dataLen >= sizeof(WeaponFOV::FOVSliderValues)) {
+					mgr->SetFOVSliderValues(
+						*static_cast<const WeaponFOV::FOVSliderValues*>(msg->data));
+				}
 				logger::trace("[FPGunplayOverhaul] FOV Slider F4SE refresh received - reloading WBFOV defaults");
-				WeaponFOV::Manager::GetSingleton()->RefreshDefaults();
+				mgr->RefreshDefaults();
 			}
 			return;
 		}

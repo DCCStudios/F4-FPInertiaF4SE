@@ -45,11 +45,11 @@ namespace
 	// 2 * distance / duration — a noticeably faster burst than the old ~1.48x.
 	constexpr float kEaseInFrac = 0.06f;  // ~1-2 frames of launch accel
 
-	// Minimum gap between synthetic crouch toggle re-issues (pending + slide).
-	// The toggle needs a few frames to register before we may conclude it was
-	// swallowed; re-issuing sooner risks a double toggle that stands the
-	// player back up.
-	constexpr float kForceCrouchRetryInterval = 0.12f;  // ~7 frames @ 60fps
+	// How long the deferred end-of-slide pin release waits for the persistent
+	// sneak state to align (IsSneaking() true) before releasing anyway. One
+	// synthetic press takes roughly 0.15-0.25s to reflect in IsSneaking(), so
+	// this comfortably covers a single registration.
+	constexpr float kPinReleaseTimeout = 0.5f;
 
 	// Friction curvature of the decay. 1.0 = linear (constant deceleration).
 	// >1.0 makes the decay convex: the slide sheds speed faster right after the
@@ -324,6 +324,22 @@ void CrouchSlide::Manager::Update(const FrameState& a_fs)
 		return;
 	}
 
+	// Deferred end-of-slide pin release (runs in ANY state, incl. ramp/idle).
+	// After a normal slide end the pose is still held by forceSneak while the
+	// persistent sneak toggle state catches up (EndSlide sends one aligning
+	// press if it was off). Release the pin the moment the state reads
+	// sneaking - or after a timeout, so a swallowed press can never leave the
+	// pin stuck and lock the player into the crouch.
+	if (m_pinReleasePending) {
+		m_pinReleaseTimer += a_fs.delta;
+		if (player->IsSneaking() || m_pinReleaseTimer >= kPinReleaseTimeout) {
+			ReleaseForceSneakPin(player);
+			m_pinReleasePending = false;
+			logger::info("[CrouchSlide] Force-sneak pin released ({} after {:.2f}s)",
+				player->IsSneaking() ? "state aligned" : "timeout", m_pinReleaseTimer);
+		}
+	}
+
 	// --------------------------------------------------------
 	// PENDING CROUCH — armed, waiting for the crouch pose before we drive
 	// velocity. This is what makes it read as a slide instead of a lunge:
@@ -340,21 +356,11 @@ void CrouchSlide::Manager::Update(const FrameState& a_fs)
 
 		m_crouchWaitTime += a_fs.delta;
 
-		// Re-issue the crouch toggle until it takes. On a jump landing the
-		// recovery state can swallow the press, so we retry on a throttle
-		// (long enough for a press to register before we conclude it was
-		// eaten) and stop the instant IsSneaking() reports true — re-issuing
-		// after it engaged would toggle the player back OUT of the crouch.
-		if (m_needsForceCrouch && !player->IsSneaking()) {
-			m_forceCrouchRetryTimer += a_fs.delta;
-			if (m_forceCrouchRetryTimer >= kForceCrouchRetryInterval) {
-				ForceCrouch(player);
-				m_forceCrouchRetryTimer = 0.0f;
-				logger::info("[CrouchSlide] Re-issued crouch toggle while pending (t={:.2f}s)", m_crouchWaitTime);
-			}
-		} else {
-			m_forceCrouchRetryTimer = 0.0f;
-		}
+		// No toggle re-issues here: the forceSneak pin (set at StartSlide) is
+		// what guarantees the crouch, including on jump landings where the
+		// recovery state swallows presses. Retrying synthetic toggles on a
+		// timer double-fires (a press takes longer to reflect in IsSneaking()
+		// than any usable retry interval) and visibly bobs the player.
 
 		// Begin once the crouch POSE is latched (anti-lunge: driving velocity on
 		// the input-flag edge, before the pose settles, reads as a launch). This
@@ -364,20 +370,22 @@ void CrouchSlide::Manager::Update(const FrameState& a_fs)
 			return;
 		}
 
-		// Fallback: the toggle registered (IsSneaking() true) but the pose anim
-		// event has not latched (missed / renamed event). Rather than stall the
-		// whole timeout we begin after a short settle; the crouch is already
-		// engaged and blending by then, so no standing-lunge.
+		// Fallback: the pose anim event has not latched (missed / renamed
+		// event), but the crouch IS engaged - either the persistent sneak
+		// state registered (IsSneaking()) or the forceSneak pin set at
+		// StartSlide is holding the pose down. Begin after a short settle so
+		// the transition has started blending; no standing-lunge.
 		constexpr float kCrouchSettleTime  = 0.15f;  // brief settle if the pose event is missed
 		constexpr float kCrouchWaitTimeout = 0.45f;  // hard cap; crouch clearly failed
-		if (player->IsSneaking() && m_crouchWaitTime >= kCrouchSettleTime) {
+		if ((player->IsSneaking() || m_forceSneakPinned) && m_crouchWaitTime >= kCrouchSettleTime) {
 			BeginSlideMotion(player);
 			return;
 		}
 
 		if (m_crouchWaitTime >= kCrouchWaitTimeout) {
-			// Never got crouched (e.g. crouch blocked here). Do NOT slide
-			// standing, which is exactly the launch/standing-slide bug.
+			// Never got crouched (pin not set and no sneak state - defensive;
+			// should be unreachable now that StartSlide always pins). Do NOT
+			// slide standing, which is exactly the launch/standing-slide bug.
 			CancelSlide(player, "crouch never engaged");
 		}
 		return;
@@ -393,24 +401,11 @@ void CrouchSlide::Manager::Update(const FrameState& a_fs)
 			return;
 		}
 
-		// Keep the player pinned in the crouch for the whole slide. Landing
-		// recovery can stand the player back up partway through — this
-		// mid-slide clearing is the "jump slide won't stay crouched" bug (the
-		// original code only enforced the crouch at slide START). Primary
-		// defense is the forceSneak pin set in BeginSlideMotion; this throttled
-		// toggle re-issue is the fallback in case that bit turns out to be
-		// inert for the player. Only fires when sneak reads off, never faster
-		// than a press can register.
-		if (m_needsForceCrouch && !player->IsSneaking()) {
-			m_forceCrouchRetryTimer += a_fs.delta;
-			if (m_forceCrouchRetryTimer >= kForceCrouchRetryInterval) {
-				ForceCrouch(player);
-				m_forceCrouchRetryTimer = 0.0f;
-				logger::info("[CrouchSlide] Re-issued crouch toggle mid-slide (t={:.2f}s)", m_elapsed);
-			}
-		} else {
-			m_forceCrouchRetryTimer = 0.0f;
-		}
+		// The crouch is held by the forceSneak pin alone. No synthetic toggle
+		// re-issues here: IsSneaking() lags a press by several frames, so a
+		// retry loop keyed on it double-fires and bobs the player up and down
+		// mid-slide (observed in-game 2026-08-01). forceSneak is verified to
+		// hold the pose against landing recovery and every input scheme.
 
 		m_elapsed += a_fs.delta;
 
@@ -498,7 +493,11 @@ void CrouchSlide::Manager::Update(const FrameState& a_fs)
 	// stood up (no longer sneaking).
 	// --------------------------------------------------------
 	if (m_state == State::kRampUp) {
-		if (!player->IsSneaking() || m_rampDuration <= 0.0001f) {
+		// "Stood up" is judged by the POSE (anim-event latched), not
+		// IsSneaking(): right after EndSlide the pin may still be holding the
+		// pose while the persistent state catches up, and IsSneaking() would
+		// falsely report standing and kill the ramp on its first frame.
+		if (!a_fs.sneaking || m_rampDuration <= 0.0001f) {
 			// Remove any remaining reduction and finish.
 			if (m_avSpeedMult && std::abs(m_rampSpeedDelta) > 0.001f) {
 				player->ModActorValue(static_cast<RE::ACTOR_VALUE_MODIFIER>(1), *m_avSpeedMult, -m_rampSpeedDelta);
@@ -588,17 +587,27 @@ void CrouchSlide::Manager::StartSlide(RE::PlayerCharacter* a_player, bool a_crou
 		a_player->ModActorValue(static_cast<RE::ACTOR_VALUE_MODIFIER>(2), *m_avActionPoints, -sgs->crouchSlideAPCost);
 	}
 
-	// We own the crouch for every trigger path (crouch key, hotkey, landing):
-	// while pending AND sliding we re-issue the crouch whenever it is not
-	// engaged, because the jump-land recovery actively clears sneak (that is
-	// the "jump slide won't stay crouched" bug). The crouch-key path must NOT
-	// get an immediate synthetic toggle: the engine is processing the real
-	// press this same frame, and a second toggle on top would cancel it out
-	// and stand the player. Its crouch is still safeguarded by the throttled
-	// re-issue in the pending/sliding states, which only fires if the real
-	// press somehow never registered.
-	m_needsForceCrouch = true;
-	m_forceCrouchRetryTimer = 0.0f;
+	// Pin ActorState::forceSneak for the whole slide, starting NOW. This is
+	// the input-method-agnostic crouch guarantee (the same bit the
+	// SetForceSneak console/script function drives): the engine itself holds
+	// the pose down, so the jump-land recovery clearing sneak (the "jump
+	// slide won't stay crouched" bug) and hold-to-crouch mods toggling off on
+	// key-up are both defeated without any synthetic toggle retries.
+	if (!m_forceSneakPinned) {  // still pinned from a back-to-back slide: keep the true prev
+		m_forceSneakPrev = a_player->forceSneak;
+	}
+	m_pinReleasePending = false;
+	a_player->forceSneak = 1;
+	m_forceSneakPinned = true;
+
+	// One synthetic Sneak press for the trigger paths where no real press is
+	// in flight (hotkey, landing): it registers the PERSISTENT sneak state so
+	// the player stays crouched after the pin is released, and kicks off the
+	// normal enter-sneak transition. The crouch-key path must NOT get one -
+	// the engine is processing the real press this same frame, and a second
+	// toggle on top would cancel it out. Never re-issued: IsSneaking() lags a
+	// press by several frames, so any retry loop double-fires (EndSlide sends
+	// a final aligning press if this one was swallowed).
 	if (a_crouchNow && !a_player->IsSneaking()) {
 		ForceCrouch(a_player);
 	}
@@ -648,19 +657,8 @@ void CrouchSlide::Manager::BeginSlideMotion(RE::PlayerCharacter* a_player)
 	m_diagTimer = 0.0f;
 	m_state = State::kSliding;
 
-	// Pin the engine's force-sneak bit for the duration of the slide. This is
-	// the input-method-agnostic crouch guarantee: the same ActorState bit the
-	// SetForceSneak console/script function (opcode 211) drives, so the engine
-	// itself holds the actor in sneak regardless of what the input layer does
-	// (jump-land recovery clearing sneak, hold-to-crouch mods toggling sneak
-	// off on key release, ...). Deliberately NOT set during the pending wait:
-	// it would make IsSneaking() read true and mask the toggle-retry guard
-	// there, and the pending phase is what registers the PERSISTENT sneak
-	// state that keeps toggle-sneak users crouched after the slide ends.
-	// Restored in ClearSlideEffects.
-	m_forceSneakPrev = a_player->forceSneak;
-	a_player->forceSneak = 1;
-	m_forceSneakPinned = true;
+	// (forceSneak is already pinned - StartSlide does it at arm time so the
+	// pending wait is protected too.)
 
 	// Add the OAR keyword to the player NPC base form.
 	if (m_keyword) {
@@ -719,16 +717,38 @@ void CrouchSlide::Manager::BeginSlideMotion(RE::PlayerCharacter* a_player)
 
 void CrouchSlide::Manager::EndSlide(RE::PlayerCharacter* a_player)
 {
-	ClearSlideEffects(a_player);
+	// Keep the forceSneak pin alive across the transition: releasing it while
+	// the persistent sneak state still reads standing would stand the player
+	// up at the exact moment the slide ends. Instead, align the state with
+	// one synthetic press if needed and let the deferred handler in Update
+	// release the pin once IsSneaking() reads true (or after a timeout).
+	ClearSlideEffects(a_player, /*a_releaseForceSneak=*/false);
+	if (m_forceSneakPinned) {
+		if (a_player && !a_player->IsSneaking()) {
+			ForceCrouch(a_player);
+			logger::info("[CrouchSlide] End-of-slide aligning sneak press sent");
+		}
+		m_pinReleasePending = true;
+		m_pinReleaseTimer = 0.0f;
+	}
 
 	auto* sgs = Settings::GetSingleton();
 
 	// If still crouching, ease SpeedMult back up over the ramp window so the
 	// player accelerates smoothly to crouch-walk speed instead of snapping.
 	// If they stood up, skip the ramp entirely (they resume at normal speed).
-	if (a_player && sgs && m_avSpeedMult && sgs->crouchSlideRampUpTime > 0.0f && a_player->IsSneaking()) {
+	// The pin holds the pose here, so "still crouching" is simply "the pin is
+	// still ours or the state registered".
+	if (a_player && sgs && m_avSpeedMult && sgs->crouchSlideRampUpTime > 0.0f && (a_player->IsSneaking() || m_forceSneakPinned)) {
 		const float baseSpeed = a_player->GetActorValue(*m_avSpeedMult);
-		m_rampInitialReduction = -std::abs(baseSpeed) * 0.5f;  // start at half speed
+		// Start the ramp DEEP (15% speed), not at half: the slide envelope
+		// decays to ~0, so if the player is holding a movement key when the
+		// slide ends, engine locomotion resumes instantly at whatever the
+		// ramp's starting speed allows. A 50% start stepped them from ~25u/s
+		// to ~100+u/s in one frame, which read as an end-of-slide forward
+		// jolt. 15% resumes at roughly the slide's terminal speed and eases
+		// up from there.
+		m_rampInitialReduction = -std::abs(baseSpeed) * 0.85f;
 		m_rampSpeedDelta = m_rampInitialReduction;
 		m_rampElapsed = 0.0f;
 		m_rampDuration = sgs->crouchSlideRampUpTime;
@@ -755,17 +775,33 @@ void CrouchSlide::Manager::CancelSlide(RE::PlayerCharacter* a_player, const char
 	logger::info("[CrouchSlide] Cancelled ({})", a_reason);
 }
 
-void CrouchSlide::Manager::ClearSlideEffects(RE::PlayerCharacter* a_player)
+void CrouchSlide::Manager::ClearSlideEffects(RE::PlayerCharacter* a_player, bool a_releaseForceSneak)
 {
 	StopSound();
 
-	// Release the force-sneak pin. The player's real sneak state (registered
-	// during the pending phase) takes over: toggle users remain crouched,
-	// hold-to-crouch users remain crouched only while still holding.
-	if (m_forceSneakPinned && a_player) {
-		a_player->forceSneak = m_forceSneakPrev;
+	// Hand the character controller a clean slate. The last driven frame left
+	// outVelocity/velocityMod at the slide's terminal velocity; anything left
+	// in velocityMod keeps pushing the actor after we stop driving, which
+	// contributes to a residual shove right as the slide ends. We wrote these
+	// fields every driven frame, so zeroing them here only clears our own
+	// residue.
+	if (a_player && m_state == State::kSliding) {
+		if (auto* cc = GetCharController(a_player)) {
+			cc->velocityTime = 0.0f;
+			cc->outVelocity  = RE::hkVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+			cc->velocityMod  = cc->outVelocity;
+		}
 	}
-	m_forceSneakPinned = false;
+
+	// Release the force-sneak pin (cancels/reset only - a normal EndSlide
+	// defers this to the aligned-state handler in Update so the player is not
+	// stood up before the persistent sneak state has caught up). After
+	// release the real sneak state takes over: toggle users remain crouched,
+	// hold-to-crouch users remain crouched only while still holding.
+	if (a_releaseForceSneak) {
+		ReleaseForceSneakPin(a_player);
+		m_pinReleasePending = false;
+	}
 
 	if (m_iframesActive) {
 		SetIFrames(a_player, false);
@@ -780,6 +816,14 @@ void CrouchSlide::Manager::ClearSlideEffects(RE::PlayerCharacter* a_player)
 	m_elapsed = 0.0f;
 }
 
+void CrouchSlide::Manager::ReleaseForceSneakPin(RE::PlayerCharacter* a_player)
+{
+	if (m_forceSneakPinned && a_player) {
+		a_player->forceSneak = m_forceSneakPrev;
+	}
+	m_forceSneakPinned = false;
+}
+
 void CrouchSlide::Manager::Reset()
 {
 	auto* player = RE::PlayerCharacter::GetSingleton();
@@ -792,6 +836,10 @@ void CrouchSlide::Manager::Reset()
 			player->ModActorValue(static_cast<RE::ACTOR_VALUE_MODIFIER>(1), *m_avSpeedMult, -m_rampSpeedDelta);
 		}
 	}
+	// The pin can outlive the slide state (deferred release after EndSlide);
+	// never let it survive a load/cell change.
+	ReleaseForceSneakPin(player);
+	m_pinReleasePending = false;
 	m_rampSpeedDelta = 0.0f;
 	m_state = State::kIdle;
 	SneakSlideInput::s_crouchPressedWhileSprint.store(false);
@@ -840,17 +888,62 @@ void CrouchSlide::Manager::PlaySound(RE::PlayerCharacter* a_player)
 	auto* audioMgr = RE::BSAudioManager::GetSingleton();
 	if (!audioMgr) return;
 
-	RE::BSResource::ID soundID;
-	soundID.GenerateFromPath("F4SE\\Plugins\\FPGunplayOverhaul\\CrouchSlide\\crouchslide.wav");
+	// Candidate data-relative paths, tried in order. The conventional Sound\
+	// tree is what the game's own audio ships in (and what the proven Skyrim
+	// AudioUtil serves from); the F4SE\Plugins path is where the rest of this
+	// plugin's assets live. The per-path resolvability probe below tells us in
+	// the log which root the resource system actually serves, which is the
+	// open question flagged in the plugin dev reference.
+	static constexpr const char* kSoundPaths[] = {
+		"Sound\\FX\\FPGunplayOverhaul\\crouchslide.wav",
+		"F4SE\\Plugins\\FPGunplayOverhaul\\CrouchSlide\\crouchslide.wav",
+	};
 
-	// GetSoundHandleByFile returns void; validity is read back from the
-	// handle. Try usage flags 0x1A first (2D/loose-file play, per the
-	// reference doc), then 0x00 as a fallback.
-	audioMgr->GetSoundHandleByFile(g_slideSound, soundID, 0x1A, 0x00);
-	if (!g_slideSound.IsValid()) {
-		audioMgr->GetSoundHandleByFile(g_slideSound, soundID, 0x00, 0x00);
+	// AudioUtil's ResourceExists pattern: opening a BSResource stream succeeds
+	// only if the engine's own lookup (loose file or mounted archive) can
+	// serve the path. Separates "resource system cannot see the file" from
+	// "audio cannot play it". Probed once per session for EVERY candidate
+	// (not just until the first hit) so the log answers which roots the
+	// resource system serves - the open question in the plugin dev reference.
+	static bool s_probedOnce = false;
+	if (!s_probedOnce) {
+		s_probedOnce = true;
+		for (const char* path : kSoundPaths) {
+			RE::BSResourceNiBinaryStream probe{ path };
+			logger::info("[CrouchSlide] Sound probe: '{}' resolvable={}", path, static_cast<bool>(probe));
+		}
 	}
-	if (!g_slideSound.IsValid()) {
+
+	const char* usedPath = nullptr;
+	for (const char* path : kSoundPaths) {
+		bool resolvable = false;
+		{
+			RE::BSResourceNiBinaryStream probe{ path };
+			resolvable = static_cast<bool>(probe);
+		}
+		if (!resolvable) continue;
+
+		RE::BSResource::ID soundID;
+		soundID.GenerateFromPath(path);
+
+		// GetSoundHandleByFile returns void; validity is read back from the
+		// handle. The trailing path string is REQUIRED by the real signature
+		// (CK 2.21 PDB) - the ID is only a hash and the loose-file open needs
+		// the actual path; the old 4-arg call left garbage in that slot.
+		// Priority 128 matches AudioUtil's proven default. Usage flags 0x1A
+		// first, then 0x00.
+		audioMgr->GetSoundHandleByFile(g_slideSound, soundID, 0x1A, 128, path);
+		if (!g_slideSound.IsValid()) {
+			audioMgr->GetSoundHandleByFile(g_slideSound, soundID, 0x00, 128, path);
+		}
+		if (g_slideSound.IsValid()) {
+			usedPath = path;
+			break;
+		}
+		logger::warn("[CrouchSlide] Sound: path resolvable but no handle: '{}'", path);
+	}
+
+	if (!usedPath) {
 		logger::warn("[CrouchSlide] Could not build sound handle for crouchslide.wav (slide continues silently)");
 		g_slideSoundValid = false;
 		return;
@@ -871,11 +964,10 @@ void CrouchSlide::Manager::PlaySound(RE::PlayerCharacter* a_player)
 	g_slideSoundValid = true;
 
 	// Explicit confirmation: the handle built and Play() was issued. If this
-	// logs but you hear nothing, the loose-WAV path is resolving but the audio
-	// engine is not serving/decoding it (path-root or format issue), which is
-	// the piece flagged as unverified in the reference doc.
-	logger::info("[CrouchSlide] Sound: handle valid, Play()={}, followObj={}, vol={:.2f}, atten={:.0f}",
-		played, followed, vol, atten);
+	// logs but you hear nothing, the file resolved and the handle built but
+	// the engine is not audibly playing it (mix category / decode issue).
+	logger::info("[CrouchSlide] Sound: playing '{}', Play()={}, followObj={}, vol={:.2f}, atten={:.0f}",
+		usedPath, played, followed, vol, atten);
 }
 
 void CrouchSlide::Manager::StopSound()

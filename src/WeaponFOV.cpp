@@ -270,6 +270,25 @@ namespace WeaponFOV
 				// spurious entryLost apply on the first Update tick.
 				lastAppliedFOV = -1.0f;
 				hadWeaponEntry = false;
+
+				// FOV Slider F4SE defers its Viewmodel FOV slider to us
+				// whenever we're installed (it can't know if the weapon
+				// has an entry). With no entry, nobody would apply the
+				// new default — the slider would be dead. Apply its
+				// pushed default here. Gated on the live-value channel
+				// (its drift watcher undoes the `fov` camera side
+				// effects; that guarantee is what the AE no-entry bug
+				// fix was protecting users WITHOUT it from) and on the
+				// external lock (a refresh dispatched during its
+				// Pip-Boy/terminal exit lerp must not snap the vm).
+				if (fovSliderLive.load() && !externalOverride.load()) {
+					const float def = defaultViewmodelFOV.load();
+					ApplyViewmodelFOV(def);
+					logger::info("[WeaponFOV] Refresh: no weapon entry (weapon='{}') — applied FOV Slider default vm={:.1f}",
+						curEditorID.empty() ? "<none>" : curEditorID.c_str(), def);
+					return;
+				}
+
 				logger::info("[WeaponFOV] Refresh: no weapon entry (weapon='{}') — leaving FOV untouched",
 					curEditorID.empty() ? "<none>" : curEditorID.c_str());
 				return;
@@ -282,8 +301,45 @@ namespace WeaponFOV
 		});
 	}
 
+	void Manager::SetFOVSliderValues(const FOVSliderValues& a_values)
+	{
+		// Version gate: a future FOV Slider may extend the payload; only
+		// adopt layouts we understand.
+		if (a_values.version != 1) {
+			logger::warn("[WeaponFOV] FOV Slider F4SE pushed unknown FSRF payload version {} — ignoring",
+				a_values.version);
+			return;
+		}
+
+		const auto sane = [](float v, float fallback) {
+			return (v >= 30.0f && v <= 160.0f) ? v : fallback;
+		};
+
+		defaultViewmodelFOV.store(sane(a_values.viewmodelFOV, defaultViewmodelFOV.load()));
+		cameraFOV.store(sane(a_values.firstPersonFOV, cameraFOV.load()));
+		thirdPersonFOV.store(sane(a_values.thirdPersonFOV, thirdPersonFOV.load()));
+		defaultSource = FOVDefaultSource::FOVSliderF4SE;
+		cameraSource  = FOVDefaultSource::FOVSliderF4SE;
+
+		if (!fovSliderLive.exchange(true)) {
+			logger::info("[WeaponFOV] FOV Slider F4SE live-value channel active — INI re-detection and external adoption bypassed");
+		}
+		logger::trace("[WeaponFOV] FOV Slider F4SE pushed VM={:.2f} 1P={:.2f} 3P={:.2f}",
+			defaultViewmodelFOV.load(), cameraFOV.load(), thirdPersonFOV.load());
+	}
+
 	void Manager::DetectAndLoadDefaultFOV()
 	{
+		// FOV Slider F4SE pushes its live slider values with every FSRF
+		// message (SetFOVSliderValues). Once that channel is active it is
+		// the source of truth — re-reading its disk INI here could only
+		// REGRESS the values (the file lags the sliders until its next
+		// Save, and the relative path depends on the process CWD).
+		if (fovSliderLive.load()) {
+			logger::trace("[WeaponFOV] DetectAndLoadDefaultFOV skipped — FOV Slider F4SE live values in effect");
+			return;
+		}
+
 		// ---- Viewmodel FOV (default when no weapon entry matches) ----
 		{
 			float            v   = kHardcodedDefaultFOV;
@@ -448,6 +504,19 @@ namespace WeaponFOV
 	// ============================================================
 	bool Manager::AdoptExternalFOVChanges(bool a_force)
 	{
+		// With FOV Slider F4SE pushing live values, the engine INI is NOT
+		// a signal of user intent: FOV Slider's drift watcher deliberately
+		// reverts console edits back to its saved sliders, and the engine
+		// itself transiently resets these keys around loads. Adopting
+		// either would poison our baselines (seen as "Adopting external
+		// 3rd-person FOV change 105.0 -> 80.0" in earlier sessions). The
+		// authoritative values arrive via SetFOVSliderValues instead.
+		if (fovSliderLive.load()) {
+			pendingExternalCam   = -1.0f;
+			pendingExternalWorld = -1.0f;
+			return false;
+		}
+
 		using clock = std::chrono::steady_clock;
 		constexpr double kPollSec         = 0.4;
 		constexpr double kAdoptDebounceSec = 0.9;
@@ -507,6 +576,10 @@ namespace WeaponFOV
 			if (!a_locked) {
 				lastAppliedFOV = -1.0f;
 				hadWeaponEntry = false;
+				// The viewmodel now sits at FOV Slider's default (its
+				// exit lerp just finished). Make the next per-weapon
+				// apply a smooth lerp from that default, not a snap.
+				resumingFromExternal = true;
 			}
 		}
 	}
@@ -561,6 +634,11 @@ namespace WeaponFOV
 		if (resumingFromBlock) {
 			logger::info("[WeaponFOV] Camera returned to first-person — resuming WBFOV applies");
 		}
+		// One-shot, same consume point as wasCameraBlocked: both survive
+		// the early returns above (external lock, adoption pending,
+		// camera blocked) so the resume isn't lost to a skipped tick.
+		const bool resumingFromExternalNow = resumingFromExternal;
+		resumingFromExternal = false;
 
 		// Camera/3rd-person FOV baselines come from the FOV mod INIs,
 		// resolved at Init() and RefreshDefaults() (called on game load and
@@ -673,6 +751,7 @@ namespace WeaponFOV
 			if (log_info) {
 				reason.reserve(96);
 				if (resumingFromBlock) reason += "resumeFromBlock ";
+				if (resumingFromExternalNow) reason += "resumeFromExternal ";
 				if (weaponChanged) reason += "weaponChanged ";
 				if (drawChanged) reason += "drawChanged ";
 				if (entryGained) reason += "entryGained ";
@@ -684,15 +763,35 @@ namespace WeaponFOV
 				}
 			}
 
-			if (resumingFromBlock && haveWeaponEntry) {
-				const float fromFOV = defaultViewmodelFOV.load();
+			// Decide whether this apply can be VISIBLE to the player and
+			// therefore must smooth-lerp instead of hard-snap:
+			//   - resume from a camera block or from FOV Slider's
+			//     external-override unlock: the viewmodel currently sits
+			//     at the default value with the player watching, lerp
+			//     default -> per-weapon;
+			//   - in-place value change (menu edit of the entry, or an
+			//     entry removed while the same weapon stays drawn): lerp
+			//     from the last applied value.
+			// Weapon swaps / holster-draw transitions stay INSTANT on
+			// purpose: the equip animation masks them, and each weapon
+			// should render with its own FOV from its first frame.
+			float lerpFrom = std::numeric_limits<float>::quiet_NaN();
+			if ((resumingFromBlock || resumingFromExternalNow) && haveWeaponEntry) {
+				lerpFrom = defaultViewmodelFOV.load();
+			} else if (!weaponChanged && !drawChanged &&
+			           lastAppliedFOV > 0.0f &&
+			           std::fabs(targetFOV - lastAppliedFOV) > 0.001f) {
+				lerpFrom = lastAppliedFOV;
+			}
+
+			if (!std::isnan(lerpFrom)) {
 				if (log_info) {
 					logger::info("[WeaponFOV] LERP vm {:.1f}->{:.1f} (weapon='{}' cam={:.1f} 3p={:.1f}) reason: {}",
-						fromFOV, targetFOV,
+						lerpFrom, targetFOV,
 						curEditorID.empty() ? "<none>" : curEditorID.c_str(),
 						cameraFOV.load(), thirdPersonFOV.load(), reason);
 				}
-				InterpolateViewmodelFOV(fromFOV, targetFOV, 12);
+				InterpolateViewmodelFOV(lerpFrom, targetFOV, 12);
 			} else {
 				if (log_info) {
 					logger::info("[WeaponFOV] APPLY vm={:.1f} (weapon='{}' cam={:.1f} 3p={:.1f} prev={:.1f}) reason: {}",
@@ -882,13 +981,31 @@ namespace WeaponFOV
 		const float camFov  = cameraFOV.load();
 		const float tpFov   = thirdPersonFOV.load();
 
+		// Capture the runtime world FOV BEFORE the console command runs,
+		// then put the exact value back afterwards. This makes the EXEC
+		// perfectly NEUTRAL to whatever the engine (or FP Camera Overhaul)
+		// is doing with the world camera right now — including the
+		// engine's own camera-override zooms (terminal/furniture enter and
+		// exit transitions lerp worldFOV; computing a "correct" restore
+		// value here stomped those lerps and showed up as popping). The
+		// world camera's correctness is owned elsewhere: FOV Slider's
+		// camera-cut guard (when installed) or the engine's own INI sync,
+		// both of which read the INI keys we re-assert below.
+		float preWorld     = 0.0f;
+		bool  havePreWorld = false;
+		if (auto* camera = RE::PlayerCamera::GetSingleton()) {
+			preWorld     = camera->worldFOV;
+			havePreWorld = preWorld >= 5.0f && preWorld <= 170.0f;
+		}
+
 		const std::string cmd = std::format("fov {:.4f} {:.4f}", vmFov, camFov);
 		ExecuteConsoleCommand(cmd);
 
-		// Undo the runtime 3rd-person clobber immediately — worldFOV only
-		// affects the 3rd-person camera, safe to write same-frame.
+		// Undo the runtime worldFOV clobber immediately, same-frame.
+		// Fall back to the 3rd-person value only if the pre-command read
+		// was unavailable or garbage.
 		if (auto* camera = RE::PlayerCamera::GetSingleton()) {
-			camera->worldFOV = tpFov;
+			camera->worldFOV = havePreWorld ? preWorld : tpFov;
 		}
 
 		// firstPersonFOV is also clobbered to X (viewmodel value), but it
@@ -905,7 +1022,7 @@ namespace WeaponFOV
 		SetEngineFloatSetting("fDefault1stPersonFOV:Display", camFov);
 
 		logger::trace("[WeaponFOV] post-fov fixup: worldFOV={:.2f} INI(1stP={:.2f} 3rdP={:.2f}) vm={:.2f}",
-			tpFov, camFov, tpFov, vmFov);
+			havePreWorld ? preWorld : tpFov, camFov, tpFov, vmFov);
 	}
 
 	void Manager::InterpolateViewmodelFOV(float from, float to, int frames)

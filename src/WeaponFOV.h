@@ -27,6 +27,21 @@ namespace WeaponFOV
 		UserINI,             // From the user's Fallout4Prefs/Custom INI
 	};
 
+	// Live FOV baselines pushed by FOV Slider F4SE in its FSRF message
+	// payload. When installed, FOV Slider is the single source of truth
+	// for these values; receiving this struct replaces re-reading its
+	// disk INI (stale until its next Save, CWD-dependent path) and
+	// polling the engine INI (transiently reset by the engine during
+	// loads). Layout must match FOV Slider F4SE/src/FOVManager.cpp::
+	// FSRFPayload.
+	struct FOVSliderValues
+	{
+		std::uint32_t version;         // = 1
+		float         viewmodelFOV;    // default vm (no weapon entry / lerp origin)
+		float         firstPersonFOV;  // camera Y arg for `fov X Y`
+		float         thirdPersonFOV;  // world-FOV restore value after `fov X Y`
+	};
+
 	struct WBFOVEntry
 	{
 		std::string editorID;     // Weapon EditorID — also the JSON filename stem
@@ -61,6 +76,15 @@ namespace WeaponFOV
 		// Pip-Boy / Terminal / Aiming contexts without us fighting it.
 		void SetExternalOverride(bool a_locked);
 		bool IsExternalOverride() const { return externalOverride.load(); }
+
+		// Adopt the live baselines FOV Slider F4SE pushed in its FSRF
+		// payload. From the first call on, FOV Slider is authoritative:
+		// DetectAndLoadDefaultFOV keeps these values instead of re-reading
+		// disk INIs, and AdoptExternalFOVChanges stops second-guessing the
+		// engine INI (FOV Slider's drift watcher owns console-edit policy).
+		// Safe from any thread — everything written is atomic.
+		void SetFOVSliderValues(const FOVSliderValues& a_values);
+		bool HasLiveFOVSliderValues() const { return fovSliderLive.load(); }
 
 		// Per-frame update — applies the correct FOV based on equipped weapon
 		void Update(RE::PlayerCharacter* player, bool weaponDrawn);
@@ -151,6 +175,13 @@ namespace WeaponFOV
 		// clobbering 3rd-person FOV to X (the viewmodel value).
 		std::atomic<float>  thirdPersonFOV{ 80.0f };
 
+		// True once FOV Slider F4SE has pushed live values via FSRF
+		// (SetFOVSliderValues). While set, that plugin is the single
+		// source of truth for defaultViewmodelFOV / cameraFOV /
+		// thirdPersonFOV: disk-INI re-detection and engine-INI adoption
+		// are both bypassed.
+		std::atomic<bool>   fovSliderLive{ false };
+
 		// Last applied viewmodel FOV — used to suppress redundant re-applies
 		// (executing the script compiler every frame is unnecessary work).
 		float               lastAppliedFOV{ -1.0f };
@@ -189,6 +220,16 @@ namespace WeaponFOV
 		// 3rd-person, VATS, etc.). Used to detect the transition back to
 		// first-person so we can smooth-lerp rather than hard-snap.
 		bool wasCameraBlocked{ false };
+
+		// Set when the FOV Slider F4SE external-override lock releases
+		// (Pip-Boy / terminal / VATS transition finished). The next apply
+		// resumes from FOV Slider's default viewmodel FOV, so it must
+		// smooth-lerp like the camera-block resume; without this flag the
+		// unlock path (which resets lastAppliedFOV) hard-snapped from the
+		// default to the per-weapon value right as the player regained
+		// view. Only touched from the game thread (SetExternalOverride is
+		// dispatched via F4SE messaging; Update is the per-frame hook).
+		bool resumingFromExternal{ false };
 
 		// ---- External FOV change adoption (see AdoptExternalFOVChanges) ----
 		// Poll throttle: engine setting lookups walk a list, so only poll a

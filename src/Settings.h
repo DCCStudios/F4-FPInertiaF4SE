@@ -415,17 +415,17 @@ public:
 	// is clamped so the camera can nudge the slide a few degrees but not circle.
 	bool  crouchSlideEnabled{ true };
 	bool  crouchSlideUseCrouchKey{ true };      // trigger by pressing crouch while sprinting
-	float crouchSlideDuration{ 1.6f };          // total slide time (seconds)
-	float crouchSlideDistance{ 450.0f };        // total slide distance (game units)
+	float crouchSlideDuration{ 0.85f };         // total slide time (seconds)
+	float crouchSlideDistance{ 240.0f };        // total slide distance (game units)
 	float crouchSlideMaxSteerDegrees{ 15.0f };  // max deviation the camera can bend the slide heading
-	float crouchSlideAPCost{ 20.0f };           // Action Points consumed on slide start
+	float crouchSlideAPCost{ 15.0f };           // Action Points consumed on slide start
 	float crouchSlideRampUpTime{ 1.0f };        // seconds to ease back to crouch-walk speed if still crouching
-	bool  crouchSlideOmnidirectional{ false };  // slide in any sprint direction (omnidirectional-sprint mods)
-	bool  crouchSlideLandingEnabled{ false };   // trigger a slide on landing with forward momentum
+	bool  crouchSlideOmnidirectional{ true };   // slide in any sprint direction (omnidirectional-sprint mods)
+	bool  crouchSlideLandingEnabled{ true };    // trigger a slide on landing with forward momentum
 	float crouchSlideLandingMomentum{ 350.0f };  // min horizontal speed (units/s) to trigger a landing slide
 	bool  crouchSlideIFramesEnabled{ false };   // invulnerability during the first part of the slide (default off)
 	float crouchSlideIFramesDuration{ 0.5f };   // i-frame window length (seconds) from slide start
-	float crouchSlideVolume{ 1.0f };            // slide sound volume (0..1)
+	float crouchSlideVolume{ 0.5f };            // slide sound volume (0..1)
 	// The optional activation hotkey is stored by the F4SE Menu Framework
 	// hotkey API, not here — see Menu::Register.
 
