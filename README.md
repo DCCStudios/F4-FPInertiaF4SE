@@ -10,7 +10,7 @@ First-person gunplay overhaul for **Fallout 4**, implemented as an **F4SE** plug
 |-------------|--------|
 | **Fallout 4** | Current supported F4SE branch for your game version. |
 | **[F4SE](https://f4se.silverlock.org/)** | Script extender matching your game build. |
-| **[F4SE Menu Framework](https://www.nexusmods.com/fallout4/mods/58459)** | Required for the in-game menu (`F4SEMenuFramework.dll`). Without it, the plugin still runs but the menu is unavailable. |
+| **[F4SE Menu Framework](https://www.nexusmods.com/fallout4/mods/105090)** | Required for the in-game menu (`F4SEMenuFramework.dll`). Without it, the plugin still runs but the menu is unavailable. |
 
 ### Optional integrations
 
