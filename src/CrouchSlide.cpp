@@ -148,11 +148,22 @@ namespace
 // ============================================================
 // SneakHandler input hook — detect "crouch pressed while sprinting"
 // ------------------------------------------------------------
-// We do NOT eat the press: letting the engine process the real Sneak event
-// is exactly what leaves the player crouched at the end of the slide. The
-// hook only records that the crouch key was pressed while the sprint bit was
-// set, which Update consumes to start a slide. Same vtable-slot-8 patch as
-// SuperSprintInput (BSInputEventUser::HandleEvent(ButtonEvent*)).
+// Outside a slide, events pass through untouched: the engine processing the
+// real Sneak event is what leaves the player crouched after the slide (on
+// toggle-on-press schemes). The hook records that the crouch key was pressed
+// while the sprint bit was set, which Update consumes to start a slide.
+//
+// WHILE a slide owns the crouch (pending / sliding / pin still held), real
+// Sneak events are SWALLOWED instead. Reason (confirmed in-game 2026-08-02):
+// some input schemes fire the sneak toggle on key RELEASE, so the release of
+// the very key that triggered the slide lands mid-slide and toggles the
+// player OUT of the crouch — the engine stands them up and the forceSneak
+// pin immediately forces them back down, a visible bob. Swallowing the event
+// prevents the toggle entirely; it also makes the slide fully committed
+// (mid-slide crouch presses do nothing, matching the design). The slide's
+// own synthetic presses go straight to s_originalHandleButton and are never
+// swallowed. Same vtable-slot-8 patch as SuperSprintInput
+// (BSInputEventUser::HandleEvent(ButtonEvent*)).
 // ============================================================
 namespace SneakSlideInput
 {
@@ -164,22 +175,54 @@ namespace SneakSlideInput
 	// Set by the hook on a sprint+crouch press; consumed by Update.
 	inline std::atomic<bool> s_crouchPressedWhileSprint{ false };
 
+	// Set by the hook on ANY crouch press (no sprint requirement); consumed
+	// by Update, which only acts on it while the player is airborne — the
+	// mid-air arm for the landing slide. A separate flag because the sprint
+	// bit is routinely already cleared mid-jump, so the sprint-gated flag
+	// above can never represent an in-air press reliably.
+	inline std::atomic<bool> s_crouchPressed{ false };
+
+	// Set when a Sneak key RELEASE is swallowed during the pending-crouch
+	// wait; consumed by Update. On release-toggle schemes (confirmed
+	// in-game 2026-08-02) that release IS the sneak toggle, so the pending
+	// block answers it with the rescue press immediately instead of waiting
+	// out the rescue timer — a tap-to-slide stays responsive. The rescue's
+	// IsSneaking() guard still protects hypothetical press-toggle schemes
+	// whose state is mid-registration when the release lands.
+	inline std::atomic<bool> s_sneakReleaseSwallowed{ false };
+
 	static void HookedHandleButton(void* a_self, const RE::ButtonEvent* a_event)
 	{
-		if (a_event && a_event->QJustPressed()) {
-			// Only the Sneak user event, only while the feature + crouch-key
-			// trigger are enabled and the player is sprinting this instant.
-			const auto& userEvent = a_event->QUserEvent();
-			if (userEvent.c_str() && std::strcmp(userEvent.c_str(), "Sneak") == 0) {
-				auto* sgs = Settings::GetSingleton();
-				auto* pc = RE::PlayerCharacter::GetSingleton();
-				if (sgs && pc && sgs->crouchSlideEnabled && sgs->crouchSlideUseCrouchKey &&
-					(pc->moveMode & kSprintBit) != 0) {
+		const auto* userEvent = a_event ? a_event->QUserEvent().c_str() : nullptr;
+		const bool  isSneakEvent = userEvent && std::strcmp(userEvent, "Sneak") == 0;
+
+		if (isSneakEvent && a_event->QJustPressed()) {
+			// Record the slide trigger. This runs BEFORE the swallow check so
+			// a press during the previous slide's pin-release window can still
+			// arm a back-to-back slide even though the event itself is eaten.
+			auto* sgs = Settings::GetSingleton();
+			auto* pc = RE::PlayerCharacter::GetSingleton();
+			if (sgs && pc && sgs->crouchSlideEnabled && sgs->crouchSlideUseCrouchKey) {
+				s_crouchPressed.store(true);
+				if ((pc->moveMode & kSprintBit) != 0) {
 					s_crouchPressedWhileSprint.store(true);
 				}
 			}
 		}
-		// Always forward to the engine so crouch toggles normally.
+
+		// Swallow real Sneak input while the slide owns the crouch. Held keys
+		// dispatch an event every frame, so this is trace-level only.
+		if (isSneakEvent && CrouchSlide::Manager::GetSingleton()->OwnsCrouchInput()) {
+			if (a_event->QReleased()) {
+				// The swallowed release would have been the sneak toggle on
+				// release-toggle schemes: let the pending wait answer it NOW.
+				s_sneakReleaseSwallowed.store(true);
+			}
+			logger::trace("[CrouchSlide] Swallowed Sneak input during slide (value={:.1f}, held={:.2f}s)",
+				a_event->value, a_event->heldDownSecs);
+			return;
+		}
+
 		if (s_originalHandleButton) {
 			s_originalHandleButton(a_self, a_event);
 		}
@@ -308,8 +351,9 @@ void CrouchSlide::Manager::Update(const FrameState& a_fs)
 
 	// Always drain the input flags so a press made while disabled cannot
 	// linger and surprise-trigger a slide after the feature is re-enabled.
-	const bool crouchPressed = SneakSlideInput::s_crouchPressedWhileSprint.exchange(false);
-	const bool hotkeyPressed = g_hotkeyPressed.exchange(false);
+	const bool crouchPressed    = SneakSlideInput::s_crouchPressedWhileSprint.exchange(false);
+	const bool crouchPressedAny = SneakSlideInput::s_crouchPressed.exchange(false);
+	const bool hotkeyPressed    = g_hotkeyPressed.exchange(false);
 
 	// Track sprint history internally so the caller does not have to preserve
 	// its own previous-frame sprint state for us.
@@ -371,21 +415,45 @@ void CrouchSlide::Manager::Update(const FrameState& a_fs)
 		}
 
 		// Fallback: the pose anim event has not latched (missed / renamed
-		// event), but the crouch IS engaged - either the persistent sneak
-		// state registered (IsSneaking()) or the forceSneak pin set at
-		// StartSlide is holding the pose down. Begin after a short settle so
-		// the transition has started blending; no standing-lunge.
+		// event) but the persistent sneak state HAS registered - the crouch
+		// is engaged and blending, begin after a short settle. The forceSneak
+		// pin is deliberately NOT accepted as evidence here: the pin holds an
+		// ALREADY-ENTERED crouch down, it does not itself play the crouch
+		// enter. Treating "pinned" as "crouched" (previous version) made the
+		// slide drive while still standing whenever the trigger press failed
+		// to toggle sneak - the reported "slide animation plays standing,
+		// character only crouches at the end" bug (the end crouch was
+		// EndSlide's aligning press).
 		constexpr float kCrouchSettleTime  = 0.15f;  // brief settle if the pose event is missed
-		constexpr float kCrouchWaitTimeout = 0.45f;  // hard cap; crouch clearly failed
-		if ((player->IsSneaking() || m_forceSneakPinned) && m_crouchWaitTime >= kCrouchSettleTime) {
+		constexpr float kCrouchRescueTime  = 0.35f;  // one rescue toggle if the crouch never engaged
+		constexpr float kCrouchWaitTimeout = 0.75f;  // hard cap; crouch clearly failed
+		if (player->IsSneaking() && m_crouchWaitTime >= kCrouchSettleTime) {
 			BeginSlideMotion(player);
 			return;
 		}
 
+		// Rescue: the trigger press never produced a crouch (release-toggle
+		// scheme, or sprint-break swallowed the press). ONE synthetic toggle,
+		// once per slide, sent on the EARLIER of:
+		//   - the player's own Sneak key release being swallowed by the hook
+		//     (on release-toggle schemes that release IS the toggle, so
+		//     answering it immediately keeps tap-to-slide responsive), or
+		//   - the 0.35s rescue timer (covers held keys, where no release
+		//     arrives until mid/after the slide).
+		// The IsSneaking() guard keeps this from double-toggling when a real
+		// press merely registers slowly (state can lag a press by ~0.25s).
+		const bool releaseSwallowed = SneakSlideInput::s_sneakReleaseSwallowed.exchange(false);
+		if (!m_rescuePressSent && !player->IsSneaking() &&
+			(releaseSwallowed || m_crouchWaitTime >= kCrouchRescueTime)) {
+			m_rescuePressSent = true;
+			ForceCrouch(player);
+			logger::info("[CrouchSlide] Crouch not engaged {:.2f}s after trigger - rescue sneak toggle sent ({})",
+				m_crouchWaitTime, releaseSwallowed ? "answering swallowed key release" : "rescue timer");
+		}
+
 		if (m_crouchWaitTime >= kCrouchWaitTimeout) {
-			// Never got crouched (pin not set and no sneak state - defensive;
-			// should be unreachable now that StartSlide always pins). Do NOT
-			// slide standing, which is exactly the launch/standing-slide bug.
+			// Still standing even after the rescue press. Do NOT slide
+			// standing, which is exactly the launch/standing-slide bug.
 			CancelSlide(player, "crouch never engaged");
 		}
 		return;
@@ -530,8 +598,25 @@ void CrouchSlide::Manager::Update(const FrameState& a_fs)
 	// --------------------------------------------------------
 	// A slide can only start in first person, on the ground, out of power
 	// armor, and with enough AP.
-	if (!a_fs.firstPerson || a_fs.inAir) return;
+	if (!a_fs.firstPerson) return;
 	if (RE::PowerArmor::ActorInPowerArmor(*player)) return;
+
+	// Mid-air: the only trigger interaction is ARMING the landing slide.
+	// Pressing crouch (or the slide hotkey) while airborne arms it; the
+	// slide itself starts on the landing edge below. A second press
+	// disarms — which also matches the engine state, since the same crouch
+	// press toggles sneak back off. No sprint requirement here: the sprint
+	// bit is routinely dropped mid-jump, and the landing momentum threshold
+	// already gates out low-speed landings.
+	if (a_fs.inAir) {
+		if (sgs->crouchSlideLandingEnabled && (crouchPressedAny || hotkeyPressed)) {
+			m_landingSlideArmed = !m_landingSlideArmed;
+			logger::info("[CrouchSlide] Landing slide {} (mid-air {} press)",
+				m_landingSlideArmed ? "armed" : "disarmed",
+				hotkeyPressed ? "hotkey" : "crouch");
+		}
+		return;
+	}
 
 	if (m_avActionPoints && sgs->crouchSlideAPCost > 0.0f) {
 		if (player->GetActorValue(*m_avActionPoints) < sgs->crouchSlideAPCost) {
@@ -555,20 +640,32 @@ void CrouchSlide::Manager::Update(const FrameState& a_fs)
 		return;
 	}
 
-	// Landing slide — on the filtered landing edge, if the player is carrying
-	// enough horizontal momentum.
-	if (sgs->crouchSlideLandingEnabled && a_fs.confirmedLanding) {
+	// Landing slide — on the filtered landing edge, if the slide was armed by
+	// a crouch/hotkey press made while airborne AND the player is carrying
+	// enough horizontal momentum. A press processed on the touchdown frame
+	// itself counts as armed too (pressing crouch the instant of landing is
+	// unmistakably slide intent, and input/physics frame alignment shouldn't
+	// decide whether it worked).
+	if (sgs->crouchSlideLandingEnabled && a_fs.confirmedLanding &&
+		(m_landingSlideArmed || crouchPressedAny || hotkeyPressed)) {
+		m_landingSlideArmed = false;
 		if (auto* cc = GetCharController(player)) {
 			RE::hkVector4f cur;
 			cc->GetLinearVelocityImpl(cur);
 			// Havok m/s -> game units/s for the threshold comparison.
 			const float horizGame = std::sqrt(cur.x * cur.x + cur.y * cur.y) / kGameToHavok;
 			if (horizGame >= sgs->crouchSlideLandingMomentum) {
-				StartSlide(player, /*a_crouchNow=*/true, "landing momentum");
+				StartSlide(player, /*a_crouchNow=*/true, "air-armed landing");
 				return;
 			}
+			logger::info("[CrouchSlide] Armed landing below momentum threshold ({:.0f} < {:.0f} u/s) - landing crouched only",
+				horizGame, sgs->crouchSlideLandingMomentum);
 		}
 	}
+
+	// Any grounded frame with no landing pending means leftover arm state is
+	// stale (e.g. a short hop that never produced a confirmed landing edge).
+	m_landingSlideArmed = false;
 }
 
 void CrouchSlide::Manager::StartSlide(RE::PlayerCharacter* a_player, bool a_crouchNow, const char* a_reason)
@@ -618,6 +715,10 @@ void CrouchSlide::Manager::StartSlide(RE::PlayerCharacter* a_player, bool a_crou
 	// timeout elapses).
 	m_state = State::kPendingCrouch;
 	m_crouchWaitTime = 0.0f;
+	m_rescuePressSent = false;
+	// Stale release from a previous slide must not instantly fire this
+	// slide's rescue.
+	SneakSlideInput::s_sneakReleaseSwallowed.store(false);
 
 	logger::info("[CrouchSlide] Armed ({}) - dist={:.0f}u, dur={:.2f}s, peak={:.0f}u/s, steer={:.0f}deg - waiting for crouch",
 		a_reason, distance, m_duration, m_peakSpeed, sgs->crouchSlideMaxSteerDegrees);
@@ -842,7 +943,25 @@ void CrouchSlide::Manager::Reset()
 	m_pinReleasePending = false;
 	m_rampSpeedDelta = 0.0f;
 	m_state = State::kIdle;
+	m_landingSlideArmed = false;
 	SneakSlideInput::s_crouchPressedWhileSprint.store(false);
+	SneakSlideInput::s_crouchPressed.store(false);
+	SneakSlideInput::s_sneakReleaseSwallowed.store(false);
+	g_hotkeyPressed.store(false);
+}
+
+void CrouchSlide::Manager::DrainTriggerFlags()
+{
+	// See the header comment: called from InertiaManager::Update's
+	// non-first-person early-return, where our Update (the normal drain
+	// point) never runs. Presses recorded by the input hooks in 3rd person
+	// must die here, not survive until the camera returns to 1st person.
+	// The landing arm state dies with them: leaving first person mid-air
+	// revokes the armed slide the same way it drops queued presses.
+	m_landingSlideArmed = false;
+	SneakSlideInput::s_crouchPressedWhileSprint.store(false);
+	SneakSlideInput::s_crouchPressed.store(false);
+	SneakSlideInput::s_sneakReleaseSwallowed.store(false);
 	g_hotkeyPressed.store(false);
 }
 

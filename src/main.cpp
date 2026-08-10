@@ -2,11 +2,13 @@
 #include "Settings.h"
 #include "InertiaPresets.h"
 #include "Menu.h"
+#include "ADSReload.h"
 #include "ChamberExclusion.h"
 #include "WeaponFOV.h"
 #include "FireOnEmpty.h"
 #include "ContextualLean.h"
 #include "CrouchSlide.h"
+#include "EditorIDCache.h"
 
 // ============================================================
 // Plugin Info
@@ -14,7 +16,7 @@
 namespace Plugin
 {
 	static constexpr auto NAME    = "FPGunplayOverhaul"sv;
-	static constexpr auto VERSION = REL::Version{ 1, 1, 0 };
+	static constexpr auto VERSION = REL::Version{ 1, 3, 0 };
 }
 
 // ============================================================
@@ -106,6 +108,7 @@ namespace
 		{
 			logger::info("[FPGunplayOverhaul] kGameDataReady - initializing");
 			LogOptionalDependencies();
+			EditorIDCache::LogDiagnostics();
 			Settings::GetSingleton()->Load();
 			InertiaPresets::GetSingleton()->Init();
 			ChamberExclusion::Manager::GetSingleton()->Init();
@@ -114,6 +117,7 @@ namespace
 			ContextualLean::Manager::GetSingleton()->Init();
 			Inertia::InertiaManager::GetSingleton()->InitSuperSprint();
 			CrouchSlide::Manager::GetSingleton()->Init();
+			ADSReload::Manager::GetSingleton()->Init();
 			Inertia::Install();
 			break;
 		}
@@ -123,6 +127,7 @@ namespace
 			logger::info("[FPGunplayOverhaul] kPostLoadGame - reloading config");
 			Settings::GetSingleton()->Load();
 			Inertia::InertiaManager::GetSingleton()->OnGameLoaded();
+			ADSReload::Manager::GetSingleton()->OnGameLoaded();
 			ChamberExclusion::Manager::GetSingleton()->ReapplyAllKeywords(
 				RE::PlayerCharacter::GetSingleton());
 			WeaponFOV::Manager::GetSingleton()->RefreshDefaults();
@@ -135,6 +140,7 @@ namespace
 			logger::info("[FPGunplayOverhaul] kNewGame - reloading config");
 			Settings::GetSingleton()->Load();
 			Inertia::InertiaManager::GetSingleton()->OnGameLoaded();
+			ADSReload::Manager::GetSingleton()->OnGameLoaded();
 			ChamberExclusion::Manager::GetSingleton()->ReapplyAllKeywords(
 				RE::PlayerCharacter::GetSingleton());
 			WeaponFOV::Manager::GetSingleton()->RefreshDefaults();
@@ -196,6 +202,11 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* F4S
 		logger::critical("[FPGunplayOverhaul] Failed to register messaging listener");
 		return false;
 	}
+
+	// Must be installed before game data loading starts: SetFormEditorID
+	// fires once per record during plugin parsing, and that is the only
+	// chance to capture weapon editor IDs (the engine discards them).
+	EditorIDCache::Install();
 
 	logger::info("[FPGunplayOverhaul] Plugin loaded, waiting for kGameDataReady");
 	return true;

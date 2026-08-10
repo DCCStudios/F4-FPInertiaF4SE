@@ -1,4 +1,5 @@
 #include "Inertia.h"
+#include "ADSReload.h"
 #include "ChamberExclusion.h"
 #include "WeaponFOV.h"
 #include "FireOnEmpty.h"
@@ -2362,7 +2363,13 @@ Inertia::InertiaManager::FetchEquippedWeapon(RE::PlayerCharacter* player) const
 			snap.formID = form->GetFormID();
 			snap.idata  = equipped.item.instanceData ? equipped.item.instanceData.get() : nullptr;
 			const char* eid = snap.base->GetFormEditorID();
-			if (eid && eid[0]) snap.editorID = eid;
+			// Same "0x{:08X}" fallback as GetEquippedWeaponEditorIDStatic:
+			// the menu keys presets through that path, so runtime lookups
+			// must produce the identical key or fallback-keyed presets can
+			// never match.
+			snap.editorID = (eid && eid[0])
+				? std::string(eid)
+				: std::format("0x{:08X}", snap.formID);
 			break;
 		}
 	}
@@ -2929,6 +2936,21 @@ namespace SuperSprintInput
 
 	static void HookedSprintHandleButton(void* self, const RE::ButtonEvent* event)
 	{
+		// Sprint input is inert while a crouch slide owns the crouch (pending
+		// wait, active slide, or post-slide forceSneak pin) — same window the
+		// SneakHandler hook swallows sneak toggles for. The engine's sprint
+		// start force-stands the player, and the forceSneak pin then drags
+		// them back down: a visible one-frame bob mid-slide. Releases still
+		// pass through — they can only stop a sprint, never start one, and
+		// swallowing them would leave hold-to-sprint schemes with a stale
+		// held state once the slide ends.
+		if (event && !event->QReleased() &&
+			CrouchSlide::Manager::GetSingleton()->OwnsCrouchInput()) {
+			logger::trace("[CrouchSlide] Swallowed Sprint input during slide (value={:.1f}, held={:.2f}s)",
+				event->value, event->heldDownSecs);
+			return;
+		}
+
 		if (s_eatEnabled && event && event->QJustPressed()) {
 			// Eat the press — don't let the engine toggle sprint off
 			s_eatTriggered = true;
@@ -4465,6 +4487,17 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	if (!inFP) {
 		// Reset springs when leaving FP so no pop when returning
 		if (isInFirstPerson) { Reset(); isInFirstPerson = false; }
+		// ADS Reloads' per-frame driver only runs inside the FP gate below;
+		// release an active zoom hold here or a POV switch mid-reload would
+		// leave fovAdjustTarget pinned with nothing ever letting it go.
+		ADSReload::Manager::GetSingleton()->ForceRelease("left first person");
+		// Crouch Slide's input hooks record trigger presses in ANY camera
+		// mode, but their consumer (CrouchSlide::Update, below this gate)
+		// never runs while we return early here. Without this drain, a
+		// crouch-while-sprinting press made in 3rd person survives until the
+		// camera returns to 1st person and fires a surprise delayed slide
+		// (user report 2026-08-02).
+		CrouchSlide::Manager::GetSingleton()->DrainTriggerFlags();
 		return;
 	}
 	isInFirstPerson = true;
@@ -4624,8 +4657,39 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 		}
 	}
 
+	// ---- ADS RELOADS (Extras feature) ----
+	// Keeps the sighted zoom (PlayerCamera::fovAdjustCurrent/Target) pinned
+	// while a reload plays with the aim input held, and applies the
+	// AnimsADSReloadKeyword runtime keyword so OAR can swap in sighted-pose
+	// reload animations. Runs BEFORE the ADS detection below so an active
+	// hold can mask the gunState 6 -> 4 flip (no ADS-exit impulse and no
+	// inertia profile change while the player is still visually aimed).
+	// wasADS / wasScoped still hold LAST frame's values here (updated at
+	// the end of the ADS block), which is exactly what the engage check
+	// needs: the sighted exit and reloadStateEnter land on the same frame.
+	{
+		bool adsAimHeldNow = false;
+		if (auto* pcNow = RE::PlayerControls::GetSingleton(); pcNow && pcNow->attackHandler) {
+			auto* hh = reinterpret_cast<RE::HeldStateHandler*>(pcNow->attackHandler);
+			adsAimHeldNow = AttackInput::s_installed ? AttackInput::s_adsHeld : hh->heldStateActive;
+		}
+		// Aim-enter blend duration for the hand-off fast-forward. Melee /
+		// unarmed read 0.0 (no rangedData) — the fast-forward is skipped,
+		// which is fine because the hold never engages without a reload.
+		const float sightedBlendSecs =
+			GetSightedTransitionSeconds(GetEquippedWeaponInstanceData(player));
+		ADSReload::Manager::GetSingleton()->Update(
+			player, camera, delta,
+			GunStateLocal::Read(player),
+			adsAimHeldNow,
+			wasADS, wasScoped,
+			reloadStarted,
+			sightedBlendSecs);
+	}
+	const bool adsReloadHoldActive = ADSReload::Manager::GetSingleton()->IsHoldActive();
+
 	// ---- ADS detection + impulses ----
-	bool isCurrentlyADS  = IsADS(camera);
+	bool isCurrentlyADS  = IsADS(camera) || adsReloadHoldActive;
 	bool isCurrentlyScoped = IsScoped(camera);
 
 	if (!wasADS && isCurrentlyADS) {
@@ -5290,7 +5354,12 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	// held (adsAimHeld, not the either-attack-button heldStateActive flag
 	// — see the input-read block for why that armed on every fire-to-empty
 	// auto reload and cut the animation short).
-	if (isCurrentlyReloading && ws.earlyAdsReturnEnabled && !earlyAdsArmed && adsAimHeld) {
+	// Suppressed while an ADS Reloads hold is active: that feature keeps
+	// the player visually sighted through the FULL reload, so cutting the
+	// animation short here would defeat it (and its synthetic re-ADS tap
+	// would momentarily release the aim state the hold depends on).
+	if (isCurrentlyReloading && ws.earlyAdsReturnEnabled && !earlyAdsArmed && adsAimHeld &&
+		!ADSReload::Manager::GetSingleton()->IsHoldActive()) {
 		earlyAdsArmed         = true;
 		earlyAdsReturnPending = false;
 		earlyAdsReturnTimer   = 0.0f;

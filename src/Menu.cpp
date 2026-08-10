@@ -1,5 +1,6 @@
 #include "Menu.h"
 #include "Inertia.h"
+#include "ADSReload.h"
 #include "ChamberExclusion.h"
 #include "WeaponFOV.h"
 #include "FireOnEmpty.h"
@@ -3723,6 +3724,71 @@ namespace Menu
 			}
 	}
 
+	// ====== ADS RELOADS ======
+		ImGuiMCP::Spacing();
+		if (ImGuiMCP::CollapsingHeader("ADS Reloads")) {
+			auto* settings = Settings::GetSingleton();
+			auto* arMgr = ADSReload::Manager::GetSingleton();
+
+			ImGuiMCP::Indent(8.0f);
+			ImGuiMCP::Spacing();
+			ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "What it does:");
+			ImGuiMCP::TextWrapped(
+				"Reloading while holding the aim input no longer kicks you out of "
+				"the aimed view: the sighted zoom is held for the whole reload and "
+				"the game re-aims seamlessly when it finishes. Releasing aim at any "
+				"point exits normally. The reload animation still plays.");
+			ImGuiMCP::Spacing();
+			ImGuiMCP::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "How it works:");
+			ImGuiMCP::BulletText("The engine's zoom-out at reload start is suppressed while aim stays held");
+			ImGuiMCP::BulletText("AnimsADSReloadKeyword is kept on the player while aiming with aim held");
+			ImGuiMCP::BulletText("  and through the reload, so OAR sees it when the reload clip activates");
+			ImGuiMCP::BulletText("OAR animations: condition on HasKeyword(AnimsADSReloadKeyword) to play a");
+			ImGuiMCP::BulletText("  sighted-pose reload (OAR's IsADS reads gunState and is false mid-reload)");
+			ImGuiMCP::BulletText("Without replacement animations the vanilla reload plays under the held zoom");
+			ImGuiMCP::BulletText("While the hold is active, Early ADS Return is suppressed (full reload plays)");
+			ImGuiMCP::BulletText("The re-aim blend at reload end is fast-forwarded, so the weapon snaps back");
+			ImGuiMCP::BulletText("  into the sights instead of dipping to hip and raising under the held zoom");
+			ImGuiMCP::Unindent(8.0f);
+			ImGuiMCP::Spacing();
+
+			// Live status indicator
+			if (arMgr->IsHoldActive()) {
+				ImGuiMCP::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "Status: HOLDING ADS");
+			} else {
+				ImGuiMCP::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Status: Idle");
+			}
+			ImGuiMCP::Spacing();
+
+			if (CheckboxWithTooltip("Enable ADS Reloads##adsReload", &settings->adsReloadEnabled,
+				"Master toggle for the ADS Reloads feature.\n"
+				"Hold aim while reloading to stay in the aimed view;\n"
+				"release aim at any point to exit normally.")) {
+				State::hasUnsavedChanges = true;
+			}
+
+			if (settings->adsReloadEnabled) {
+				ImGuiMCP::Spacing();
+
+				if (CheckboxWithTooltip("Allow On Scoped Weapons##adsReloadScoped", &settings->adsReloadAllowScoped,
+					"Also hold the zoom on weapons with a full-screen scope overlay.\n"
+					"Off by default: the scope overlay closes during the reload, so\n"
+					"you would see a zoomed world with no scope around it.")) {
+					State::hasUnsavedChanges = true;
+				}
+
+				if (SliderFloatWithTooltip("Re-Sight Window##adsReloadRegain", &settings->adsReloadRegainTimeout,
+					0.1f, 5.0f, "%.2f sec",
+					"After the reload ends (or is interrupted), how long to keep the\n"
+					"zoom held while waiting for the game to re-enter ADS on its own.\n"
+					"If it hasn't re-aimed within this window the hold releases and\n"
+					"the view zooms out normally. Default: 1.0")) {
+					settings->adsReloadRegainTimeout = std::clamp(settings->adsReloadRegainTimeout, 0.1f, 5.0f);
+					State::hasUnsavedChanges = true;
+				}
+			}
+		}
+
 	// ====== WEAPON BASED FOV ======
 		ImGuiMCP::Spacing();
 		if (ImGuiMCP::CollapsingHeader("Weapon Based FOV")) {
@@ -4098,8 +4164,9 @@ namespace Menu
 				ImGuiMCP::Spacing();
 
 				if (CheckboxWithTooltip("Slide on Landing##csLand", &settings->crouchSlideLandingEnabled,
-					"Trigger a slide automatically when you land with enough forward\n"
-					"momentum. Default: off")) {
+					"Slide when you land if you pressed crouch (or the slide hotkey)\n"
+					"while in the air and you land with enough forward momentum.\n"
+					"Pressing again mid-air cancels the armed slide. Default: off")) {
 					State::hasUnsavedChanges = true;
 				}
 				if (settings->crouchSlideLandingEnabled) {

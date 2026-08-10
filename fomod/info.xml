@@ -2,8 +2,8 @@
 <fomod>
     <Name>FP Gunplay Overhaul</Name>
     <Author>The Shiny Haxorus</Author>
-    <Version>1.1.0</Version>
-    <Website>https://www.nexusmods.com/games/fallout4/mods/105089</Website>
+    <Version>1.3.0</Version>
+    <Website>https://www.nexusmods.com/fallout4/mods/105089</Website>
     <Description>Spring-based weapon inertia and gunplay extras for Fallout 4 first person. Includes camera look inertia, movement sway, ADS scaling, fire recovery, contextual lean, super sprint, weapon-based FOV, and more. Fully customizable via F4SE Menu Framework.</Description>
     <Groups>
         <element>Gameplay</element>

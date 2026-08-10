@@ -16,6 +16,8 @@
 1. Overwrite any settings files from Uneducated Shooter if you have that installed.
 2. Delete any settings files for Uneducated Shooter in your MO2 Overwrite folder. They are provided with this mod.
 
+OR install this mod from JAG337: https://www.nexusmods.com/fallout4/mods/107443
+
 You may need to redo your lean settings in-game if you changed them from default. Please do NOT post comments about this if you don't read or follow these instructions. Thanks and happy modding!
 
 Selecting this option installs the full FP Gunplay Overhaul package (F4SE plugin, INI, presets, PDB) and safe Uneducated Shooter MCM override settings (inertia disabled).]]></description>
@@ -23,7 +25,30 @@ Selecting this option installs the full FP Gunplay Overhaul package (F4SE plugin
                             <files>
                                 <folder source="F4SE" destination="F4SE" />
                                 <folder source="MCM" destination="MCM" />
+                                <folder source="Sound" destination="Sound" />
                             </files>
+                            <typeDescriptor>
+                                <type name="Recommended" />
+                            </typeDescriptor>
+                        </plugin>
+                    </plugins>
+                </group>
+            </optionalFileGroups>
+        </installStep>
+
+        <installStep name="IMPORTANT: Crouch Slide Compatibility">
+            <optionalFileGroups order="Explicit">
+                <group name="Confirm Crouch Slide Warning" type="SelectExactlyOne">
+                    <plugins order="Explicit">
+                        <plugin name="I understand: disable or uninstall other crouch slide mods">
+                            <description><![CDATA[FP Gunplay Overhaul includes an optional Crouch Slide feature (Extras tab in the in-game settings menu).
+
+If you plan to use that feature, you MUST disable or uninstall any other crouch sliding mods before playing. Running multiple crouch slide implementations at once will conflict (movement, crouch state, animation keywords, and input handling) and can cause broken player movement or animation.
+
+If you do not enable Crouch Slide in this mod's settings, other crouch slide mods may remain installed.
+
+Selecting this option confirms you have read the warning. Installation continues with the package selected on the previous page.]]></description>
+                            <image path="fomod\images\Crouch Slide Warning.png" />
                             <typeDescriptor>
                                 <type name="Recommended" />
                             </typeDescriptor>

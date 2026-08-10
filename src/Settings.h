@@ -368,6 +368,20 @@ public:
 	// Prevent walking/running animations while airborne
 	bool  disableAirWalk{ false };
 
+	// === ADS RELOADS ===
+	// Keep the sighted zoom while a reload plays with the aim input held
+	// (releasing aim exits as normal). The reload animation still plays;
+	// the runtime keyword AnimsADSReloadKeyword is applied for the hold's
+	// duration so OAR can swap in sighted-pose reload animations.
+	bool  adsReloadEnabled{ false };
+	// Also hold on weapons with a scope overlay (ScopeMenu). Off by
+	// default: the overlay closes when the graph leaves sighted, so the
+	// hold shows a zoomed world with no scope.
+	bool  adsReloadAllowScoped{ false };
+	// After the reload ends (or is interrupted), how long to keep holding
+	// while waiting for the engine to re-enter sighted on its own.
+	float adsReloadRegainTimeout{ 1.0f };
+
 	// Settling behavior
 	float settleDelay{ 0.3f };
 	float settleSpeed{ 2.0f };
@@ -421,7 +435,7 @@ public:
 	float crouchSlideAPCost{ 15.0f };           // Action Points consumed on slide start
 	float crouchSlideRampUpTime{ 1.0f };        // seconds to ease back to crouch-walk speed if still crouching
 	bool  crouchSlideOmnidirectional{ true };   // slide in any sprint direction (omnidirectional-sprint mods)
-	bool  crouchSlideLandingEnabled{ true };    // trigger a slide on landing with forward momentum
+	bool  crouchSlideLandingEnabled{ false };   // trigger a slide on landing with forward momentum (opt-in: fires with no button input)
 	float crouchSlideLandingMomentum{ 350.0f };  // min horizontal speed (units/s) to trigger a landing slide
 	bool  crouchSlideIFramesEnabled{ false };   // invulnerability during the first part of the slide (default off)
 	float crouchSlideIFramesDuration{ 0.5f };   // i-frame window length (seconds) from slide start

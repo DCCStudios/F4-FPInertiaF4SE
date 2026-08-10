@@ -2,7 +2,7 @@
 includes("lib/commonlibf4")
 
 set_project("FPGunplayOverhaul")
-set_version("1.1.0")
+set_version("1.3.0")
 set_license("MIT")
 set_languages("c++23")
 set_warnings("allextra")

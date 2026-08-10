@@ -743,6 +743,12 @@ void Settings::Load()
 	// Air walk prevention
 	disableAirWalk      = ini.GetBoolValue("Extras", "bDisableAirWalk", false);
 
+	// ADS Reloads
+	adsReloadEnabled       = ini.GetBoolValue("Extras", "bADSReloadEnabled", false);
+	adsReloadAllowScoped   = ini.GetBoolValue("Extras", "bADSReloadAllowScoped", false);
+	adsReloadRegainTimeout = static_cast<float>(ini.GetDoubleValue("Extras", "fADSReloadRegainTimeout", 1.0));
+	adsReloadRegainTimeout = std::clamp(adsReloadRegainTimeout, 0.1f, 5.0f);
+
 	// Settling
 	settleDelay       = static_cast<float>(ini.GetDoubleValue("Settling", "fSettleDelay", 0.3));
 	settleSpeed       = static_cast<float>(ini.GetDoubleValue("Settling", "fSettleSpeed", 2.0));
@@ -815,7 +821,7 @@ void Settings::Load()
 	crouchSlideAPCost           = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideAPCost", 15.0));
 	crouchSlideRampUpTime       = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideRampUpTime", 1.0));
 	crouchSlideOmnidirectional  = ini.GetBoolValue("Extras", "bCrouchSlideOmnidirectional", true);
-	crouchSlideLandingEnabled   = ini.GetBoolValue("Extras", "bCrouchSlideLandingEnabled", true);
+	crouchSlideLandingEnabled   = ini.GetBoolValue("Extras", "bCrouchSlideLandingEnabled", false);
 	crouchSlideLandingMomentum  = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideLandingMomentum", 350.0));
 	crouchSlideIFramesEnabled   = ini.GetBoolValue("Extras", "bCrouchSlideIFramesEnabled", false);
 	crouchSlideIFramesDuration  = static_cast<float>(ini.GetDoubleValue("Extras", "fCrouchSlideIFramesDuration", 0.5));
@@ -957,6 +963,10 @@ void Settings::Save()
 	setBool("Extras", "bFireOnEmptyEnabled", fireOnEmptyEnabled);
 
 	setBool("Extras", "bDisableAirWalk", disableAirWalk);
+
+	setBool("Extras", "bADSReloadEnabled", adsReloadEnabled);
+	setBool("Extras", "bADSReloadAllowScoped", adsReloadAllowScoped);
+	ini.SetDoubleValue("Extras", "fADSReloadRegainTimeout", adsReloadRegainTimeout);
 
 	ini.SetDoubleValue("Settling", "fSettleDelay", settleDelay);
 	ini.SetDoubleValue("Settling", "fSettleSpeed", settleSpeed);

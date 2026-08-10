@@ -61,8 +61,31 @@ namespace CrouchSlide
 		// InertiaManager::Reset (cell change, save load, first-person exit).
 		void Reset();
 
+		// Drop any queued trigger presses without acting on them. Called every
+		// frame InertiaManager::Update early-returns for a non-first-person
+		// camera: the input hooks record presses in ANY camera mode, but this
+		// manager's Update (the consumer) never runs there, so without the
+		// drain a crouch-while-sprinting press made in 3rd person survives
+		// until the camera returns to 1st person and fires a surprise slide.
+		void DrainTriggerFlags();
+
 		// True while a slide is actively driving the player (for menu status).
 		bool IsSliding() const { return m_state == State::kSliding; }
+
+		// True while the slide owns the player's crouch (pending wait, active
+		// slide, or the post-slide window where the forceSneak pin is still
+		// held). The SneakHandler hook swallows real Sneak button events for
+		// this whole window: on schemes where the sneak toggle fires on key
+		// RELEASE (confirmed in-game 2026-08-02), the release lands mid-slide
+		// and would toggle the player OUT of the crouch - the engine stands
+		// them up and the forceSneak pin immediately drags them back down, a
+		// visible bob. Swallowing the event means the toggle never happens;
+		// the slide's own rescue/aligning presses (dispatched straight to the
+		// engine's unhooked handler) are unaffected.
+		bool OwnsCrouchInput() const
+		{
+			return m_state == State::kPendingCrouch || m_state == State::kSliding || m_forceSneakPinned;
+		}
 
 	private:
 		Manager() = default;
@@ -124,6 +147,12 @@ namespace CrouchSlide
 		// ---- slide state ----
 		State m_state{ State::kIdle };
 		bool  m_prevSprinting{ false }; // sprint bit last frame (for the hotkey fallback)
+
+		// Landing slide arm state: set by a crouch/hotkey press while airborne,
+		// consumed (or invalidated) on the next grounded frame. The landing
+		// trigger never fires without it — landing slides are opt-in per jump,
+		// not automatic on momentum alone.
+		bool m_landingSlideArmed{ false };
 		float m_elapsed{ 0.0f };        // time in the current slide
 		float m_duration{ 1.6f };       // captured from settings at start
 		float m_peakSpeed{ 0.0f };      // units/s peak of the ease envelope
@@ -144,6 +173,14 @@ namespace CrouchSlide
 		// Velocity starts when the player is crouched or this passes a short
 		// timeout (whichever comes first).
 		float m_crouchWaitTime{ 0.0f };
+
+		// One-shot rescue toggle during the pending-crouch wait. If neither
+		// the pose event nor IsSneaking() shows a crouch well past the settle
+		// window, the trigger press evidently never toggled sneak (broken by
+		// sprint-break, or a held-button scheme that only toggles on release).
+		// A single synthetic press is sent to actually start the crouch; the
+		// slide still refuses to drive velocity until sneak is real.
+		bool m_rescuePressSent{ false };
 
 		// The ActorState::forceSneak pin (the engine bit behind the
 		// SetForceSneak console/script function) is the SOLE in-slide crouch
