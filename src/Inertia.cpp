@@ -874,6 +874,12 @@ static void FastForwardGraph(RE::PlayerCharacter* a_player)
 // reset so one in-game bash produces a before/after pair showing exactly
 // what the reset changed — the camera's adjust values, the base FOVs, or
 // the weapon's instance/zoom pointers being swapped out from under it.
+//
+// Debug level: this fires on every bash reset, so it stays out of normal
+// user logs. Raise the log level to bisect a zoom regression — the pair
+// distinguishes a Weapon Based FOV clobber of the base FOV (fp1st moves)
+// from the engine rebuilding the weapon instance (idata/zoom pointers
+// move) without needing another round of guesswork.
 static void LogZoomState(RE::PlayerCharacter* a_player, const char* a_tag)
 {
 	auto* camera = RE::PlayerCamera::GetSingleton();
@@ -903,7 +909,7 @@ static void LogZoomState(RE::PlayerCharacter* a_player, const char* a_tag)
 		}
 	}
 
-	logger::info("[Zoom] {} gs={} adj(cur={:.2f} tgt={:.2f} rate={:.2f}) fp1st={:.2f} world={:.2f} "
+	logger::debug("[Zoom] {} gs={} adj(cur={:.2f} tgt={:.2f} rate={:.2f}) fp1st={:.2f} world={:.2f} "
 		"idata={} zoom={} fovMult={:.3f} overlay={}",
 		a_tag, GunStateLocal::Read(a_player),
 		camera->fovAdjustCurrent, camera->fovAdjustTarget, camera->fovAdjustPerSec,
