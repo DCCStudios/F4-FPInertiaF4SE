@@ -577,6 +577,24 @@ namespace EquippedWeapon
 		}
 		return false;
 	}
+
+	// Sighted zoom data for the equipped weapon, preferring the INSTANCE
+	// copy so an attached scope's own zoom wins over the base record's.
+	// Null when the weapon has no sighted zoom at all.
+	inline const RE::BGSZoomData* GetZoomData(RE::PlayerCharacter* a_player)
+	{
+		if (!a_player || !a_player->currentProcess || !a_player->currentProcess->middleHigh) return nullptr;
+		auto* mh = a_player->currentProcess->middleHigh;
+		RE::BSAutoLock lock{ mh->equippedItemsLock };
+		for (auto& eq : mh->equippedItems) {
+			auto* form = eq.item.object;
+			if (!form || form->formType != RE::ENUM_FORM_ID::kWEAP) continue;
+			auto* idata = static_cast<RE::TESObjectWEAP::InstanceData*>(eq.item.instanceData.get());
+			if (idata && idata->zoomData) return idata->zoomData;
+			return static_cast<RE::TESObjectWEAP*>(form)->weaponData.zoomData;
+		}
+		return nullptr;
+	}
 }
 
 // ============================================================
@@ -786,7 +804,9 @@ namespace HavokVar {
 // hides exactly that re-draw with one call — UpdateAnimation(1000.0f),
 // a single graph update with a huge delta that completes the re-draw
 // before it renders a frame (idlestopfix Hooks.cpp ProcessEvent). So:
-// reset to base state, then fast-forward through the draw.
+// reset to base state, then fast-forward through the draw. We deliver
+// that fast-forward in plausible chunks rather than one 1000s step —
+// see FastForwardGraph.
 //
 // For a non-looping OAR dry-fire replacement clip the reset lands
 // after the clip already finished, and the fast-forward makes the
@@ -825,6 +845,71 @@ namespace HavokVar {
 // FireAnnotationGuard can swallow re-equip SoundPlay annotations
 // without muting the dry-fire clip's own sounds earlier in the idle.
 static std::atomic<bool> g_suppressEquipSounds{ false };
+
+// Fast-forward the mandatory re-draw that an InitializeToBaseState reset
+// forces, so it never renders as a visible re-equip.
+//
+// This used to be ONE UpdateAnimation(1000.0f) call. That completed the
+// draw, but it also injects a thousand seconds of animation time per
+// reset, and back-to-back resets accumulate it — which matches the
+// reported "several gun bashes in a row wreck the weapon's zoom until it
+// is re-equipped" far better than any one-shot state loss (clearing the
+// camera's zoom adjust after the reset did NOT fix it). The same total is
+// now delivered as a handful of plausible steps: enough animation time to
+// finish any draw, with every individual dt inside the range the engine's
+// own timers are built for.
+static void FastForwardGraph(RE::PlayerCharacter* a_player)
+{
+	if (!a_player) return;
+	constexpr int   kSteps    = 8;
+	constexpr float kStepSecs = 0.5f;  // 4.0s total — longer than any draw anim
+	g_suppressEquipSounds.store(true, std::memory_order_relaxed);
+	for (int i = 0; i < kSteps; ++i) {
+		a_player->UpdateAnimation(kStepSecs);
+	}
+	g_suppressEquipSounds.store(false, std::memory_order_relaxed);
+}
+
+// Dump every zoom-relevant field. Called either side of the bash graph
+// reset so one in-game bash produces a before/after pair showing exactly
+// what the reset changed — the camera's adjust values, the base FOVs, or
+// the weapon's instance/zoom pointers being swapped out from under it.
+static void LogZoomState(RE::PlayerCharacter* a_player, const char* a_tag)
+{
+	auto* camera = RE::PlayerCamera::GetSingleton();
+	if (!a_player || !camera) return;
+
+	const void*   idataPtr = nullptr;
+	const void*   zoomPtr  = nullptr;
+	float         fovMult  = 0.0f;
+	std::uint32_t overlay  = 0;
+	if (a_player->currentProcess && a_player->currentProcess->middleHigh) {
+		auto* mh = a_player->currentProcess->middleHigh;
+		RE::BSAutoLock lock{ mh->equippedItemsLock };
+		for (auto& eq : mh->equippedItems) {
+			auto* form = eq.item.object;
+			if (!form || form->formType != RE::ENUM_FORM_ID::kWEAP) continue;
+			auto* idata = static_cast<RE::TESObjectWEAP::InstanceData*>(eq.item.instanceData.get());
+			idataPtr = idata;
+			const auto* zoom = (idata && idata->zoomData)
+				? idata->zoomData
+				: static_cast<RE::TESObjectWEAP*>(form)->weaponData.zoomData;
+			zoomPtr = zoom;
+			if (zoom) {
+				fovMult = zoom->zoomData.fovMult;
+				overlay = zoom->zoomData.overlay;
+			}
+			break;
+		}
+	}
+
+	logger::info("[Zoom] {} gs={} adj(cur={:.2f} tgt={:.2f} rate={:.2f}) fp1st={:.2f} world={:.2f} "
+		"idata={} zoom={} fovMult={:.3f} overlay={}",
+		a_tag, GunStateLocal::Read(a_player),
+		camera->fovAdjustCurrent, camera->fovAdjustTarget, camera->fovAdjustPerSec,
+		camera->firstPersonFOV, camera->worldFOV,
+		idataPtr, zoomPtr, fovMult, overlay);
+}
 
 // HARD stop: full base-state reset. Used for hipfire dry-fires and any
 // reload-driven interrupt. Soft-stop (StopCurrentIdle alone) was verified
@@ -868,9 +953,7 @@ static bool StopEmptyFireAnimation(RE::PlayerCharacter* a_player, const char* a_
 		logger::warn("[FireOnEmpty] InitializeToBaseState default object missing");
 	}
 
-	g_suppressEquipSounds.store(true, std::memory_order_relaxed);
-	a_player->UpdateAnimation(1000.0f);
-	g_suppressEquipSounds.store(false, std::memory_order_relaxed);
+	FastForwardGraph(a_player);
 
 	const auto gsAfter = GunStateLocal::Read(a_player);
 	logger::info("[FireOnEmpty] Stopped dry-fire ({}) hard-stop baseStateReset={} + fast-forward (gs={})",
@@ -1592,6 +1675,66 @@ namespace BashBlend
 	}
 }
 
+// Re-establish the camera's ADS zoom from the equipped weapon INSTANCE
+// after a behavior-graph base-state reset.
+//
+// InitializeToBaseState forces a weapon re-draw, and both callers collapse
+// that re-draw into a single huge UpdateAnimation step so it never renders.
+// The engine's zoom bookkeeping does not survive that intact: fovAdjust*
+// can be left describing a transition that no longer exists (a stranded
+// fovAdjustCurrent, or a fovAdjustPerSec of ~0 that can never interpolate
+// back), which reads in-game as the weapon's zoom being wrong until it is
+// re-equipped — a real equip re-runs the sequence and rebinds it.
+//
+// The correct value comes from the weapon instance, so attached scopes
+// (which carry their own zoomData) are honoured:
+//   - not sighted, the normal state after a bash -> no adjust at all,
+//   - sighted -> the instance's sighted adjust. fovMult is a multiplier on
+//     the unsighted first-person FOV, while fovAdjust* carry the DELTA
+//     from it (ADSReload's capture confirms 0 is the non-sighted value).
+//     Note firstPersonFOV may itself be holding a Weapon Based FOV
+//     viewmodel value, so the derived figure is range-guarded; the
+//     not-sighted path that fixes the reported bug does not depend on it.
+static void ReassertWeaponZoomFromInstance(RE::PlayerCharacter* a_player, const char* a_reason)
+{
+	if (!a_player) return;
+
+	// ADS Reload deliberately pins fovAdjust* while its hold is engaged.
+	// Never fight an owner that is mid-hold.
+	if (ADSReload::Manager::GetSingleton()->IsHoldActive()) return;
+
+	auto* camera = RE::PlayerCamera::GetSingleton();
+	if (!camera) return;
+
+	const std::uint32_t gs = GunStateLocal::Read(a_player);
+	const bool sighted = (gs == GunStateLocal::kSighted || gs == GunStateLocal::kFireSighted);
+
+	float target  = 0.0f;
+	float fovMult = 0.0f;
+	if (sighted) {
+		if (const auto* zoom = EquippedWeapon::GetZoomData(a_player)) {
+			fovMult = zoom->zoomData.fovMult;
+			if (std::isfinite(fovMult) && fovMult > 0.05f && fovMult < 2.0f) {
+				target = camera->firstPersonFOV * (fovMult - 1.0f);
+			}
+		}
+	}
+
+	const float before = camera->fovAdjustCurrent;
+	camera->fovAdjustCurrent = target;
+	camera->fovAdjustTarget  = target;
+	// A dead rate leaves any LATER transition hanging part-applied — the
+	// same failure ADSReload guards on release, with the same remedy.
+	if (std::fabs(camera->fovAdjustPerSec) < 0.01f) {
+		camera->fovAdjustPerSec = std::max(1.0f, std::fabs(target) / 0.2f);
+	}
+
+	if (std::fabs(before - target) > 0.01f) {
+		logger::info("[Zoom] Re-asserted from weapon instance after {} (adjust {:.2f}->{:.2f}, sighted={}, fovMult={:.3f})",
+			a_reason, before, target, sighted, fovMult);
+	}
+}
+
 // Repeatable Gun Bash — fire a follow-up bash while the previous bash's
 // animation is still playing.
 //
@@ -1680,6 +1823,8 @@ static bool TriggerGunBashAction(RE::PlayerCharacter* a_player)
 		BashBlend::CaptureBeforeReset(a_player);
 	}
 
+	LogZoomState(a_player, "bash reset BEFORE");
+
 	static const RE::BSFixedString kEvtAttackStop{ "attackStop" };
 	a_player->NotifyAnimationGraphImpl(kEvtAttackStop);
 	HavokVar::SetBool(a_player, HavokVar::kIsAttacking, false);
@@ -1693,9 +1838,12 @@ static bool TriggerGunBashAction(RE::PlayerCharacter* a_player)
 	// Fast-forward the reset's mandatory re-draw so the follow-up bash can
 	// start immediately (and its equip sounds stay silent) — the exact
 	// mechanism the FOE hard-stop uses.
-	g_suppressEquipSounds.store(true, std::memory_order_relaxed);
-	a_player->UpdateAnimation(1000.0f);
-	g_suppressEquipSounds.store(false, std::memory_order_relaxed);
+	FastForwardGraph(a_player);
+
+	// The skipped re-draw never rebound the zoom; restore it from the
+	// weapon instance so ADS is not left wrong until the next re-equip.
+	ReassertWeaponZoomFromInstance(a_player, "gun bash graph reset");
+	LogZoomState(a_player, "bash reset AFTER ");
 
 	{
 		if (a_player->PerformAction(meleeAction, nullptr)) {
@@ -1744,9 +1892,10 @@ static void ForceGraphBaseStateReset(RE::PlayerCharacter* a_player)
 	// exactly like the hard stop and the bash trigger do. Before this,
 	// the net's reset was the ONE reset that played its re-draw visibly —
 	// the "fast equip after every few dry fires" report (2026-07-22).
-	g_suppressEquipSounds.store(true, std::memory_order_relaxed);
-	a_player->UpdateAnimation(1000.0f);
-	g_suppressEquipSounds.store(false, std::memory_order_relaxed);
+	FastForwardGraph(a_player);
+
+	// Same skipped re-draw as the bash path — rebind the zoom.
+	ReassertWeaponZoomFromInstance(a_player, "fire-on-empty graph reset");
 
 	logger::warn("[FireOnEmpty] Graph stuck in fire loop after stop — forced base-state reset (ran={})", ran);
 }
@@ -4125,9 +4274,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 						// fresh hip->ADS press the natural aim-enter blend is
 						// exactly what the player expects — let it play.
 						if (fireOnEmptyWasADS) {
-							g_suppressEquipSounds.store(true, std::memory_order_relaxed);
-							player->UpdateAnimation(1000.0f);
-							g_suppressEquipSounds.store(false, std::memory_order_relaxed);
+							FastForwardGraph(player);
 						}
 						logger::info("[FireOnEmpty] {} ADS via synthetic tap (gs={})",
 							fireOnEmptyWasADS ? "Re-entered" : "Entered",
@@ -4148,9 +4295,7 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 					// the real release already landed, and this release pairs
 					// with our synthetic press inside the tap.
 					if (AttackInput::SimulateTap("SecondaryAttack")) {
-						g_suppressEquipSounds.store(true, std::memory_order_relaxed);
-						player->UpdateAnimation(1000.0f);
-						g_suppressEquipSounds.store(false, std::memory_order_relaxed);
+						FastForwardGraph(player);
 						AttackInput::DispatchButton("SecondaryAttack", 0.0f, 0.5f);
 						logger::info("[FireOnEmpty] Reconstructed natural ADS exit (gs={})",
 							GunStateLocal::Read(player));

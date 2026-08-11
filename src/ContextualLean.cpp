@@ -89,6 +89,15 @@ namespace
 		return (idx >= 0 && idx < 47) ? kNames[idx] : "DataDefined";
 	}
 
+	// Minimum plausible distance (game units) from the eye to real cover.
+	// The character controller keeps a standing player well clear of solid
+	// geometry, so anything reported a few units from the eye is the
+	// player's own collision (held weapon, body, char-controller capsule)
+	// or a stale result — never geometry worth leaning around. Sub-floor
+	// hits are skipped and the ray continues past them, so real cover
+	// behind them still measures at its true distance.
+	constexpr float kMinCoverDistance = 12.0f;
+
 	// Result of one LOS ray, with enough detail for layer filtering and
 	// the debug view.
 	struct LOSHit
@@ -134,10 +143,11 @@ namespace
 	// LAYER FILTERING: when the pick's collector carries per-hit results
 	// (the RainSplashes contract: enumerate GetAllCollectorRayHitAt and
 	// read filter info from each), the NEAREST hit on an allowed layer
-	// wins and helper-volume hits are skipped entirely. When the
-	// collector is empty (observed on AE: no per-hit results, embedded
-	// closest hit only), fall back to that closest result — no layer
-	// available, but the self/actor skip above still applies.
+	// wins and helper-volume hits are skipped entirely. When the collector
+	// is empty — which is ALWAYS, since bhkPickData's collector is never
+	// configured — the embedded closest result is used instead, and its
+	// own collision filter feeds the same allow-list. A hit on a
+	// disallowed layer is skipped and the ray re-cast past it.
 	//
 	// FRACTION SANITY (both paths): a reported hit with a fraction at or
 	// below zero would mean a wall exactly at the ray start —
@@ -210,16 +220,38 @@ namespace
 				if (!std::isfinite(embedded) || embedded <= 0.001f || embedded > 1.0f) {
 					return false;
 				}
+				// No per-hit collector results. This is not the rare AE case
+				// the code originally assumed — bhkPickData's `collector` and
+				// `collectorType` are never configured, so the collector is
+				// empty on EVERY runtime and this is the path every ray takes.
+				// The embedded result still describes the closest hit, and its
+				// collision filter is the same CFilter the collector path
+				// reads, so the allow-list applies here identically instead of
+				// trusting an unidentified hit as cover.
 				segFraction = embedded;
+				layer = pick.result.hitBodyInfo.shapeCollisionFilterInfo.val().GetCollisionLayer();
+				layerKnown = true;
 				obj = hitObj;
 			}
 
 			// Map the segment-local fraction back onto the original ray.
 			const float overallFraction = consumed + (1.0f - consumed) * segFraction;
 
-			if (obj && IsActorHit(obj, a_selfRootA, a_selfRootB)) {
+			// Skip-and-recast cases, all of which measure real cover behind
+			// them correctly:
+			//   - the player's own body or any actor (never cover),
+			//   - a non-solid helper volume: trigger, avoid box, camera
+			//     sphere, portal, char controller, invisible wall (the
+			//     "detects collision with nothing there" class of hit),
+			//   - a hit closer than any real geometry can be to the eye.
+			// The collector path pre-filters layers, so the helper test only
+			// ever fires on the embedded-result path above.
+			const bool actorHit  = obj && IsActorHit(obj, a_selfRootA, a_selfRootB);
+			const bool helperHit = layerKnown && !IsSolidCoverLayer(layer);
+			const bool tooClose  = (overallFraction * segLen) < kMinCoverDistance;
+			if (actorHit || helperHit || tooClose) {
 				consumed = overallFraction + epsFrac;
-				if (consumed >= 1.0f) return false;  // actor filled the rest of the ray
+				if (consumed >= 1.0f) return false;  // filled the rest of the ray
 				continue;
 			}
 
