@@ -3941,8 +3941,16 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	auto* player = RE::PlayerCharacter::GetSingleton();
 	// Pip-Boy (and holotape-in-Pip-Boy): clear spring / impulse carryover every frame
 	// while open, even if master toggle is off, so re-enabling does not inherit stale state.
+	// Zeroing spring state alone is not enough: the normal bone write lives behind the
+	// springsActive gate below, and opening the Pip-Boy holsters the weapon (springsActive
+	// -> false), so the inserted node would otherwise stay frozen at its last sway offset
+	// and the Pip-Boy raise would animate from a tilted base. Drop pending offsets and
+	// write the node back to neutral directly, independent of that gate.
 	if (player && IsPipboyMenuOpen()) {
 		ResetSpringPhysicsState();
+		deferredOffsets.hasOffsets = false;
+		deferredOffsets.combined   = SpringState{};
+		NeutralizeInsertedNode(static_cast<RE::NiNode*>(player->Get3D(true)));
 	}
 
 	auto* gs = Settings::GetSingleton();
@@ -4668,8 +4676,21 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 	// Falling edge: drain all spring energy once so no stale offset stays
 	// applied to the viewmodel and re-enabling starts clean (no pop).
 	// Physics-only reset — gameplay-extra state must survive this.
+	//
+	// Zeroing spring STATE is not enough on its own: the node write lives
+	// behind the springsActive gate, which is now false, so the inserted
+	// node keeps whatever offset it last held. Holstering while MOVING is
+	// the visible case — the movement spring's sway (e.g. left+up on a
+	// forward walk) freezes onto the node, and opening the Pip-Boy then
+	// raises the arm from that offset (reported for pistols, 1.3.2).
+	// Holstering while standing still froze a ~neutral offset, hence "no
+	// bug when the holster finished standing still". Write the node back to
+	// neutral here so it never freezes, whatever is shown next.
 	if (!springsActive && springsWereActive) {
 		ResetSpringPhysicsState();
+		deferredOffsets.hasOffsets = false;
+		deferredOffsets.combined   = SpringState{};
+		NeutralizeInsertedNode(static_cast<RE::NiNode*>(player->Get3D(true)));
 	}
 	springsWereActive = springsActive;
 
@@ -6751,7 +6772,12 @@ void Inertia::InertiaManager::Update(float delta, float realDelta)
 void Inertia::InertiaManager::OnFirstPersonUpdate(RE::NiAVObject* firstPersonObject)
 {
 	if (IsPipboyMenuOpen()) {
+		// Frame-gen may tick this hook between the Pip-Boy opening and the
+		// next Update; neutralize here too so no stale offset survives even
+		// one interpolated frame. firstPersonObject is the FP skeleton root.
 		deferredOffsets.hasOffsets = false;
+		deferredOffsets.combined   = SpringState{};
+		NeutralizeInsertedNode(static_cast<RE::NiNode*>(firstPersonObject));
 		return;
 	}
 	if (!deferredOffsets.hasOffsets) return;
@@ -6801,6 +6827,21 @@ void Inertia::InertiaManager::ResetSpringPhysicsState()
 	lastCameraYaw          = 0.0f;
 	lastCameraPitch        = 0.0f;
 	smoothedCameraVelocity = { 0.0f, 0.0f, 0.0f };
+}
+
+void Inertia::InertiaManager::NeutralizeInsertedNode(RE::NiNode* fpRoot)
+{
+	if (!fpRoot) return;
+	// Only write when the live skeleton still carries our node (guards a
+	// stale cachedInsertedBone after a weapon swap / skeleton reload). The
+	// node is inserted as an identity pass-through (see GetOrInsertInertiaBone),
+	// so MakeIdentity IS its neutral — the same transform ApplyOffset writes
+	// for a zero combined, contributing nothing to the arm chain.
+	static const RE::BSFixedString kNode{ kInsertedBoneName };
+	if (auto* inserted = fpRoot->GetObjectByName(kNode)) {
+		inserted->local.MakeIdentity();
+		cachedInsertedBone = static_cast<RE::NiNode*>(inserted);
+	}
 }
 
 void Inertia::InertiaManager::Reset()

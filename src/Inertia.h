@@ -289,6 +289,15 @@ namespace Inertia
 		// Reset(). Does not clear reload / EarlyADS / weapon cache / bone cache.
 		void ResetSpringPhysicsState();
 
+		// Force the inserted viewmodel node back to its identity (neutral)
+		// local transform. ResetSpringPhysicsState only zeroes spring STATE;
+		// the node keeps its last applied offset until something writes it,
+		// and the normal write lives behind the springsActive gate. Used
+		// while the Pip-Boy is open so the arm can't raise from a frozen
+		// sway pose regardless of that gate. Safe on a null root; validates
+		// the node against the live skeleton before writing.
+		void NeutralizeInsertedNode(RE::NiNode* fpRoot);
+
 		void ApplyOffset(RE::NiNode* node, const SpringState& combined,
 			const WeaponInertiaSettings& ws);
 		RE::NiNode* FindTargetNode(RE::NiNode* fpRoot, const WeaponInertiaSettings& ws, bool isADS = false);
